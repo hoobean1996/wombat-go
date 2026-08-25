@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# Run one agent turn and render it for a human.
+#
+#   scripts/wombat [flags] "your prompt"
+#   scripts/wombat -r -working-dir /tmp/x "prompt with 'quotes' && ampersands"
+#
+# A shell script rather than a make target because a make variable cannot
+# safely carry prose: a prompt containing a quote or an && is re-parsed by the
+# shell make invokes, the pipeline breaks, and the failure looks like the agent
+# misbehaving. Here the prompt is just an argument.
+#
+# Env comes from $WOMBAT_ENV, defaulting to ./.env. Copy .env.example to .env
+# and fill it in.
+set -euo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$here"
+
+env_file=${WOMBAT_ENV:-}
+if [ -z "$env_file" ]; then
+  if [ -f .env ]; then env_file=.env; fi
+fi
+if [ -n "$env_file" ] && [ -f "$env_file" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$env_file"
+  set +a
+else
+  echo "scripts/wombat: no env file (looked at \$WOMBAT_ENV and ./.env)" >&2
+  echo "                copy .env.example to .env and fill it in" >&2
+  exit 2
+fi
+
+# -r goes to the renderer, everything else to the binary.
+pretty_args=()
+cli_args=()
+for a in "$@"; do
+  case "$a" in
+    -r|--reasoning) pretty_args+=("$a") ;;
+    *) cli_args+=("$a") ;;
+  esac
+done
+
+go build -o bin/ ./cmd/...
+
+exec bin/wombat-jsonl -log warn "${cli_args[@]}" \
+  | python3 scripts/pretty.py "${pretty_args[@]+"${pretty_args[@]}"}"

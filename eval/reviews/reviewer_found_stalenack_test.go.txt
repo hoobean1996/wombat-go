@@ -1,0 +1,51 @@
+package jobq
+
+import (
+	"fmt"
+	"testing"
+)
+
+// TestReviewStaleNackStealsClaim verifies that after a job's claim is reclaimed
+// via visibility timeout (worker A is considered dead), the now-stale caller A
+// can no longer Nack it and yank it away from the new worker B.
+func TestReviewStaleNackStealsClaim(t *testing.T) {
+	q := openTest(t)
+
+	id, err := q.Enqueue("job")
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if _, ok, err := q.Claim("A"); !ok || err != nil {
+		t.Fatalf("claim A: ok=%v err=%v", ok, err)
+	}
+	// A dies (never acks); after visibility timeout B reclaims the job.
+	if _, err := q.db.Exec(`UPDATE jobs SET updated_at = ? WHERE id = ?`, nowMillis()-60000, id); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+	if _, ok, err := q.Claim("B"); !ok || err != nil {
+		t.Fatalf("claim B (reclaim): ok=%v err=%v", ok, err)
+	}
+
+	// Now stale caller A, having lost its claim, calls Nack. This must not be
+	// allowed to move job id into a retry state while B still owns it.
+	if err := q.Nack(id, fmt.Errorf("A's late failure")); err != nil {
+		t.Fatalf("stale nack returned unexpected error: %v", err)
+	}
+
+	// B still owns the job: it should be in the claimed state, and B should be
+	// able to Ack it without error.
+	var state string
+	var worker string
+	if err := q.db.QueryRow(`SELECT state, worker FROM jobs WHERE id=?`, id).Scan(&state, &worker); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if state != StateClaimed {
+		t.Fatalf("after stale caller A's Nack, job state = %q, want %q (stale caller must not release B's claim)", state, StateClaimed)
+	}
+	if worker != "B" {
+		t.Fatalf("after stale caller A's Nack, worker = %q, want B", worker)
+	}
+	if err := q.Ack(id); err != nil {
+		t.Fatalf("B's ack failed after stale A nacked: %v", err)
+	}
+}

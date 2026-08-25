@@ -1,0 +1,22 @@
+{
+  "requirements": [
+    "Write a todo list CLI in Go",
+    "Write it in the current directory",
+    "Module must be github.com/example/todo2",
+    "Must be a single main package",
+    "Must have subcommands add, list, done, and rm",
+    "Each task must have an id",
+    "Each task must have a title",
+    "Each task must have a done flag",
+    "Each task must have a created timestamp",
+    "The tasks file must be named todos.json",
+    "The tasks file must be stored in the same directory as the compiled binary",
+    "The location of the tasks file must be resolved from the executable's own path at runtime",
+    "The tasks file must NOT be stored in the process working directory",
+    "Running the binary from any directory must see the same task list",
+    "'go build ./...' must succeed",
+    "'go vet ./...' must succeed",
+    "Verify your work before answering"
+  ],
+  "task": "session"
+}

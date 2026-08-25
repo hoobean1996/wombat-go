@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>wombat trace</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --line: #30363d; --dim: #7d8590;
+    --fg: #c9d1d9; --sel: rgba(31,111,235,.22); --fail: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body { font: 13px/1.45 ui-monospace, "SF Mono", Menlo, monospace;
+         margin: 0; background: var(--bg); color: var(--fg); }
+  header { padding: 9px 14px; border-bottom: 1px solid var(--line);
+           display: flex; gap: 14px; align-items: baseline; flex-wrap: wrap; }
+  header h1 { font-size: 13px; margin: 0; font-weight: 600; }
+  #stats { color: var(--dim); font-size: 12px; }
+  #stats b { color: var(--fg); font-weight: 600; }
+  .controls { margin-left: auto; display: flex; gap: 10px; align-items: center; }
+  input[type=text] { background: var(--bg); border: 1px solid var(--line); color: var(--fg);
+                     padding: 3px 6px; border-radius: 3px; font: inherit; width: 210px; }
+  label { color: var(--dim); font-size: 12px; cursor: pointer; user-select: none; }
+  main { display: grid; grid-template-columns: minmax(0,1fr) 420px;
+         height: calc(100vh - 42px); }
+  #left { overflow: auto; padding-bottom: 40px; }
+  #details { border-left: 1px solid var(--line); background: var(--panel);
+             overflow: auto; padding: 12px 14px; }
+  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+       color: var(--dim); margin: 16px 14px 6px; font-weight: 600; }
+  #details h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+                color: var(--dim); margin: 14px 0 5px; font-weight: 600; }
+  .row { display: flex; align-items: center; gap: 8px; height: 22px;
+         padding: 0 14px; white-space: nowrap; cursor: pointer; }
+  .row:hover { background: #1c2128; }
+  .row.sel { background: var(--sel); }
+  .row.fail .nm { color: var(--fail); }
+  .tw { width: 12px; color: var(--dim); flex: none; text-align: center; }
+  .badge { flex: none; width: 58px; text-align: center; border-radius: 3px;
+           font-size: 10px; color: #fff; padding: 1px 0; }
+  .nm { overflow: hidden; text-overflow: ellipsis; }
+  .meta { color: var(--dim); font-size: 11px; margin-left: auto;
+          flex: none; padding-left: 12px; }
+  .bar { flex: none; width: 160px; height: 6px; background: var(--line);
+         border-radius: 2px; position: relative; }
+  .bar i { position: absolute; top: 0; height: 6px; border-radius: 2px; min-width: 2px; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  th, td { text-align: left; padding: 3px 8px; border-bottom: 1px solid #21262d;
+           white-space: nowrap; }
+  th { color: var(--dim); font-weight: 600; cursor: pointer; position: sticky;
+       top: 0; background: var(--bg); }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tr.fail td { color: var(--fail); }
+  tr.sel td { background: var(--sel); }
+  pre { background: var(--bg); padding: 7px; border-radius: 4px; overflow: auto;
+        max-height: 260px; white-space: pre-wrap; word-break: break-all;
+        font-size: 12px; margin: 0; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; font-size: 12px; }
+  .kv span:nth-child(odd) { color: var(--dim); }
+  .empty { color: var(--dim); font-style: italic; padding: 24px 14px; }
+</style>
+</head>
+<body>
+<!-- Span data, injected by trace.WriteHTML. encoding/json escapes the three
+     three HTML-significant bytes into their unicode escapes by default, so no
+     attribute value can close this tag early; that default is the reason the
+     payload rides in a script element instead of being escaped by hand. -->
+<script id="wombat-trace" type="application/json">__WOMBAT_TRACE_DATA__</script>
+<header>
+  <h1>wombat trace</h1>
+  <div id="stats"></div>
+  <div class="controls">
+    <input type="text" id="q" placeholder="filter by name or attr…">
+    <label><input type="checkbox" id="failonly"> failed only</label>
+  </div>
+</header>
+<main>
+  <div id="left">
+    <h2>timeline</h2>
+    <div id="tree"></div>
+    <h2>spans</h2>
+    <table id="table"><thead><tr>
+      <th data-sort="kind">kind</th>
+      <th data-sort="name">name</th>
+      <th class="num" data-sort="offset">start&nbsp;+ms</th>
+      <th class="num" data-sort="dur">dur&nbsp;ms</th>
+      <th data-sort="ok">status</th>
+      <th data-sort="detail">detail</th>
+    </tr></thead><tbody></tbody></table>
+  </div>
+  <div id="details"><div class="empty">no span selected</div></div>
+</main>
+<script>
+"use strict";
+
+// DOM rows, not a canvas. The OCaml viewer this is a port of went to canvas
+// because it was drawing 2k+ frames; a wombat trace is one process's run and
+// lands in the hundreds, where the DOM is instant and the code is a third the
+// size. If you ever hit five figures of spans, that is the trade to revisit.
+
+const KIND_COLOR = {
+  run:       "#8957e5",
+  iteration: "#6e7681",
+  llm:       "#1f6feb",
+  tool:      "#238636",
+  subagent:  "#db7d2c",
+};
+
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s).replace(/[&<>"]/g,
+  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+let spans = [], byId = new Map(), kids = new Map(), roots = [];
+let t0 = 0, t1 = 0, selected = null, sortKey = null, sortDir = 1;
+const collapsed = new Set();
+
+function attr(s, key) {
+  for (const a of s.attrs || []) if (a.key === key) return a.value;
+  return undefined;
+}
+function num(s, key) { const v = attr(s, key); return typeof v === "number" ? v : 0; }
+
+function load(raw) {
+  // Duplicate ids are real: two runs appending to one file, or a resumed run
+  // whose tail was concatenated. Keeping both would double every rollup.
+  const seen = new Set();
+  spans = [];
+  for (const s of raw) {
+    if (!s || seen.has(s.id)) continue;
+    seen.add(s.id);
+    s._start = Date.parse(s.start);
+    s._dur = s.dur_ms || 0;
+    s._end = s._start + s._dur;
+    spans.push(s);
+  }
+  byId = new Map(spans.map((s) => [s.id, s]));
+  kids = new Map();
+  roots = [];
+  for (const s of spans) {
+    // A span whose parent is missing is still worth showing: the file may be
+    // truncated, or the parent may live in another process's trace.
+    if (s.parent_id && byId.has(s.parent_id)) {
+      if (!kids.has(s.parent_id)) kids.set(s.parent_id, []);
+      kids.get(s.parent_id).push(s);
+    } else {
+      roots.push(s);
+    }
+  }
+  const byStart = (a, b) => a._start - b._start;
+  roots.sort(byStart);
+  for (const v of kids.values()) v.sort(byStart);
+
+  t0 = Math.min(...spans.map((s) => s._start));
+  t1 = Math.max(...spans.map((s) => s._end));
+
+  for (const r of roots) rollup(r);
+  // A short trace is most useful wide open. A long one is unreadable that way,
+  // and the iteration is its natural fold — collapsing there leaves the run
+  // shape visible and hides the per-iteration detail until it is asked for.
+  if (spans.length > 200) {
+    for (const s of spans) if (s.kind === "iteration") collapsed.add(s.id);
+  }
+}
+
+// Inclusive rollup, computed once: each span carries its own totals plus every
+// descendant's, so a collapsed row still tells you what is hiding under it.
+function rollup(s) {
+  let inTok = num(s, "gen_ai.usage.input_tokens");
+  let outTok = num(s, "gen_ai.usage.output_tokens");
+  let llm = s.kind === "llm" ? 1 : 0;
+  let tool = s.kind === "tool" ? 1 : 0;
+  let fail = s.error ? 1 : 0;
+  for (const k of kids.get(s.id) || []) {
+    rollup(k);
+    inTok += k._in; outTok += k._out;
+    llm += k._llm; tool += k._tool; fail += k._fail;
+  }
+  s._in = inTok; s._out = outTok; s._llm = llm; s._tool = tool; s._fail = fail;
+}
+
+function matches(s) {
+  if ($("#failonly").checked && !s.error) return false;
+  const q = $("#q").value.trim().toLowerCase();
+  if (!q) return true;
+  if (s.name.toLowerCase().includes(q) || s.kind.includes(q)) return true;
+  for (const a of s.attrs || []) {
+    if (a.key.toLowerCase().includes(q)) return true;
+    if (String(a.value).toLowerCase().includes(q)) return true;
+  }
+  return false;
+}
+// A parent that does not itself match is kept when a descendant does —
+// otherwise filtering for a tool name detaches it from its iteration.
+function subtreeMatches(s) {
+  if (matches(s)) return true;
+  return (kids.get(s.id) || []).some(subtreeMatches);
+}
+
+function metaText(s) {
+  const bits = [Math.round(s._dur) + "ms"];
+  const kc = (kids.get(s.id) || []).length;
+  if (kc) {
+    bits.push("Σ " + s._llm + "llm/" + s._tool + "tool");
+    if (s._in + s._out > 0) bits.push(s._in + "↓" + s._out + "↑");
+    if (s._fail) bits.push("✗" + s._fail);
+  } else {
+    if (s._in + s._out > 0) bits.push(s._in + "↓" + s._out + "↑");
+    if (s.error) bits.push("✗");
+  }
+  return bits.join("  ");
+}
+
+function renderTree() {
+  const span = Math.max(t1 - t0, 1);
+  const out = [];
+  const walk = (s, depth) => {
+    if (!subtreeMatches(s)) return;
+    const children = kids.get(s.id) || [];
+    const open = !collapsed.has(s.id);
+    const tw = children.length ? (open ? "▾" : "▸") : "·";
+    const color = KIND_COLOR[s.kind] || "#484f58";
+    const left = ((s._start - t0) / span) * 100;
+    const width = Math.max((s._dur / span) * 100, 0.6);
+    out.push(
+      '<div class="row' + (s.error ? " fail" : "") +
+        (selected === s.id ? " sel" : "") + '" data-id="' + esc(s.id) + '">' +
+        '<span class="tw" style="margin-left:' + depth * 14 + 'px">' + tw + "</span>" +
+        '<span class="badge" style="background:' + color + '">' +
+          esc(s.kind.slice(0, 4).toUpperCase()) + "</span>" +
+        '<span class="nm">' + esc(s.name) + "</span>" +
+        '<span class="meta">' + esc(metaText(s)) + "</span>" +
+        '<span class="bar"><i style="left:' + left.toFixed(3) + "%;width:" +
+          width.toFixed(3) + "%;background:" + color + '"></i></span>' +
+      "</div>");
+    if (open) for (const k of children) walk(k, depth + 1);
+  };
+  for (const r of roots) walk(r, 0);
+  $("#tree").innerHTML = out.length ? out.join("") :
+    '<div class="empty">no spans match</div>';
+}
+
+function detailText(s) {
+  const parts = [];
+  const model = attr(s, "gen_ai.response.model") || attr(s, "gen_ai.request.model");
+  if (model) parts.push(model);
+  const stop = attr(s, "gen_ai.response.finish_reason");
+  if (stop) parts.push(stop);
+  const cat = attr(s, "wombat.tool.category");
+  if (cat) parts.push(cat);
+  if (s.error) parts.push(s.error);
+  return parts.join(" · ");
+}
+
+function renderTable() {
+  const rows = spans.filter(matches);
+  if (sortKey) {
+    const key = {
+      kind: (s) => s.kind, name: (s) => s.name,
+      offset: (s) => s._start - t0, dur: (s) => s._dur,
+      ok: (s) => (s.error ? 1 : 0), detail: (s) => detailText(s),
+    }[sortKey];
+    rows.sort((a, b) => {
+      const x = key(a), y = key(b);
+      return (x < y ? -1 : x > y ? 1 : 0) * sortDir;
+    });
+  }
+  $("#table").tBodies[0].innerHTML = rows.map((s) =>
+    '<tr class="' + (s.error ? "fail " : "") + (selected === s.id ? "sel" : "") +
+      '" data-id="' + esc(s.id) + '">' +
+      "<td>" + esc(s.kind) + "</td>" +
+      "<td>" + esc(s.name) + "</td>" +
+      '<td class="num">' + Math.round(s._start - t0) + "</td>" +
+      '<td class="num">' + s._dur.toFixed(1) + "</td>" +
+      "<td>" + (s.error ? "fail" : "ok") + "</td>" +
+      "<td>" + esc(detailText(s)) + "</td>" +
+    "</tr>").join("");
+}
+
+function renderDetails() {
+  const d = $("#details");
+  const s = byId.get(selected);
+  if (!s) { d.innerHTML = '<div class="empty">no span selected</div>'; return; }
+  const rows = (s.attrs || []).map((a) =>
+    "<span>" + esc(a.key) + "</span><span>" + esc(JSON.stringify(a.value)) + "</span>").join("");
+  const children = (kids.get(s.id) || []).length;
+  d.innerHTML =
+    '<div><span class="badge" style="background:' + (KIND_COLOR[s.kind] || "#484f58") +
+      '">' + esc(s.kind.slice(0, 4).toUpperCase()) + "</span> <b>" + esc(s.name) + "</b></div>" +
+    '<div style="color:var(--dim);font-size:11px;margin-top:4px">id ' + esc(s.id) +
+      (s.parent_id ? " · parent " + esc(s.parent_id) : " · root") +
+      (s.trace_id ? " · trace " + esc(s.trace_id) : "") + "</div>" +
+    "<h3>timing</h3><div class='kv'>" +
+      "<span>start</span><span>" + esc(new Date(s._start).toISOString()) + "</span>" +
+      "<span>offset</span><span>+" + Math.round(s._start - t0) + " ms</span>" +
+      "<span>duration</span><span>" + s._dur.toFixed(1) + " ms</span>" +
+    "</div>" +
+    (children ?
+      "<h3>subtree (incl. descendants)</h3><div class='kv'>" +
+      "<span>llm / tool</span><span>" + s._llm + " / " + s._tool + "</span>" +
+      "<span>tokens</span><span>" + s._in + " in / " + s._out + " out</span>" +
+      "<span>failures</span><span>" + s._fail + "</span></div>" : "") +
+    "<h3>attributes</h3>" +
+      (rows ? "<div class='kv'>" + rows + "</div>" : "<div class='empty'>none</div>") +
+    (s.error ? "<h3>error</h3><pre style='color:var(--fail)'>" + esc(s.error) + "</pre>" : "");
+}
+
+function renderStats() {
+  let llm = 0, tool = 0, fails = 0, inTok = 0, outTok = 0;
+  for (const s of spans) {
+    if (s.kind === "llm") llm++;
+    else if (s.kind === "tool") tool++;
+    if (s.error) fails++;
+    inTok += num(s, "gen_ai.usage.input_tokens");
+    outTok += num(s, "gen_ai.usage.output_tokens");
+  }
+  $("#stats").innerHTML =
+    "<b>" + spans.length + "</b> spans | <b>" + llm + "</b> llm | <b>" + tool +
+    "</b> tool | <b>" + inTok + "↓ " + outTok + "↑</b> tokens | <b>" +
+    ((t1 - t0) / 1000).toFixed(2) + "s</b> wall" +
+    (fails ? ' | <span style="color:var(--fail)">' + fails + " failed</span>" : "");
+}
+
+function render() { renderTree(); renderTable(); renderDetails(); }
+
+$("#tree").addEventListener("click", (ev) => {
+  const row = ev.target.closest(".row");
+  if (!row) return;
+  const id = row.dataset.id;
+  if (ev.target.classList.contains("tw")) {
+    if (collapsed.has(id)) collapsed.delete(id); else collapsed.add(id);
+  } else {
+    selected = id;
+  }
+  render();
+});
+$("#table").addEventListener("click", (ev) => {
+  const th = ev.target.closest("th");
+  if (th) {
+    const k = th.dataset.sort;
+    sortDir = sortKey === k ? -sortDir : 1;
+    sortKey = k;
+    renderTable();
+    return;
+  }
+  const tr = ev.target.closest("tr[data-id]");
+  if (tr) { selected = tr.dataset.id; render(); }
+});
+$("#q").addEventListener("input", render);
+$("#failonly").addEventListener("change", render);
+
+(function start() {
+  let raw = [];
+  try {
+    raw = JSON.parse($("#wombat-trace").textContent) || [];
+  } catch (e) {
+    document.body.innerHTML = '<div class="empty">trace data is not valid JSON: ' +
+      esc(e.message) + "</div>";
+    return;
+  }
+  if (!raw.length) {
+    $("#left").innerHTML = '<div class="empty">this trace is empty</div>';
+    return;
+  }
+  load(raw);
+  renderStats();
+  render();
+})();
+</script>
+</body>
+</html>

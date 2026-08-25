@@ -1,0 +1,330 @@
+package mvcc
+
+// Written before the implementation existed, from the task statement alone.
+//
+// Group 1 checks the requirements as written. Group 2 checks the interactions
+// the requirements describe only one half of — which is where the last task's
+// three real defects lived, and where the model's own invariant was measured
+// to collapse: it named "owned by at most one worker at any moment" and then
+// restated it as "the acquire transition happens once", leaving every release
+// path unexamined.
+//
+// The analogous collapse here would be an invariant about "a snapshot reads
+// the state as of Begin" that quietly becomes "Begin records a version", after
+// which GC is free to delete out from under it.
+
+import (
+	"errors"
+	"fmt"
+	"path/filepath"
+	"sync"
+	"testing"
+)
+
+func openDB(t *testing.T, name string) *DB {
+	t.Helper()
+	db, err := Open(filepath.Join(t.TempDir(), name))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+func set(t *testing.T, db *DB, k, v string) {
+	t.Helper()
+	tx := db.Begin()
+	if err := tx.Set(k, v); err != nil {
+		t.Fatalf("set %s: %v", k, err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit %s: %v", k, err)
+	}
+}
+
+func mustGet(t *testing.T, tx *Tx, k string) (string, bool) {
+	t.Helper()
+	v, ok, err := tx.Get(k)
+	if err != nil {
+		t.Fatalf("get %s: %v", k, err)
+	}
+	return v, ok
+}
+
+// ===== group 1: the stated requirements =====
+
+func TestProbeSnapshotIsolation(t *testing.T) {
+	db := openDB(t, "iso.db")
+	set(t, db, "k", "v1")
+
+	snap := db.Begin()
+	if v, _ := mustGet(t, snap, "k"); v != "v1" {
+		t.Fatalf("snapshot opened on %q, want v1", v)
+	}
+	set(t, db, "k", "v2")
+
+	if v, ok := mustGet(t, snap, "k"); !ok || v != "v1" {
+		t.Errorf("the snapshot sees %q (present=%v) after another commit; snapshot isolation "+
+			"means it reads the state as of Begin", v, ok)
+	}
+	_ = snap.Rollback()
+
+	fresh := db.Begin()
+	if v, _ := mustGet(t, fresh, "k"); v != "v2" {
+		t.Errorf("a transaction begun after the commit sees %q, want v2", v)
+	}
+	_ = fresh.Rollback()
+}
+
+func TestProbeOwnWritesAreVisibleToItself(t *testing.T) {
+	db := openDB(t, "own.db")
+	set(t, db, "k", "v1")
+	tx := db.Begin()
+	if err := tx.Set("k", "mine"); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := mustGet(t, tx, "k"); !ok || v != "mine" {
+		t.Errorf("a transaction reads %q through its own Get after writing 'mine'", v)
+	}
+	if err := tx.Set("new", "n"); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := mustGet(t, tx, "new"); !ok || v != "n" {
+		t.Errorf("a key created in this transaction reads back as %q present=%v", v, ok)
+	}
+	_ = tx.Rollback()
+}
+
+func TestProbeRollbackDiscardsEverything(t *testing.T) {
+	db := openDB(t, "rb.db")
+	set(t, db, "k", "v1")
+
+	tx := db.Begin()
+	if err := tx.Set("k", "doomed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Set("alsodoomed", "x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	after := db.Begin()
+	defer after.Rollback() //nolint:errcheck // read-only probe
+	if v, _ := mustGet(t, after, "k"); v != "v1" {
+		t.Errorf("a rolled-back write survived: k=%q, want v1", v)
+	}
+	if _, ok := mustGet(t, after, "alsodoomed"); ok {
+		t.Error("a key created by a rolled-back transaction is visible")
+	}
+}
+
+func TestProbeWriteWriteConflict(t *testing.T) {
+	db := openDB(t, "conf.db")
+	set(t, db, "k", "base")
+
+	a, b := db.Begin(), db.Begin()
+	if err := a.Set("k", "from-a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Set("k", "from-b"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Commit(); err != nil {
+		t.Fatalf("the first committer failed: %v", err)
+	}
+	err := b.Commit()
+	if !errors.Is(err, ErrConflict) {
+		t.Errorf("the second committer returned %v, want ErrConflict", err)
+	}
+
+	// And the loser writes NOTHING. A conflict that half-applies is worse than
+	// one that is not detected, because the winner's value is silently gone.
+	check := db.Begin()
+	defer check.Rollback() //nolint:errcheck // read-only probe
+	if v, _ := mustGet(t, check, "k"); v != "from-a" {
+		t.Errorf("after a rejected commit the key holds %q, want the winner's from-a", v)
+	}
+}
+
+func TestProbeSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "persist.db")
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	tx := db.Begin()
+	if err := tx.Set("kept", "yes"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	again, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer again.Close() //nolint:errcheck // probe
+	rt := again.Begin()
+	defer rt.Rollback() //nolint:errcheck // read-only probe
+	if v, ok := mustGet(t, rt, "kept"); !ok || v != "yes" {
+		t.Errorf("after a restart the key reads %q present=%v, want yes", v, ok)
+	}
+}
+
+// ===== group 2: the interactions =====
+
+// The prediction. "GC must never reclaim a version an open transaction can
+// still read" is the release half of snapshot isolation, and the requirements
+// state it in one sentence a long way from the sentence about Begin.
+func TestReviewGCDoesNotReclaimWhatAnOpenSnapshotNeeds(t *testing.T) {
+	db := openDB(t, "gc.db")
+	set(t, db, "k", "v1")
+
+	snap := db.Begin()    // holds the right to read v1 for as long as it lives
+	defer snap.Rollback() //nolint:errcheck // read-only probe
+
+	for i := 2; i <= 6; i++ {
+		set(t, db, "k", fmt.Sprintf("v%d", i))
+	}
+
+	n, err := db.GC()
+	if err != nil {
+		t.Fatalf("gc: %v", err)
+	}
+	t.Logf("gc reclaimed %d version(s) with a snapshot open on v1", n)
+
+	v, ok, err := snap.Get("k")
+	if err != nil {
+		t.Errorf("the open snapshot's Get failed after GC: %v", err)
+		return
+	}
+	if !ok {
+		t.Error("the open snapshot can no longer see the key at all: GC reclaimed a version " +
+			"a live transaction still had the right to read")
+		return
+	}
+	if v != "v1" {
+		t.Errorf("the open snapshot now reads %q, want v1: GC moved it forward in time", v)
+	}
+}
+
+// A snapshot must hold for its whole life, and GC running concurrently with
+// long readers is the case that separates "recorded a version number" from
+// "kept what that version number points at".
+func TestReviewSnapshotHoldsWhileGCRunsConcurrently(t *testing.T) {
+	db := openDB(t, "gcrace.db")
+	set(t, db, "k", "v1")
+
+	snap := db.Begin()
+	defer snap.Rollback() //nolint:errcheck // read-only probe
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	wg.Add(2)
+	go func() { // churn
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			tx := db.Begin()
+			_ = tx.Set("k", fmt.Sprintf("churn-%d", i))
+			_ = tx.Commit()
+		}
+	}()
+	go func() { // gc
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_, _ = db.GC()
+		}
+	}()
+
+	bad := 0
+	for range 200 {
+		v, ok, err := snap.Get("k")
+		if err != nil || !ok || v != "v1" {
+			bad++
+			if bad == 1 {
+				t.Errorf("the open snapshot read %q (present=%v err=%v) while GC ran; it must "+
+					"read v1 for its whole life", v, ok, err)
+			}
+		}
+	}
+	close(stop)
+	wg.Wait()
+}
+
+// Deleting is a write. A snapshot taken before the delete must still see the
+// key, and GC must not treat the tombstone as licence to drop the version
+// underneath it.
+func TestReviewDeleteRespectsOlderSnapshots(t *testing.T) {
+	db := openDB(t, "del.db")
+	set(t, db, "k", "v1")
+
+	snap := db.Begin()
+	defer snap.Rollback() //nolint:errcheck // read-only probe
+
+	tx := db.Begin()
+	if err := tx.Delete("k"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.GC(); err != nil {
+		t.Fatalf("gc: %v", err)
+	}
+
+	if v, ok := mustGet(t, snap, "k"); !ok || v != "v1" {
+		t.Errorf("a snapshot older than the delete reads %q present=%v, want v1 present", v, ok)
+	}
+
+	fresh := db.Begin()
+	defer fresh.Rollback() //nolint:errcheck // read-only probe
+	if _, ok := mustGet(t, fresh, "k"); ok {
+		t.Error("a transaction begun after the delete still sees the key")
+	}
+}
+
+// The probe above passes if GC does nothing at all, and it reported reclaiming
+// zero. A GC that never reclaims trivially satisfies "never reclaim what is
+// still needed", so that pass is not evidence until this one holds too.
+func TestReviewGCActuallyReclaimsWhenNothingHoldsThePast(t *testing.T) {
+	db := openDB(t, "gcpos.db")
+	for i := 1; i <= 8; i++ {
+		set(t, db, "k", fmt.Sprintf("v%d", i))
+	}
+	// No open transaction: every version but the newest is unreachable by
+	// anyone, now or later.
+	n, err := db.GC()
+	if err != nil {
+		t.Fatalf("gc: %v", err)
+	}
+	t.Logf("gc reclaimed %d version(s) with nothing open", n)
+	if n == 0 {
+		t.Error("GC reclaimed nothing after eight overwrites with no transaction open; " +
+			"the negative probe above therefore proves nothing about it")
+	}
+
+	// And the store still reads correctly afterwards.
+	tx := db.Begin()
+	defer tx.Rollback() //nolint:errcheck // read-only probe
+	if v, ok := mustGet(t, tx, "k"); !ok || v != "v8" {
+		t.Errorf("after GC the current value reads %q present=%v, want v8", v, ok)
+	}
+}

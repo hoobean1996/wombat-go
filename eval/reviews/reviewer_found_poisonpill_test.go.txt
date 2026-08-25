@@ -1,0 +1,50 @@
+package jobq
+
+import (
+	"fmt"
+	"testing"
+)
+
+// TestReviewDeadOnRepeatedCrash verifies the "after 3 failed attempts job moves
+// to dead" invariant holds even when a failed attempt is a worker that dies
+// (claim never acked, reclaimed via the visibility timeout) rather than an
+// explicit Nack. Each reclaim is a failed attempt and must count toward the
+// 3-attempt budget.
+func TestReviewDeadOnRepeatedCrash(t *testing.T) {
+	q := openTest(t)
+
+	id, err := q.Enqueue("crashy")
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	// Simulate a worker that dies on every attempt: claim, then let the claim
+	// go stale (visibility timeout) by backdating, then reclaim repeatedly.
+	for i := 0; i < 3; i++ {
+		job, ok, err := q.Claim(fmt.Sprintf("worker-%d", i))
+		if err != nil {
+			t.Fatalf("claim %d: %v", i, err)
+		}
+		if !ok {
+			t.Fatalf("claim %d: nothing claimable", i)
+		}
+		if _, err := q.db.Exec(`UPDATE jobs SET updated_at = ? WHERE id = ?`, nowMillis()-60000, id); err != nil {
+			t.Fatalf("backdate %d: %v", i, err)
+		}
+		// 3rd failed attempt: after this the job must be dead per spec.
+		_ = job
+	}
+
+	// After 3 failed attempts (3 dead workers), the job must be dead and never
+	// claimable again.
+	if _, ok, err := q.Claim("checker"); err != nil {
+		t.Fatalf("final claim err: %v", err)
+	} else if ok {
+		t.Fatalf("job id=%d was claimed after 3 dead-worker attempts; expected it to be dead and never claimable", id)
+	}
+
+	status, _ := q.Status()
+	if status[StateDead] != 1 {
+		t.Fatalf("dead count after 3 dead-worker attempts = %d, want 1 (at least one dead worker attempt should dead the job)", status[StateDead])
+	}
+}

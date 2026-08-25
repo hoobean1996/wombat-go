@@ -1,0 +1,10 @@
+/wombat-jsonl
+/wombat
+/bin/
+/runs/
+*.test
+*.out
+.DS_Store
+/.env
+/wombat-bench
+/todos.db

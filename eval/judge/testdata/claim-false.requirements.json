@@ -1,0 +1,25 @@
+{
+  "requirements": [
+    "Write a small todo list CLI in Go",
+    "Write it in the current directory",
+    "Module is github.com/example/todoapp",
+    "Go version is 1.21 or later",
+    "There is a single main package",
+    "There are subcommands add",
+    "There are subcommands list",
+    "There are subcommands done",
+    "There are subcommands rm",
+    "Tasks are persisted as JSON",
+    "Tasks are persisted in ./todos.json",
+    "The persistence file is next to the binary",
+    "Each task has an id",
+    "Each task has a title",
+    "Each task has a done flag",
+    "Each task has a created timestamp",
+    "'go build ./...' must succeed",
+    "'go vet ./...' must succeed",
+    "Both 'go build ./...' and 'go vet ./...' must succeed when finished",
+    "Verify that both succeed yourself before answering"
+  ],
+  "task": "session"
+}

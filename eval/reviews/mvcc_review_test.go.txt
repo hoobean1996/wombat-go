@@ -1,0 +1,159 @@
+package mvcc
+
+// Findings from reading the implementation, each written as a check rather
+// than an opinion. These target things the requirement probes cannot see.
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+// GC exists to reclaim memory and reports a count of what it reclaimed. It
+// reslices — db.versions[key] = vs[cutoff:] — which shares the backing array,
+// so every *version before the cutoff is still referenced by that array and
+// stays alive. The number it returns is of versions made unreachable through
+// the SLICE, not of memory released.
+func TestReviewGCActuallyReleasesTheVersionsItCounts(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "release.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	for i := 1; i <= 20; i++ {
+		tx := db.Begin()
+		_ = tx.Set("k", fmt.Sprintf("v%d", i))
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Hold on to the ORIGINAL slice header. If GC released the versions it
+	// counted, the entries it dropped are no longer referenced from anywhere;
+	// if it merely resliced forward, they are still sitting in the shared
+	// backing array and this view still sees them.
+	db.mu.Lock()
+	orig := db.versions["k"]
+	beforeLen := len(orig)
+	db.mu.Unlock()
+
+	n, err := db.GC()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	db.mu.Lock()
+	head := db.versions["k"]
+	db.mu.Unlock()
+
+	t.Logf("reclaimed %d | len %d -> %d", n, beforeLen, len(head))
+	if n == 0 {
+		t.Fatal("nothing was reclaimed, so this probe measures nothing")
+	}
+
+	stillReferenced := 0
+	for i := 0; i < beforeLen-len(head); i++ {
+		if orig[i] != nil {
+			stillReferenced++
+		}
+	}
+	if stillReferenced > 0 {
+		t.Errorf("GC reported reclaiming %d version(s), but %d of them are still referenced "+
+			"by the shared backing array: db.versions[key] = vs[cutoff:] reslices forward "+
+			"rather than releasing, so the count is of slice entries dropped, not of memory "+
+			"freed. A long-lived key never gives its history back.", n, stillReferenced)
+	}
+
+	if len(head) != 1 || head[0].value != "v20" {
+		t.Errorf("after GC the surviving slice is %d long with head %q, want 1 and v20",
+			len(head), head[len(head)-1].value)
+	}
+}
+
+// A commit appends its versions to memory and bumps the clock, and only THEN
+// persists. If persisting fails the error is returned — but the writes are
+// already visible to every later transaction. A caller told its commit failed
+// has no way to know the data landed anyway.
+func TestReviewFailedPersistDoesNotLeaveTheCommitApplied(t *testing.T) {
+	dir := t.TempDir()
+	db, err := Open(filepath.Join(dir, "fail.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	tx0 := db.Begin()
+	_ = tx0.Set("k", "committed")
+	if err := tx0.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Make persistence fail: writeAtomic creates its temp file in the
+	// database's directory, so a directory that cannot be written to is enough.
+	blocked := filepath.Join(dir, "blocked")
+	if err := os.Mkdir(blocked, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(blocked, 0o700) })
+	db.mu.Lock()
+	db.path = filepath.Join(blocked, "fail.db")
+	db.mu.Unlock()
+
+	tx := db.Begin()
+	_ = tx.Set("k", "should-not-survive")
+	err = tx.Commit()
+	if err == nil {
+		t.Skip("persistence did not fail here; the probe needs another way to break it")
+	}
+	t.Logf("commit reported: %v", err)
+
+	after := db.Begin()
+	defer after.Rollback() //nolint:errcheck // read-only probe
+	v, _, _ := after.Get("k")
+	if v == "should-not-survive" {
+		t.Errorf("the commit returned %v and its write is visible anyway: a caller that "+
+			"handles the error by retrying or reporting failure is wrong either way", err)
+	}
+}
+
+// A deleted key leaves a tombstone that GC keeps forever as the head version,
+// so the map entry never goes away. A workload that creates and deletes keys
+// grows without bound even with GC running.
+func TestReviewDeletedKeysAreEventuallyForgotten(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "tomb.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	const n = 500
+	for i := range n {
+		tx := db.Begin()
+		_ = tx.Set(fmt.Sprintf("key-%d", i), "x")
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range n {
+		tx := db.Begin()
+		_ = tx.Delete(fmt.Sprintf("key-%d", i))
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.GC(); err != nil {
+		t.Fatal(err)
+	}
+
+	db.mu.Lock()
+	remaining := len(db.versions)
+	db.mu.Unlock()
+	t.Logf("map entries after deleting and GCing %d keys: %d", n, remaining)
+	if remaining >= n {
+		t.Errorf("%d key entries remain after every key was deleted and GC ran: a tombstone "+
+			"is kept as the head version forever, so a create/delete workload grows without "+
+			"bound however often GC is called", remaining)
+	}
+}
