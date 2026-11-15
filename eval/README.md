@@ -1,7 +1,7 @@
 # eval — does the *harness* work?
 
-`benchmarks/` asks whether the **agent** can solve a task and answers with
-pass@k. Every task there runs on a bare agent: `wombat-bench` wires exactly one
+`benchmarks/` (here, in eval/) asks whether the **agent** can solve a task and answers with
+pass@k. Every task there runs on a bare agent: the suite runner wires exactly one
 option, `WithOverflowRecovery()`. So the mechanisms this project is actually
 about — skill gating, delegation, the permission gate, transcript strategies,
 the breaker/dedup split — are measured by **nothing**.
@@ -44,7 +44,7 @@ tool loop has **no legal cut point** and every window degrades to `Flat`.
 
 Not a bug (an over-long request is recoverable; an orphaned `tool_result` is a
 hard provider error), but it decides where windowing can help at all: only in
-multi-turn sessions, which is the `httpapi` case.
+multi-turn sessions, which is the daemon's case.
 
 Pinned by `TestSingleRunToolLoopHasNoLegalCutPoint`.
 
@@ -116,7 +116,7 @@ go test ./eval/wire/
 
 ### What it establishes
 
-Seven tests, all against the shipping `llm/openai` client — no substituted
+Seven tests, all against the shipping `pkg/core/llm/openai` client — no substituted
 `llm.Client` anywhere, so the HTTP, SSE and decode paths are the ones under
 test:
 
@@ -161,7 +161,7 @@ not evidence — this suite exists because "the tests are green" was not evidenc
 either.
 
 `Obs` is folded from the **event stream**, not the transcript, for the reason
-`rl/rollout.go` gives about its own `Steps`: a `tool_result` does not say
+`rl/rollout.go` (here, in eval/) gives about its own `Steps`: a `tool_result` does not say
 whether the permission gate refused the call or the tool failed, and it does not
 say how many tools were on offer when the model chose. `LLMStart.Tools` is the
 direct observable for progressive disclosure — a gated run reads `12, 12, 14`
@@ -188,7 +188,7 @@ millisecond, and it covers the mechanisms whose regressions are otherwise
 real money per run and should be reserved for the claims the other two cannot
 reach.
 
-The repo already ships `tape/` — content-hash record and replay, measured at
+The repo already ships `pkg/core/tape` — content-hash record and replay, measured at
 0.107 s against a dead endpoint with byte-identical output — and nothing uses
 it. Recording lane-3 probes once and replaying them is the cheapest way to give
 the expensive lane a regression mode.

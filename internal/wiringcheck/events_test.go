@@ -11,26 +11,29 @@ import (
 	"strings"
 	"testing"
 
-	wombat "github.com/hoobean1996/wombat-go"
-	"github.com/hoobean1996/wombat-go/httpapi"
-	"github.com/hoobean1996/wombat-go/permission"
+	"wombat/pkg/core"
+	"wombat/pkg/core/permission"
+	"wombat/pkg/core/review"
+	"wombat/pkg/daemon"
 )
 
 // TestEveryEventIsRegistered: each EventTypes() is a list kept by hand, and a
-// type left out of it still marshals and still streams — but wombat-tsgen
-// walks the list, so web/events.ts never declares it, and a front end that
-// switches over the union exhaustively has no case for it.
+// type left out of it still marshals and still streams — but every check that
+// walks the list, like the core's test that each event puts its "type" first,
+// never sees it, and neither does a renderer that walks the list to learn what
+// can arrive.
 //
-// An event is anything with a Kind() string method, which is all wombat.Event
+// An event is anything with a Kind() string method, which is all core.Event
 // asks. The test reads the source for them, so it needs no list of its own.
 func TestEveryEventIsRegistered(t *testing.T) {
 	for _, pkg := range []struct {
 		dir        string
-		registered []wombat.Event
+		registered []core.Event
 	}{
-		{"../..", wombat.EventTypes()},
-		{"../../permission", permission.EventTypes()},
-		{"../../httpapi", httpapi.EventTypes()},
+		{"../../pkg/core", core.EventTypes()},
+		{"../../pkg/core/permission", permission.EventTypes()},
+		{"../../pkg/daemon", daemon.EventTypes()},
+		{"../../pkg/core/review", review.EventTypes()},
 	} {
 		var names []string
 		for _, e := range pkg.registered {

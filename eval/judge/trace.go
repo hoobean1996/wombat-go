@@ -5,9 +5,9 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/hoobean1996/wombat-go"
-	"github.com/hoobean1996/wombat-go/llm"
-	"github.com/hoobean1996/wombat-go/rl"
+	"wombat/eval/rl"
+	"wombat/pkg/core"
+	"wombat/pkg/core/llm"
 )
 
 // view is the episode re-read as the things a rule needs to look at.
@@ -97,7 +97,7 @@ func newView(ep *rl.Episode) *view {
 		v.failed += len(s.Failed)
 	}
 
-	if ans, ok := ep.Outcome.(wombat.Answer); ok {
+	if ans, ok := ep.Outcome.(core.Answer); ok {
 		v.answer = ans.Text
 	}
 	if v.answer == "" {

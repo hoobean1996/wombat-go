@@ -4,9 +4,9 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/hoobean1996/wombat-go"
-	"github.com/hoobean1996/wombat-go/llm"
-	"github.com/hoobean1996/wombat-go/permission"
+	"wombat/pkg/core"
+	"wombat/pkg/core/llm"
+	"wombat/pkg/core/permission"
 )
 
 // Obs is one sample, folded out of the event stream.
@@ -128,7 +128,7 @@ func (c Call) ArgString(key string) string {
 // abandoned Run leaks its goroutine, and a probe that measured only the
 // successful samples would be measuring the mechanism where it was needed
 // least.
-func observe(run *wombat.Run) Obs {
+func observe(run *core.Run) Obs {
 	var o Obs
 	turn := 0
 	byUse := map[llm.ToolUseID]int{}
@@ -136,33 +136,33 @@ func observe(run *wombat.Run) Obs {
 
 	for run.Next() {
 		switch e := run.Event().(type) {
-		case wombat.IterStart:
+		case core.IterStart:
 			turn = e.N
 			if e.N > o.Iters {
 				o.Iters = e.N
 			}
 
-		case wombat.LLMStart:
+		case core.LLMStart:
 			o.Offered = append(o.Offered, e.Tools)
 
-		case wombat.LLMDone:
+		case core.LLMDone:
 			o.LLMCalls++
 			o.Usage.In += e.Usage.InputTokens
 			o.Usage.Out += e.Usage.OutputTokens
 			o.Usage.CacheRead += e.Usage.CacheReadTokens
 			o.Usage.CacheWrite += e.Usage.CacheWriteTokens
 
-		case wombat.Spend:
+		case core.Spend:
 			// The running tally; the last one seen is the total. Read from the
 			// event rather than summed here so a probe reports the same number
 			// the budget enforced.
 			o.Cost = e.CostUSD
 
-		case wombat.ToolStart:
+		case core.ToolStart:
 			byUse[e.UseID] = len(o.Calls)
 			o.Calls = append(o.Calls, Call{Turn: turn, Name: e.Name, Input: e.Input})
 
-		case wombat.ToolDone:
+		case core.ToolDone:
 			i, ok := byUse[e.UseID]
 			if !ok {
 				// A done with no start: record it rather than dropping it, so
@@ -182,17 +182,17 @@ func observe(run *wombat.Run) Obs {
 				Source: e.Source, Reason: e.Reason,
 			})
 
-		case wombat.SubagentStart:
+		case core.SubagentStart:
 			subs[e.Name] = len(o.Subs)
 			o.Subs = append(o.Subs, Sub{Name: e.Name, Depth: e.Depth})
 
-		case wombat.SubagentEnd:
+		case core.SubagentEnd:
 			if i, ok := subs[e.Name]; ok {
 				o.Subs[i].OK = e.OK
 				o.Subs[i].Err = e.Error
 			}
 
-		case wombat.SubagentEvent:
+		case core.SubagentEvent:
 			// Counted, not stored. The point of the wrapper is that the
 			// child's stream REACHES the parent; how many of its deltas did is
 			// the evidence, and keeping them would make an Obs the size of a
@@ -208,11 +208,11 @@ func observe(run *wombat.Run) Obs {
 		o.Err = err.Error()
 	}
 	switch out := run.Outcome().(type) {
-	case wombat.Answer:
+	case core.Answer:
 		o.Outcome, o.Answer = "answer", out.Text
-	case wombat.Paused:
+	case core.Paused:
 		o.Outcome = "paused"
-	case wombat.Submitted:
+	case core.Submitted:
 		o.Outcome = "submitted"
 	default:
 		o.Outcome = "none"

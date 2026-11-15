@@ -28,7 +28,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/hoobean1996/wombat-go/llm"
+	"wombat/pkg/core/llm"
 )
 
 // Shot is one assembled request, reduced to the parts a mechanism controls.

@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/hoobean1996/wombat-go"
-	"github.com/hoobean1996/wombat-go/eval/shape"
+	"wombat/eval/shape"
+	"wombat/pkg/core"
 )
 
 // A long multi-turn session is where a position-based window actually bites,
@@ -23,10 +23,10 @@ func TestSessionWindowCachePrefix(t *testing.T) {
 		trigger = 24 // delta = 16
 	)
 
-	run := func(name string, s wombat.Strategy) shape.Stability {
+	run := func(name string, s core.Strategy) shape.Stability {
 		t.Helper()
 		shots, err := shape.RunSession(context.Background(),
-			shape.Config{Payload: 200, Options: []wombat.Option{wombat.WithStrategy(s)}},
+			shape.Config{Payload: 200, Options: []core.Option{core.WithStrategy(s)}},
 			turns, calls)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
@@ -36,9 +36,9 @@ func TestSessionWindowCachePrefix(t *testing.T) {
 		return st
 	}
 
-	flat := run("flat", wombat.Flat)
-	sliding := run("sliding_window", wombat.SlidingWindow(keep))
-	anchored := run("sliding_window_at", wombat.SlidingWindowAt(trigger, keep))
+	flat := run("flat", core.Flat)
+	sliding := run("sliding_window", core.SlidingWindow(keep))
+	anchored := run("sliding_window_at", core.SlidingWindowAt(trigger, keep))
 
 	if flat.Reanchored != 0 {
 		t.Errorf("flat re-anchored %d times; a strategy that never trims cannot move the prefix",

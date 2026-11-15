@@ -1,4 +1,4 @@
-/wombat-jsonl
+/wombatd
 /wombat
 /bin/
 /runs/
@@ -6,5 +6,6 @@
 *.out
 .DS_Store
 /.env
-/wombat-bench
+/wombatd.yaml
+/eval/benchmarks/runs/
 /todos.db

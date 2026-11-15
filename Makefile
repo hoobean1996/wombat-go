@@ -1,11 +1,10 @@
 .DEFAULT_GOAL := check
 
-# Where the environment comes from. Defaults to a local .env, but points at
-# the OCaml wombat's config out of the box so an existing working setup can be
-# reused without copying secrets around:
-#
-#     make ask ENV=.env Q='what is 6*7?'
-ENV ?= .env
+# wombatd reads one YAML file and nothing else; copy wombatd.example.yaml to
+# start. The live runs further down still take their endpoint from the
+# environment, sourced from $(ENV).
+CONFIG ?= wombatd.yaml
+ENV    ?= .env
 
 GO      ?= go
 BIN     := bin
@@ -35,15 +34,42 @@ bin:
 	@mkdir -p $(BIN)
 	$(GO) build -o $(BIN)/ ./cmd/...
 
-.PHONY: ts
-ts: ## regenerate the TypeScript event declarations
-	@mkdir -p web
-	$(GO) run ./cmd/wombat-tsgen > web/events.ts
-	@echo "web/events.ts"
-
 .PHONY: serve
-serve: bin ## resumable SSE server + single-page client on :8080
-	@set -a; . $(ENV); set +a; $(BIN)/wombat-serve $(FLAGS)
+serve: bin ## the agent, configured by $(CONFIG): make serve CONFIG=other.yaml
+	$(BIN)/wombatd -config $(CONFIG)
+
+# ── Postgres, in podman ─────────────────────────────────────────────────
+#
+# A throwaway database for store.driver: postgres and for the store's tests,
+# on a port of its own so it cannot be mistaken for a real one:
+#
+#   make pg-up        # then, in wombatd.yaml: store: {driver: postgres, dsn: $(PG_DSN)}
+#   make test-pg      # the Postgres store's tests, the daemon's restart test among them
+#   make pg-down
+
+PODMAN  ?= podman
+PG_NAME ?= wombat-pg
+PG_PORT ?= 55432
+PG_DSN  ?= postgres://wombat:wombat@127.0.0.1:$(PG_PORT)/wombat
+
+.PHONY: pg-up
+pg-up: ## start a Postgres for wombatd in podman, on $(PG_PORT)
+	@$(PODMAN) machine inspect --format '{{.State}}' 2>/dev/null | grep -qx running || \
+	  $(PODMAN) machine start 2>/dev/null || true
+	@if $(PODMAN) container exists $(PG_NAME); then $(PODMAN) start $(PG_NAME) >/dev/null; else \
+	  $(PODMAN) run -d --name $(PG_NAME) -p 127.0.0.1:$(PG_PORT):5432 \
+	    -e POSTGRES_USER=wombat -e POSTGRES_PASSWORD=wombat -e POSTGRES_DB=wombat \
+	    docker.io/library/postgres:17 >/dev/null; fi
+	@until $(PODMAN) exec $(PG_NAME) pg_isready -U wombat -d wombat >/dev/null 2>&1; do sleep 0.5; done
+	@echo "postgres is up: $(PG_DSN)"
+
+.PHONY: pg-down
+pg-down: ## stop and remove the podman Postgres, and its data
+	-$(PODMAN) rm -f $(PG_NAME)
+
+.PHONY: test-pg
+test-pg: ## the Postgres store's tests, against $(PG_DSN)
+	$(GO) test -race -count=1 ./pkg/store/postgres/ -args -dsn '$(PG_DSN)'
 
 # ── live runs against a real endpoint ──────────────────────────────────
 #
@@ -51,26 +77,26 @@ serve: bin ## resumable SSE server + single-page client on :8080
 # environment on its own except the API key, so this is the only place
 # configuration is implicit.
 
-# For a prompt, use scripts/wombat rather than a make target: a make variable
-# cannot carry prose safely, because a quote or an && in it is re-parsed by the
-# shell make invokes and the pipeline silently breaks.
-#
-#   scripts/wombat "your prompt"
-#   scripts/wombat -r -working-dir /tmp/x "with 'quotes' && ampersands"
-
-.PHONY: ask-raw
-ask-raw: bin ## raw JSONL, no prompt quoting help: make ask-raw Q=hello
-	@set -a; . $(ENV); set +a; $(BIN)/wombat-jsonl $(FLAGS) "$(Q)"
-
 N     ?= 8
 C     ?= 4
 OUT   ?= runs
 TASKS ?=
 
+# The suite and the judge are tests that run only when handed arguments, so
+# `go test ./...` never spends money; everything after `--` is their own flags.
 .PHONY: bench
-bench: bin ## run the benchmark suite: make bench N=8 C=4 TASKS=todo-app,fix-bug
+bench: ## run the benchmark suite: make bench N=8 C=4 TASKS=todo-app,fix-bug
 	@set -a; . $(ENV); set +a; \
-	$(BIN)/wombat-bench -n $(N) -c $(C) -out $(OUT) $(if $(TASKS),-tasks $(TASKS),) $(FLAGS)
+	$(GO) test ./eval/benchmarks -run '^TestSuite$$' -count=1 -timeout 0 -v -args -- \
+	  -n $(N) -c $(C) -out $(abspath $(OUT)) $(if $(TASKS),-tasks $(TASKS),) $(FLAGS)
+
+IN ?= $(OUT)/episodes.jsonl
+
+.PHONY: judge
+judge: ## score a benchmark run's episodes: make judge IN=runs/episodes.jsonl [LLM=1]
+	@set -a; . $(ENV); set +a; \
+	$(GO) test ./eval/judge -run '^TestJudgeEpisodes$$' -count=1 -v -args -- \
+	  -in $(abspath $(IN)) $(if $(LLM),-llm,) $(FLAGS)
 
 .PHONY: models
 models: ## list model ids the configured OpenAI-compatible endpoint offers

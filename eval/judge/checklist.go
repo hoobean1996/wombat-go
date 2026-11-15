@@ -8,8 +8,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/hoobean1996/wombat-go/llm"
-	"github.com/hoobean1996/wombat-go/rl"
+	"wombat/eval/rl"
+	"wombat/pkg/core/llm"
 )
 
 // Checklist judges faithfulness one requirement at a time.

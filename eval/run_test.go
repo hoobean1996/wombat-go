@@ -12,10 +12,10 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/hoobean1996/wombat-go"
-	"github.com/hoobean1996/wombat-go/llm"
-	"github.com/hoobean1996/wombat-go/permission"
-	"github.com/hoobean1996/wombat-go/tool"
+	"wombat/pkg/core"
+	"wombat/pkg/core/llm"
+	"wombat/pkg/core/permission"
+	"wombat/pkg/core/tool"
 )
 
 var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -74,15 +74,15 @@ var spare = tool.Def{
 	Fn:          func(context.Context, json.RawMessage) (string, error) { return "unused", nil },
 }
 
-func arm(name string, opts []wombat.Option, extra ...tool.Def) Arm {
-	return Arm{Name: name, Build: func(d Deps) (*wombat.Agent, error) {
-		base := []wombat.Option{
-			wombat.WithClient(d.Client),
-			wombat.WithModel(d.Model),
-			wombat.WithLogger(quiet),
-			wombat.WithTools(append([]tool.Def{note(d.Workspace)}, extra...)...),
+func arm(name string, opts []core.Option, extra ...tool.Def) Arm {
+	return Arm{Name: name, Build: func(d Deps) (*core.Agent, error) {
+		base := []core.Option{
+			core.WithClient(d.Client),
+			core.WithModel(d.Model),
+			core.WithLogger(quiet),
+			core.WithTools(append([]tool.Def{note(d.Workspace)}, extra...)...),
 		}
-		return wombat.New(append(base, opts...)...)
+		return core.New(append(base, opts...)...)
 	}}
 }
 
@@ -197,7 +197,7 @@ func TestAFailedSampleIsDataAndKeepsItsWorkspace(t *testing.T) {
 	down := llm.ClientFunc(func(context.Context, llm.Request) (llm.Response, error) {
 		return llm.Response{}, errors.New("provider down")
 	})
-	p := &Probe{ID: "broken", Prompt: "anything", Arms: []Arm{arm("down", []wombat.Option{wombat.WithClient(down)})}}
+	p := &Probe{ID: "broken", Prompt: "anything", Arms: []Arm{arm("down", []core.Option{core.WithClient(down)})}}
 	r := Run(context.Background(), Config{Client: llm.ClientFunc(replay), Samples: 1, Dir: dir}, []*Probe{p})[0]
 	if r.Err != nil {
 		t.Fatalf("Err = %v: a sample that failed is an answer, not a broken probe", r.Err)
@@ -233,7 +233,7 @@ func TestProbesThatCannotBeEvaluated(t *testing.T) {
 		}
 	})
 	t.Run("build fails", func(t *testing.T) {
-		p := &Probe{ID: "build", Arms: []Arm{{Name: "a", Build: func(Deps) (*wombat.Agent, error) {
+		p := &Probe{ID: "build", Arms: []Arm{{Name: "a", Build: func(Deps) (*core.Agent, error) {
 			return nil, errors.New("no agent")
 		}}}}
 		r := Run(context.Background(), cfg(t.TempDir()), []*Probe{p})[0]
@@ -278,8 +278,8 @@ func TestProbeMaxItersCapsEveryArm(t *testing.T) {
 }
 
 func TestObserveRecordsPermissionVerdictsAndRefusedCalls(t *testing.T) {
-	gate := wombat.WithToolMiddleware(permission.Gate(permission.ReadOnly(), nil))
-	p := &Probe{ID: "perm", Prompt: "write a note", Arms: []Arm{arm("gated", []wombat.Option{gate})}}
+	gate := core.WithToolMiddleware(permission.Gate(permission.ReadOnly(), nil))
+	p := &Probe{ID: "perm", Prompt: "write a note", Arms: []Arm{arm("gated", []core.Option{gate})}}
 	r := Run(context.Background(), Config{Client: llm.ClientFunc(replay), Samples: 1, Dir: t.TempDir()}, []*Probe{p})[0]
 	if r.Err != nil {
 		t.Fatal(r.Err)
@@ -303,16 +303,16 @@ func TestObserveCountsWhatADelegateStreams(t *testing.T) {
 			return llm.Response{Content: []llm.ContentBlock{llm.Text{Text: "found it"}}, StopReason: llm.StopEndTurn}, nil
 		}
 		return llm.Response{
-			Content:    []llm.ContentBlock{llm.ToolUse{ID: "d1", Name: wombat.DefaultDelegateName, Input: json.RawMessage(`{"task":"look around"}`)}},
+			Content:    []llm.ContentBlock{llm.ToolUse{ID: "d1", Name: core.DefaultDelegateName, Input: json.RawMessage(`{"task":"look around"}`)}},
 			StopReason: llm.StopToolUse,
 		}, nil
 	})
-	parent := Arm{Name: "delegating", Build: func(d Deps) (*wombat.Agent, error) {
-		child, err := wombat.New(wombat.WithName("child"), wombat.WithClient(d.Client), wombat.WithLogger(quiet))
+	parent := Arm{Name: "delegating", Build: func(d Deps) (*core.Agent, error) {
+		child, err := core.New(core.WithName("child"), core.WithClient(d.Client), core.WithLogger(quiet))
 		if err != nil {
 			return nil, err
 		}
-		return wombat.New(wombat.WithClient(d.Client), wombat.WithLogger(quiet), wombat.WithTools(wombat.DelegateTool(child)))
+		return core.New(core.WithClient(d.Client), core.WithLogger(quiet), core.WithTools(core.DelegateTool(child)))
 	}}
 	p := &Probe{ID: "delegate", Prompt: "find something", Arms: []Arm{parent}}
 	r := Run(context.Background(), Config{Client: client, Samples: 1, Dir: t.TempDir()}, []*Probe{p})[0]

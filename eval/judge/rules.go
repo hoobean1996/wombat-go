@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/hoobean1996/wombat-go/rl"
+	"wombat/eval/rl"
 )
 
 // Rules is the deterministic judge.

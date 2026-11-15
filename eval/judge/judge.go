@@ -39,7 +39,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/hoobean1996/wombat-go/rl"
+	"wombat/eval/rl"
 )
 
 // Criterion is one dimension of quality.

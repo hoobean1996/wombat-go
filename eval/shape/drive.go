@@ -9,9 +9,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/hoobean1996/wombat-go"
-	"github.com/hoobean1996/wombat-go/llm"
-	"github.com/hoobean1996/wombat-go/tool"
+	"wombat/pkg/core"
+	"wombat/pkg/core/llm"
+	"wombat/pkg/core/tool"
 )
 
 // FillerTool is the tool a shape run calls to make the transcript grow.
@@ -58,7 +58,7 @@ func (r *Recorder) Shots() []Shot {
 // A tool call per turn rather than plain text, because a strategy only has
 // something to trim once the transcript is carrying tool_use/tool_result
 // PAIRS — and pairs are also the thing a position-based cut is not allowed to
-// split, so this is the shape that exercises [wombat.SafeCut] rather than
+// split, so this is the shape that exercises [core.SafeCut] rather than
 // stepping around it.
 func ToolLoop(lastTurn int) func(int) llm.Response {
 	return func(turn int) llm.Response {
@@ -118,10 +118,10 @@ type Config struct {
 	// Options are applied on top of the defaults, so a caller supplies only
 	// the mechanism under test:
 	//
-	//	shape.Run(ctx, shape.Config{Turns: 12, Options: []wombat.Option{
-	//	    wombat.WithStrategy(wombat.SlidingWindowAt(20, 8)),
+	//	shape.Run(ctx, shape.Config{Turns: 12, Options: []core.Option{
+	//	    core.WithStrategy(core.SlidingWindowAt(20, 8)),
 	//	}})
-	Options []wombat.Option
+	Options []core.Option
 
 	// Tools replaces the default single filler tool.
 	Tools []tool.Def
@@ -132,9 +132,9 @@ type Config struct {
 	// It is not a convenience. A position-based window can only cut
 	// immediately before a user turn that carries no tool_result, and in a
 	// single ReAct run there is exactly one such turn — the opening
-	// instruction at index 0, which [wombat.SafeCut] deliberately refuses to
+	// instruction at index 0, which [core.SafeCut] deliberately refuses to
 	// cut at. So a pure tool loop has NO legal cut point and every window
-	// degrades to [wombat.Flat]. Windowing is a multi-turn mechanism, and
+	// degrades to [core.Flat]. Windowing is a multi-turn mechanism, and
 	// measuring it needs a multi-turn transcript.
 	Seed []llm.Message
 }
@@ -182,21 +182,21 @@ func Run(ctx context.Context, cfg Config) ([]Shot, error) {
 	// Silent by default. This is a measuring instrument: its diagnostics are
 	// the caller's tool logs, not its own, and a suite that prints a line per
 	// filler call buries the one number the run exists to produce.
-	opts := append([]wombat.Option{
-		wombat.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
-		wombat.WithClient(rec),
-		wombat.WithTools(tools...),
-		wombat.WithModel("shape-recorder"),
-		wombat.WithMaxIters(cfg.Turns + 2),
+	opts := append([]core.Option{
+		core.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+		core.WithClient(rec),
+		core.WithTools(tools...),
+		core.WithModel("shape-recorder"),
+		core.WithMaxIters(cfg.Turns + 2),
 	}, cfg.Options...)
 
-	a, err := wombat.New(opts...)
+	a, err := core.New(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("shape: building the agent: %w", err)
 	}
-	in := wombat.Ask(cfg.Prompt)
+	in := core.Ask(cfg.Prompt)
 	if len(cfg.Seed) > 0 {
-		in = wombat.Continue(append(append([]llm.Message(nil), cfg.Seed...), llm.UserText(cfg.Prompt)))
+		in = core.Continue(append(append([]llm.Message(nil), cfg.Seed...), llm.UserText(cfg.Prompt)))
 	}
 	if _, err := a.Run(ctx, in); err != nil {
 		return nil, fmt.Errorf("shape: run: %w", err)
@@ -262,15 +262,15 @@ func RunSession(ctx context.Context, cfg Config, turns, callsPerTurn int) ([]Sho
 		}
 	})
 
-	opts := append([]wombat.Option{
-		wombat.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
-		wombat.WithClient(rec),
-		wombat.WithTools(tools...),
-		wombat.WithModel("shape-recorder"),
-		wombat.WithMaxIters(perTurn + 2),
+	opts := append([]core.Option{
+		core.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+		core.WithClient(rec),
+		core.WithTools(tools...),
+		core.WithModel("shape-recorder"),
+		core.WithMaxIters(perTurn + 2),
 	}, cfg.Options...)
 
-	a, err := wombat.New(opts...)
+	a, err := core.New(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("shape: building the agent: %w", err)
 	}
@@ -278,11 +278,11 @@ func RunSession(ctx context.Context, cfg Config, turns, callsPerTurn int) ([]Sho
 	prior := append([]llm.Message(nil), cfg.Seed...)
 	for t := 1; t <= turns; t++ {
 		instruction := fmt.Sprintf("session turn %d: %s", t, strings.Repeat("q", cfg.Payload/4))
-		var in wombat.Input
+		var in core.Input
 		if len(prior) == 0 {
-			in = wombat.Ask(instruction)
+			in = core.Ask(instruction)
 		} else {
-			in = wombat.Then(prior, instruction)
+			in = core.Then(prior, instruction)
 		}
 
 		run := a.Start(ctx, in)

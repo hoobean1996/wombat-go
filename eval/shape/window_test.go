@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/hoobean1996/wombat-go"
-	"github.com/hoobean1996/wombat-go/eval/shape"
+	"wombat/eval/shape"
+	"wombat/pkg/core"
 )
 
 // Inside ONE run a position-based window cannot trim a tool loop at all, and
@@ -28,17 +28,17 @@ func TestSingleRunToolLoopHasNoLegalCutPoint(t *testing.T) {
 
 	for _, tc := range []struct {
 		name     string
-		strategy wombat.Strategy
+		strategy core.Strategy
 	}{
-		{"flat", wombat.Flat},
-		{"sliding_window", wombat.SlidingWindow(6)},
-		{"sliding_window_at", wombat.SlidingWindowAt(14, 6)},
+		{"flat", core.Flat},
+		{"sliding_window", core.SlidingWindow(6)},
+		{"sliding_window_at", core.SlidingWindowAt(14, 6)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			shots, err := shape.Run(context.Background(), shape.Config{
 				Turns:   turns,
 				Payload: 128,
-				Options: []wombat.Option{wombat.WithStrategy(tc.strategy)},
+				Options: []core.Option{core.WithStrategy(tc.strategy)},
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -68,10 +68,10 @@ func TestSystemPromptNeverDriftsWithinARun(t *testing.T) {
 	shots, err := shape.Run(context.Background(), shape.Config{
 		Turns:   8,
 		Payload: 64,
-		Options: []wombat.Option{
-			wombat.WithSystemBlock("policy", "be brief"),
-			wombat.WithStrategy(wombat.SlidingWindowAt(10, 4)),
-			wombat.WithTurnNotice(func(_ context.Context, iter int) string {
+		Options: []core.Option{
+			core.WithSystemBlock("policy", "be brief"),
+			core.WithStrategy(core.SlidingWindowAt(10, 4)),
+			core.WithTurnNotice(func(_ context.Context, iter int) string {
 				if iter == 4 {
 					return "(reminder: you are halfway through the budget)"
 				}

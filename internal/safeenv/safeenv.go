@@ -42,7 +42,7 @@ import (
 // Leaving SSH_AUTH_SOCK out hides where the socket is, and no more: the
 // socket itself is still there, usually under TMPDIR or /tmp, which a child
 // can list as well as the harness can. An environment filter cannot close a
-// socket; builtin.SandboxRunner is what does.
+// socket; sandbox.Confined is what does.
 var DefaultAllow = []string{
 	// The process basics.
 	"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "TZ",

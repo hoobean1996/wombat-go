@@ -6,7 +6,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/hoobean1996/wombat-go/rl"
+	"wombat/eval/rl"
 )
 
 // Oracle judges correctness from the verifiers that actually checked the work.

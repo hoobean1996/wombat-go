@@ -8,11 +8,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hoobean1996/wombat-go"
-	"github.com/hoobean1996/wombat-go/eval/judge"
-	"github.com/hoobean1996/wombat-go/llm"
-	"github.com/hoobean1996/wombat-go/llm/openai"
-	"github.com/hoobean1996/wombat-go/rl"
+	"wombat/eval/judge"
+	"wombat/eval/rl"
+	"wombat/pkg/core"
+	"wombat/pkg/core/llm"
+	"wombat/pkg/core/llm/openai"
 )
 
 // Live calibration against a real model.
@@ -149,7 +149,7 @@ func loadEpisode(t *testing.T, path string) *rl.Episode {
 			continue
 		}
 		if txt := strings.TrimSpace(llm.TextOf(msgs[i].Content)); txt != "" {
-			ep.Outcome = wombat.Answer{Text: txt}
+			ep.Outcome = core.Answer{Text: txt}
 			break
 		}
 	}

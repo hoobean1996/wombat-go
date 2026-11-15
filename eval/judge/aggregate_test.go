@@ -4,7 +4,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/hoobean1996/wombat-go/eval/judge"
+	"wombat/eval/judge"
 )
 
 func report(task string, pass bool, cause judge.Failure, repair judge.RepairTarget, reward float64) *judge.Report {

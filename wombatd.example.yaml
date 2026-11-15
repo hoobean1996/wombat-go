@@ -1,0 +1,298 @@
+# wombatd's configuration. Copy it to wombatd.yaml, which git ignores, fill in
+# the model section, and run `make serve` (or `wombatd -config <file>`).
+#
+# Every key is shown with its default, so your file need name only what it
+# changes — the model section is usually enough. A key wombatd does not know
+# is an error rather than ignored: a misspelt setting would otherwise silently
+# not take effect.
+#
+# The file can hold secrets — model.api_key, server.token, store.dsn,
+# outbox.headers — so keep it readable by you alone (chmod 600); wombatd warns
+# when it is not.
+#
+# Clients talk to wombatd over its HTTP API only: start a session with
+# POST /api/sessions, follow it on GET /api/sessions/{id}/events, post events
+# to POST /api/events, and read what the agent says from GET /api/outbox.
+
+# ── who may call ─────────────────────────────────────────────────────────
+server:
+  # Loopback by default. Without a token there is no authentication, and
+  # anything that can reach the port can run the agent and read every
+  # transcript.
+  addr: 127.0.0.1:8080
+
+  # A bearer token every API request must carry, as Authorization: Bearer.
+  # Beyond loopback, a server without one logs that anyone who can reach it
+  # can drive it.
+  token: ""
+
+  # Browser origins allowed to call the API, or ["*"] for any. Empty sends no
+  # CORS headers, which is right for every client that is not a web page.
+  # Without a token, * lets any page the operator visits drive this agent
+  # with the operator's network access.
+  cors: []
+
+  # Prometheus metrics on GET /metrics. On by default: the process is already
+  # listening, the endpoint costs one handler and an in-memory registry, and
+  # a server whose token spend and tool failures are invisible is one nobody
+  # can operate.
+  metrics: true
+
+  # debug, info, warn or error, on stderr.
+  log: info
+
+# ── where everything is kept ─────────────────────────────────────────────
+# The sessions, and the three tables an always-on agent runs on: the inbox of
+# events waiting for a turn, the timers that will put more there, and the
+# outbox of what the agent has said.
+store:
+  # memory keeps it all in this process, and loses it when wombatd stops.
+  # postgres keeps it in a database, so a restart carries on where it
+  # stopped: what was waiting is still waiting, a turn cut short runs again,
+  # and timers fire on time.
+  driver: memory
+
+  # For postgres: postgres://user:password@host:5432/db. The tables are made
+  # on the first start, in the schema search_path names — add
+  # ?search_path=name to keep two daemons' tables apart in one database. One
+  # wombatd to a schema: a second one is refused at the start. `make pg-up`
+  # starts one in podman.
+  dsn: ""
+
+# ── how the inbox is worked ──────────────────────────────────────────────
+# Nothing runs a turn but an event: a message, a decision, a timer, a webhook.
+# A session takes every event waiting for it at once, as one turn, and never
+# has two turns at once.
+daemon:
+  # How often the store is looked at for timers that are due and events to
+  # try again. An event posted to this wombatd starts its turn at once.
+  poll: 1s
+
+  # How many turns run at once, across sessions. What is over it waits its
+  # turn in the inbox.
+  max_runs: 4
+
+  # How many times an event is tried before it fails: a turn the provider
+  # fell over in, or that a restart cut short, runs again — from the
+  # transcript it started from, so nothing is in the conversation twice.
+  attempts: 3
+
+  # How long a session with nothing to do stays in memory. It stays in the
+  # store regardless, and comes back when something wants it.
+  idle: 30m
+
+# ── where what the agent says goes ───────────────────────────────────────
+# Replies, questions, calls waiting for a decision, and what the agent sends
+# with its send_message tool all go to the outbox. A client long-polls
+# GET /api/outbox?after=<last id>&wait=30s and acks what it handled with
+# POST /api/outbox/{id}/ack.
+outbox:
+  # Or wombatd POSTs each message, as JSON, to this URL, in order, until it
+  # answers 2xx. A message may arrive twice; its id says so.
+  webhook: ""
+
+  # Headers sent with every POST to the webhook: the Authorization it checks.
+  headers: {}
+
+# ── the model ────────────────────────────────────────────────────────────
+model:
+  # openai — any OpenAI-compatible /v1/chat/completions endpoint — or
+  # anthropic, for /v1/messages.
+  provider: openai
+
+  # The model id a session gets unless it asks for another. Empty takes the
+  # provider package's default.
+  name: gpt-4o-mini
+
+  # The API root. Empty is the provider's public endpoint. For openai, give
+  # the origin and /v1; /chat/completions is appended.
+  base_url: https://api.openai.com/v1
+
+  # Empty sends no key, which is what a local vLLM or Ollama wants — though
+  # the provider packages look for $OPENAI_API_KEY or $ANTHROPIC_API_KEY
+  # before giving up.
+  api_key: ""
+
+  # An HTTP proxy, as host:port or a URL. Empty uses the usual proxy
+  # environment variables, as every Go program does.
+  proxy: ""
+
+  # Headers added to every request, after the provider's own: a gateway's
+  # routing key, say.
+  headers: {}
+
+  # auto, always or never. never gives up the live text for the accounting,
+  # on a gateway that drops the token counts from a streamed reply — without
+  # them, turn.budget_usd cannot see what was spent.
+  stream: auto
+
+  # The cap on one reply, in tokens.
+  max_tokens: 8192
+
+  # A system prompt in place of the harness's own. A | block keeps the line
+  # breaks:
+  #
+  #   system: |
+  #     You are …
+  system: ""
+
+# ── what a session may touch ─────────────────────────────────────────────
+tools:
+  # The root of the shell and file tools. A session may name a workspace
+  # inside it, and none can get out of it.
+  working_dir: .
+
+  # off, readonly, workspace or ask: the policy every tool call is checked
+  # against, and the strictest a session may choose for itself. workspace
+  # gives the agent its full tool set, but puts commands, and anything outside
+  # working_dir, in front of a person: the turn stops with the call waiting,
+  # the outbox says so, GET .../approvals lists it, and a POST decides it —
+  # after which the turn carries on. off offers read-only tools, kept inside
+  # the session's workspace, and asks no one: an agent a client can reach
+  # does not get an ungated shell by default. Whatever the policy, the
+  # agent's own send_message and timer tools are never asked about.
+  permission: workspace
+
+  # Run every command the tools spawn inside the platform sandbox —
+  # sandbox-exec on macOS, bwrap on Linux: writes only under the session's
+  # workspace and the temp directory, and credential directories unreadable.
+  # The commands done.check, done.accept and the review run go through it
+  # too. wombatd refuses to start if the sandbox cannot be applied, rather
+  # than serving unconfined.
+  confine: false
+
+  # What a confined command may reach: loopback, none or full.
+  confine_network: loopback
+
+  # A JSON file of MCP servers, in the usual {"mcpServers": {...}} form,
+  # whose tools every session is offered — named <server>__<tool>, and held
+  # to the same permission as the built-in ones. The servers are started once
+  # and shared.
+  mcp: ""
+
+  # A directory of <name>/SKILL.md, offered as skills the model can load.
+  skills_dir: ""
+
+  # Offer view_media, which shows the model an image or a PDF from the
+  # workspace. Off by default: a model that cannot read images answers a
+  # request carrying one with a 400.
+  media: false
+
+  # Offer a read-only sub-agent through the delegate tool, held to the
+  # session's policy.
+  delegate: false
+
+# ── how far one turn may go ──────────────────────────────────────────────
+turn:
+  # The cost cap in USD per turn, not per conversation: a cumulative cap kills
+  # a session mid-sentence on its fourth question, for reasons nobody can
+  # see. 0 is no cap.
+  budget_usd: 1
+
+  # A wall-clock cap per turn, written as Go writes durations: 90s, 10m. 0s
+  # is no cap.
+  wall: 0s
+
+  # The iteration cap per turn, and the most a session may ask for.
+  max_iters: 12
+
+  # How many read-only tool calls of one batch run at once. A call that
+  # writes or executes always runs alone, in order.
+  tool_parallelism: 4
+
+  # The model's context window, in tokens. Set, the transcript is kept under
+  # 70% of it by eliding old tool results, rather than sent whole until the
+  # provider refuses it. 0 leaves the transcript alone.
+  context_window: 0
+
+  # Once the conversation reaches this fraction of context_window — 0.85, say
+  # — summarize its oldest part into the transcript, keeping the newest
+  # quarter of a window as it was. One model call per compaction. 0 is off.
+  compact_at: 0
+
+# ── what every session does ──────────────────────────────────────────────
+# build   Do the task.
+# plan    Write PLAN.md, TODO.md and Verifier.md for the task, and no code.
+#         Plan with your strongest model and build with a cheaper one:
+#         knowing what to verify needs breadth, and costs a few thousand
+#         tokens once, while the build costs a hundred iterations.
+#         done.accept and done.regressions do not apply to a plan.
+# review  Review the code already in the workspace instead of building; the
+#         message says what the code was meant to do. Running a review again
+#         over the same code is the only way to tell a better reviewer from
+#         a different build.
+mode: build
+
+# ── when a build is done ─────────────────────────────────────────────────
+# Checked whenever the model ends its turn. The first check that fails sends
+# the model back with what it said, and the turn goes on.
+done:
+  # A shell command that says whether the work is done — go test ./..., say.
+  # It runs in the session's workspace through the same runner as the
+  # agent's own commands; a non-zero exit sends the model back with its
+  # output.
+  check: ""
+
+  # How many times check and accept, together, may send the model back in
+  # one turn.
+  attempts: 3
+
+  # Deterministic checks: go build, go vet and go test pass, there are tests
+  # at all, TODO.md has no unticked item and Verifier.md is settled.
+  accept: false
+
+  # A directory with one test file for each defect ever found on this task.
+  # They are copied into the workspace before each turn and must pass at the
+  # accept gate, and a defect a review's fixer repaired is added to it.
+  # Without it, each run starts from nothing: a defect repaired on one run
+  # came back on the next, and six review sweeps missed it.
+  regressions: ""
+
+# ── the review ───────────────────────────────────────────────────────────
+# Once an answer has passed the checks, fresh reviewers read the workspace —
+# fresh, because the builder has just spent its context concluding the code
+# is right. A reviewer reports only a defect it can demonstrate with a Go test
+# that fails against the code, so a finding is established by running it, not
+# by believing it. The result arrives on the stream as a "reviewed" event.
+# The review is part of the turn, spends from turn.budget_usd, and needs a
+# tools.permission that lets the reviewers write a test and run go test.
+review:
+  # Review after every turn. mode: review reviews whatever this says.
+  enabled: false
+
+  # Independent passes, each with a fresh reviewer and a different lens:
+  # error paths, shared state, entry points, gaps in the tests. One pass is
+  # not a clean bill of health, and converging takes at least 6, because
+  # every lens must run before a dry pass counts.
+  sweeps: 1
+
+  # Stop early after this many passes in a row find nothing new. This, not
+  # sweeps, is the real stop condition: running out of passes is not
+  # evidence that anything is clean.
+  dry: 2
+
+  # The iteration cap for each reviewer; 0 is turn.max_iters, at most 200.
+  # Scale it with the code under review: a reviewer that runs out mid-read
+  # reports only what it reached, and that reads like a thorough review that
+  # found little.
+  iters: 0
+
+  # Repair rounds after a review. Each hands the failing tests to a fresh
+  # fixer and runs them again; a defect counts as fixed only when its own
+  # test still exists and passes.
+  fix: 0
+
+# ── what is written down ─────────────────────────────────────────────────
+record:
+  # Record every model and tool call of every session on this JSONL tape, or
+  # replay them from it.
+  tape: ""
+
+  # auto, record or replay.
+  tape_mode: auto
+
+  # Write an NDJSON trace of every session here.
+  trace: ""
+
+  # With trace: render it as a self-contained HTML report on shutdown.
+  trace_html: ""

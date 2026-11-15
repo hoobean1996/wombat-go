@@ -9,16 +9,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hoobean1996/wombat-go"
-	"github.com/hoobean1996/wombat-go/eval/wire"
-	"github.com/hoobean1996/wombat-go/llm"
-	"github.com/hoobean1996/wombat-go/llm/openai"
+	"wombat/eval/wire"
+	"wombat/pkg/core"
+	"wombat/pkg/core/llm"
+	"wombat/pkg/core/llm/openai"
 )
 
 // agentOn builds the REAL OpenAI client against the fault server. Nothing here
 // substitutes an llm.Client: the point is to exercise the HTTP and SSE code
 // that ships, which a scripted client never reaches.
-func agentOn(t *testing.T, s *wire.Server, opts ...wombat.Option) *wombat.Agent {
+func agentOn(t *testing.T, s *wire.Server, opts ...core.Option) *core.Agent {
 	t.Helper()
 	c, err := openai.New(openai.Config{
 		APIKey:    s.APIKey,
@@ -29,19 +29,19 @@ func agentOn(t *testing.T, s *wire.Server, opts ...wombat.Option) *wombat.Agent 
 	if err != nil {
 		t.Fatalf("building the client: %v", err)
 	}
-	base := []wombat.Option{
-		wombat.WithClient(c),
-		wombat.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
-		wombat.WithMaxIters(10),
+	base := []core.Option{
+		core.WithClient(c),
+		core.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+		core.WithMaxIters(10),
 		// On the AGENT, not only on the client. The reply cap the empty-turn
 		// heuristic reasons about is the agent's — it is what goes into
 		// llm.Request.MaxTokens and therefore what was actually asked for.
 		// Setting only openai.Config.MaxTokens leaves the agent at its 8192
 		// default, the request carries 8192, and a test that expected the
 		// smaller number would be asserting against a cap nobody used.
-		wombat.WithMaxTokens(256),
+		core.WithMaxTokens(256),
 	}
-	a, err := wombat.New(append(base, opts...)...)
+	a, err := core.New(append(base, opts...)...)
 	if err != nil {
 		t.Fatalf("building the agent: %v", err)
 	}
@@ -70,11 +70,11 @@ func TestEmptyTurnIsRetriedAndThenAnswers(t *testing.T) {
 	}, wire.Options{})
 	defer s.Close()
 
-	out, err := agentOn(t, s).Run(context.Background(), wombat.Ask("hello"))
+	out, err := agentOn(t, s).Run(context.Background(), core.Ask("hello"))
 	if err != nil {
 		t.Fatalf("run failed: %v", err)
 	}
-	ans, ok := out.(wombat.Answer)
+	ans, ok := out.(core.Answer)
 	if !ok {
 		t.Fatalf("outcome = %T, want Answer", out)
 	}
@@ -97,8 +97,8 @@ func TestEmptyTurnGivesUpAfterThreeAttempts(t *testing.T) {
 	}, wire.Options{})
 	defer s.Close()
 
-	_, err := agentOn(t, s).Run(context.Background(), wombat.Ask("hello"))
-	if !errors.Is(err, wombat.ErrEmptyTurn) {
+	_, err := agentOn(t, s).Run(context.Background(), core.Ask("hello"))
+	if !errors.Is(err, core.ErrEmptyTurn) {
 		t.Fatalf("err = %v, want ErrEmptyTurn", err)
 	}
 	if got := s.Consumed(); got != 3 {
@@ -124,8 +124,8 @@ func TestReasoningBudgetExhaustedIsNotRetried(t *testing.T) {
 	}, wire.Options{})
 	defer s.Close()
 
-	_, err := agentOn(t, s).Run(context.Background(), wombat.Ask("hard question"))
-	if !errors.Is(err, wombat.ErrEmptyTurn) {
+	_, err := agentOn(t, s).Run(context.Background(), core.Ask("hard question"))
+	if !errors.Is(err, core.ErrEmptyTurn) {
 		t.Fatalf("err = %v, want ErrEmptyTurn", err)
 	}
 	if got := s.Consumed(); got != 1 {
@@ -144,7 +144,7 @@ func TestPartialAnswerSurvivesAMidStreamReset(t *testing.T) {
 		wire.Options{})
 	defer s.Close()
 
-	run := agentOn(t, s).Start(context.Background(), wombat.Ask("hello"))
+	run := agentOn(t, s).Start(context.Background(), core.Ask("hello"))
 	defer run.Close()
 	for run.Next() { //nolint:revive // draining
 	}
@@ -180,10 +180,10 @@ func TestContextOverflowEngagesTheLadder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err := wombat.New(
-		wombat.WithClient(llm.Chain(c, wombat.WithOverflowRecovery())),
-		wombat.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
-		wombat.WithMaxIters(4),
+	a, err := core.New(
+		core.WithClient(llm.Chain(c, core.WithOverflowRecovery())),
+		core.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+		core.WithMaxIters(4),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -201,7 +201,7 @@ func TestContextOverflowEngagesTheLadder(t *testing.T) {
 		)
 		_ = i
 	}
-	if _, err := a.Run(context.Background(), wombat.Then(prior, "the new question")); err != nil {
+	if _, err := a.Run(context.Background(), core.Then(prior, "the new question")); err != nil {
 		t.Fatalf("run failed: %v", err)
 	}
 
@@ -233,14 +233,14 @@ func TestRateLimitIsRetried(t *testing.T) {
 	}
 	policy := llm.DefaultRetryPolicy
 	policy.Base = time.Millisecond
-	a, err := wombat.New(
-		wombat.WithClient(llm.Chain(c, llm.WithRetry(policy))),
-		wombat.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+	a, err := core.New(
+		core.WithClient(llm.Chain(c, llm.WithRetry(policy))),
+		core.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.Run(context.Background(), wombat.Ask("hello")); err != nil {
+	if _, err := a.Run(context.Background(), core.Ask("hello")); err != nil {
 		t.Fatalf("run failed: %v", err)
 	}
 	if got := s.Consumed(); got != 2 {
@@ -261,14 +261,14 @@ func TestRejectedRequestsDoNotConsumeTheScript(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	badAgent, err := wombat.New(
-		wombat.WithClient(bad),
-		wombat.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+	badAgent, err := core.New(
+		core.WithClient(bad),
+		core.WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := badAgent.Run(context.Background(), wombat.Ask("hello")); err == nil {
+	if _, err := badAgent.Run(context.Background(), core.Ask("hello")); err == nil {
 		t.Fatal("a call with the wrong bearer token succeeded")
 	}
 	if got := s.Consumed(); got != 0 {
@@ -279,11 +279,11 @@ func TestRejectedRequestsDoNotConsumeTheScript(t *testing.T) {
 	}
 
 	// The script is still where it was, so the good client gets behavior 0.
-	out, err := agentOn(t, s).Run(context.Background(), wombat.Ask("hello"))
+	out, err := agentOn(t, s).Run(context.Background(), core.Ask("hello"))
 	if err != nil {
 		t.Fatalf("run failed: %v", err)
 	}
-	if ans, ok := out.(wombat.Answer); !ok || !strings.Contains(ans.Text, "first") {
+	if ans, ok := out.(core.Answer); !ok || !strings.Contains(ans.Text, "first") {
 		t.Errorf("outcome = %#v, want the first scripted behavior", out)
 	}
 }
