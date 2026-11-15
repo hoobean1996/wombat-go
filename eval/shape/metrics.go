@@ -71,7 +71,7 @@ func PrefixStability(shots []Shot) Stability {
 //
 // It must always be empty. The system block is the head of the cache prefix,
 // so one byte of drift there costs every hit behind it — and nothing about a
-// correct run should rebuild it, since [wombat.New] renders it once and freezes
+// correct run should rebuild it, since [core.New] renders it once and freezes
 // the string.
 func SystemDrift(shots []Shot) []int {
 	var out []int

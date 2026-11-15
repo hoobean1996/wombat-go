@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/hoobean1996/wombat-go/rl"
+	"wombat/eval/rl"
 )
 
 // Panel is the judges to try, in order.

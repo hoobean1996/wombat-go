@@ -7,9 +7,9 @@ import (
 	"io"
 	"os"
 
-	"github.com/hoobean1996/wombat-go"
-	"github.com/hoobean1996/wombat-go/llm"
-	"github.com/hoobean1996/wombat-go/rl"
+	"wombat/eval/rl"
+	"wombat/pkg/core"
+	"wombat/pkg/core/llm"
 )
 
 // episodeLine mirrors what rl.Report.WriteJSONL emits.
@@ -89,7 +89,7 @@ func ReadJSONL(r io.Reader) ([]*rl.Episode, error) {
 			})
 		}
 		if e.Answer != "" {
-			ep.Outcome = wombat.Answer{Text: e.Answer}
+			ep.Outcome = core.Answer{Text: e.Answer}
 		}
 		if e.Error != "" {
 			ep.Err = fmt.Errorf("%s", e.Error)

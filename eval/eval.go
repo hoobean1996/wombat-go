@@ -38,10 +38,10 @@ package eval
 import (
 	"time"
 
-	"github.com/hoobean1996/wombat-go"
-	"github.com/hoobean1996/wombat-go/governor"
-	"github.com/hoobean1996/wombat-go/llm"
-	"github.com/hoobean1996/wombat-go/skill"
+	"wombat/pkg/core"
+	"wombat/pkg/core/governor"
+	"wombat/pkg/core/llm"
+	"wombat/pkg/core/skill"
 )
 
 // Deps is everything an [Arm] needs to build its agent.
@@ -62,7 +62,7 @@ type Deps struct {
 // can detect that for you.
 type Arm struct {
 	Name  string
-	Build func(Deps) (*wombat.Agent, error)
+	Build func(Deps) (*core.Agent, error)
 }
 
 // Kind distinguishes an expectation that must always hold from one that only

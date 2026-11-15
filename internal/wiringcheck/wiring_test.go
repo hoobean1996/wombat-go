@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hoobean1996/wombat-go/skill"
+	"wombat/pkg/core/skill"
 )
 
 // The shipped skills directory, wired the way the CLI wires it.

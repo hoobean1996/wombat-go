@@ -6,10 +6,10 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/hoobean1996/wombat-go"
-	"github.com/hoobean1996/wombat-go/eval/judge"
-	"github.com/hoobean1996/wombat-go/llm"
-	"github.com/hoobean1996/wombat-go/rl"
+	"wombat/eval/judge"
+	"wombat/eval/rl"
+	"wombat/pkg/core"
+	"wombat/pkg/core/llm"
 )
 
 // ===== episode builders =====
@@ -46,7 +46,7 @@ func episode(prompt, answer string, kind rl.FailureKind, calls ...call) *rl.Epis
 	if answer != "" {
 		msgs = append(msgs, llm.Message{Role: llm.RoleAssistant,
 			Content: []llm.ContentBlock{llm.Text{Text: answer}}})
-		ep.Outcome = wombat.Answer{Text: answer}
+		ep.Outcome = core.Answer{Text: answer}
 	}
 	ep.Messages = msgs
 	return ep

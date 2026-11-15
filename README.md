@@ -2,12 +2,12 @@
 
 # wombat-go
 
-**A ReAct agent harness for Go, with zero third-party dependencies.**
+**A ReAct agent harness for Go, and an always-on agent service built on it.**
 
 **English** · [简体中文](README.zh-CN.md)
 
 ![Go](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go&logoColor=white)
-![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
+![Dependencies](https://img.shields.io/badge/dependencies-pgx%20only-brightgreen)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 </div>
@@ -17,12 +17,14 @@
 - [What is wombat-go?](#en-what)
 - [Features](#en-features)
 - [Requirements](#en-requirements)
-- [Quick start: command line](#en-quickstart-cli)
+- [Quick start: the service](#en-quickstart)
 - [Quick start: Go library](#en-quickstart-lib)
 - [Core concepts](#en-concepts)
 - [Built-in tools](#en-tools)
 - [Configuration](#en-config)
-- [Command-line tools](#en-cli)
+- [Always on](#en-always)
+- [HTTP API](#en-http)
+- [Commands and make targets](#en-cli)
 - [Feature guide](#en-guide)
 - [Project layout](#en-layout)
 - [Development](#en-dev)
@@ -34,9 +36,10 @@
 
 ## What is wombat-go?
 
-wombat-go is a Go library, plus a few command-line tools, for building **LLM
-agents**. It runs the classic **ReAct** loop: ask the model, run the tools it
-asks for, feed the results back, and repeat until the model is done.
+wombat-go is a Go library for building **LLM agents**, and `wombatd`, a service
+that keeps them running. The library runs the classic **ReAct** loop: ask the
+model, run the tools it asks for, feed the results back, and repeat until the
+model is done.
 
 ```
               ┌───────────────────────────────────────────────┐
@@ -56,10 +59,16 @@ You supply three things:
    servers, or functions you write.
 3. **A task**, and optionally a **budget** (cost, time, steps) it must stay within.
 
+`wombatd` puts that loop behind an HTTP API and keeps it going with nobody
+watching: a session wakes on **events** — a person's message, a webhook, a
+timer the agent set for itself — runs one turn on them, and says what it has
+to say through an **outbox**. Everything it needs to survive a restart is kept
+in memory or in Postgres.
+
 It is written for people who want to see and control every part of the loop.
-Everything is plain Go using only the standard library, and every dependency is
-injected, so the model, a tool or the filesystem can each be swapped for a fake
-in a test.
+The harness is plain Go using only the standard library — the Postgres store
+is the one package with a dependency — and every dependency is injected, so
+the model, a tool or the filesystem can each be swapped for a fake in a test.
 
 <a id="en-features"></a>
 
@@ -68,14 +77,16 @@ in a test.
 | | |
 |---|---|
 | **Two providers, one interface** | Anthropic Messages API and any OpenAI-compatible `/chat/completions` endpoint, including gateways that need proxies and custom headers |
-| **Streaming events** | A run is an iterator of typed events (`TextDelta`, `ReasoningDelta`, `ToolStart`, …) that you can render in a terminal, as JSONL, or in a web UI |
-| **12 built-in tools** | `bash`, `view_file`, `write_file`, `str_replace`, `grep_search`, `git_log`, `http_get`, …, plus MCP tools and your own |
+| **Streaming events** | A run is an iterator of typed events (`TextDelta`, `ReasoningDelta`, `ToolStart`, …) that you can render in a terminal, stream over SSE, or assert on in a test |
+| **12 built-in tools** | `bash`, `view_file`, `write_file`, `str_replace`, `grep_search`, `git_log`, `http_get`, …, plus MCP tools, your own, and the daemon's `send_message` and timer tools |
 | **Budgets** | Cap cost in USD, wall-clock time, steps, tool calls and sub-agent depth. Going over a limit cancels the run cleanly |
-| **Safety** | Per-call permission policies with human approval, a scrubbed environment for child processes, and an optional OS sandbox (`sandbox-exec` / `bwrap`) |
+| **Safety** | Per-call permission policies, with human approval that never holds a turn open; a scrubbed environment for child processes; and an optional OS sandbox (`sandbox-exec` / `bwrap`) |
 | **Long tasks** | Token-aware context trimming, automatic summarization (compaction), and recovery from context-overflow errors |
 | **Skills and sub-agents** | Tools that appear only after a skill is loaded, and child agents that share the parent's budget |
+| **Always on** | Sessions run on events from a durable inbox, one turn at a time; timers wake them later; failed turns are tried again; what they say goes to an outbox, which a client polls or a webhook receives |
+| **Memory or Postgres** | One store interface, two implementations that pass the same conformance suite; a restart carries on where it stopped |
+| **HTTP API** | Sessions, a resumable SSE stream per session, the inbox, the outbox and timers, with bearer-token auth |
 | **Observability** | OpenTelemetry-shaped traces with an HTML viewer, Prometheus metrics, and record/replay tapes |
-| **HTTP server** | Resumable multi-turn sessions over Server-Sent Events, with a bundled web UI |
 | **Evaluation** | A benchmark suite of coding tasks with pass@k scoring and anti-cheat checks |
 
 <a id="en-requirements"></a>
@@ -86,88 +97,113 @@ in a test.
 |---|---|
 | **Go** | 1.25.6 or newer |
 | **An LLM API** | An Anthropic API key, **or** any OpenAI-compatible endpoint. A local Ollama or vLLM server needs no key |
-| **Python 3** | Only for `scripts/wombat`, the terminal renderer |
-| *Optional* | `sandbox-exec` (built into macOS) or `bwrap` (Linux), for `-confine` |
+| *Optional* | Postgres, for `store.driver: postgres` — or podman, for `make pg-up` |
+| *Optional* | `sandbox-exec` (built into macOS) or `bwrap` (Linux), for `tools.confine` |
 
-<a id="en-quickstart-cli"></a>
+<a id="en-quickstart"></a>
 
-## Quick start: command line
+## Quick start: the service
 
 **1. Clone and configure**
 
 ```bash
 git clone https://github.com/hoobean1996/wombat-go.git
 cd wombat-go
-cp .env.example .env
+cp wombatd.example.yaml wombatd.yaml
 ```
 
-Open `.env` and fill in **one** provider. `.env` is git-ignored, so your key
-stays on your machine.
+`wombatd` is configured by this one file — no flags but `-config`. Fill in
+the `model` section for **one** provider; `wombatd.yaml` is git-ignored, so
+your key stays on your machine. (Leave `api_key` empty and the provider looks
+for `$OPENAI_API_KEY` or `$ANTHROPIC_API_KEY` before giving up; that is the one
+thing wombatd takes from the environment.)
 
-```bash
+```yaml
 # Option A: OpenAI, or any OpenAI-compatible API (DeepSeek, a gateway, ...)
-export WOMBAT_PROVIDER="openai"
-export OPENAI_BASE_URL="https://api.openai.com/v1"
-export OPENAI_API_KEY="sk-..."
-export WOMBAT_MODEL="gpt-4o-mini"
+model:
+  provider: openai
+  base_url: https://api.openai.com/v1
+  api_key: sk-...
+  name: gpt-4o-mini
 ```
 
-```bash
+```yaml
 # Option B: Anthropic
-export WOMBAT_PROVIDER="anthropic"
-export ANTHROPIC_API_KEY="sk-ant-..."
-export WOMBAT_MODEL="claude-sonnet-5-5"
+model:
+  provider: anthropic
+  base_url: ""          # empty is the public endpoint
+  api_key: sk-ant-...
+  name: claude-sonnet-5-5
 ```
 
-```bash
+```yaml
 # Option C: a local model with Ollama (no key needed)
-export WOMBAT_PROVIDER="openai"
-export OPENAI_BASE_URL="http://localhost:11434/v1"
-export OPENAI_API_KEY=""            # empty means no auth header is sent
-export WOMBAT_MODEL="qwen2.5-coder"
+model:
+  provider: openai
+  base_url: http://localhost:11434/v1
+  api_key: ""           # empty sends no key
+  name: qwen2.5-coder
 ```
 
-**2. Ask the agent something**
+The file holds a secret now, so `chmod 600 wombatd.yaml`; wombatd warns when
+others can read it.
+
+**2. Start it**
 
 ```bash
-scripts/wombat "how many Go files are in this repo? use bash"
+make serve        # builds bin/wombatd and runs it with wombatd.yaml
 ```
 
-`scripts/wombat` builds the binaries into `bin/`, loads `.env`, runs one agent
-turn and renders it as readable text. You see the answer stream in, and each
-tool call as it happens. Add `-r` to also see the model's reasoning.
+It listens on `127.0.0.1:8080` and keeps everything in memory. To keep
+sessions across restarts, see [Always on](#en-always).
+
+**3. Ask the agent something, and watch it work**
+
+```bash
+curl -s localhost:8080/api/sessions -H 'Content-Type: application/json' \
+     -d '{"prompt": "how many Go files are in this repo? use bash"}'   # → {"id": "...", ...}
+curl -sN localhost:8080/api/sessions/<id>/events                    # the run, as server-sent events
+```
+
+Under the default policy, a command that is not obviously harmless — and
+anything outside `tools.working_dir` — waits for you. The turn stops on the
+call, and the session is `approving`:
+
+```bash
+curl -s localhost:8080/api/sessions/<id>/approvals                  # what is waiting, and why
+curl -s localhost:8080/api/sessions/<id>/approvals/<use_id> \
+     -H 'Content-Type: application/json' -d '{"allow": true}'       # the turn carries on
+```
+
+**4. Keep the conversation going, and read what it says**
+
+```bash
+curl -s localhost:8080/api/sessions/<id>/messages \
+     -H 'Content-Type: application/json' -d '{"prompt": "and how many are tests?"}'
+curl -s 'localhost:8080/api/outbox?after=0&wait=30s'                # replies, questions, approvals
+```
+
+A message sent while a turn is running waits for the next turn, and several
+that arrive meanwhile are handed over together. If the agent ended a turn by
+asking you a question, your next message is the answer to it.
 
 > [!WARNING]
-> By default the agent has an **unrestricted shell in the current directory**.
-> For anything beyond a quick try, add `-permission workspace`, `-confine`, or
-> both. See [Safety](#en-safety).
-
-**3. Keep the conversation going**
-
-```bash
-scripts/wombat -session /tmp/s.json "remember the number 8317"
-scripts/wombat -session /tmp/s.json "what was it times three?"
-```
-
-The transcript is saved to the session file after every turn. If the agent
-ended a turn by asking you a question, your next message is treated as the
-answer to it.
-
-**4. Or chat in the browser**
-
-```bash
-make serve        # then open http://localhost:8080
-```
-
-This starts a web UI with live streaming. By default, shell commands and
-anything outside the working directory wait for you on an **Allow / Deny** card.
+> Without `server.token` the API has no authentication: anything that can
+> reach the port can run the agent and read every transcript. wombatd listens
+> on loopback by default and, there, answers only to loopback host names; set
+> a token before listening anywhere else. See [Safety](#en-safety).
 
 <a id="en-quickstart-lib"></a>
 
 ## Quick start: Go library
 
+The module path is `wombat`, so another module uses it through a `replace`
+directive pointing at a checkout:
+
 ```bash
-go get github.com/hoobean1996/wombat-go
+git clone https://github.com/hoobean1996/wombat-go.git
+cd your-module
+go mod edit -require=wombat@v0.0.0 -replace=wombat=../wombat-go
 ```
 
 ```go
@@ -180,11 +216,11 @@ import (
 	"os"
 	"time"
 
-	wombat "github.com/hoobean1996/wombat-go"
-	"github.com/hoobean1996/wombat-go/governor"
-	"github.com/hoobean1996/wombat-go/llm"
-	"github.com/hoobean1996/wombat-go/llm/anthropic"
-	"github.com/hoobean1996/wombat-go/tool/builtin"
+	"wombat/pkg/core"
+	"wombat/pkg/core/governor"
+	"wombat/pkg/core/llm"
+	"wombat/pkg/core/llm/anthropic"
+	"wombat/pkg/core/tool/builtin"
 )
 
 func main() {
@@ -197,13 +233,13 @@ func main() {
 	}
 	// TrackCost charges each response to the run's budget.
 	// Without it, a CostUSD limit never trips.
-	client := llm.Chain(leaf, wombat.TrackCost(llm.DefaultPricing))
+	client := llm.Chain(leaf, core.TrackCost(llm.DefaultPricing))
 
 	// 2. An agent: the client plus the tools it may use.
-	agent, err := wombat.New(
-		wombat.WithClient(client),
-		wombat.WithModel("claude-sonnet-5-5"),
-		wombat.WithTools(builtin.Default(builtin.Deps{})...),
+	agent, err := core.New(
+		core.WithClient(client),
+		core.WithModel("claude-sonnet-5-5"),
+		core.WithTools(builtin.Default(builtin.Deps{})...),
 	)
 	if err != nil {
 		log.Fatal(err)
@@ -215,14 +251,14 @@ func main() {
 	defer cancel()
 
 	// 4. Start a run and consume its event stream.
-	run := agent.Start(ctx, wombat.Ask("How many Go files are in this directory?"))
+	run := agent.Start(ctx, core.Ask("How many Go files are in this directory?"))
 	defer run.Close()
 
 	for run.Next() {
 		switch ev := run.Event().(type) {
-		case wombat.TextDelta:
+		case core.TextDelta:
 			fmt.Print(ev.Text)
-		case wombat.ToolStart:
+		case core.ToolStart:
 			fmt.Fprintln(os.Stderr, "\n→", ev.Name)
 		}
 	}
@@ -240,20 +276,21 @@ ANTHROPIC_API_KEY=sk-ant-... go run .
 
 ```go
 switch run.Outcome().(type) {
-case wombat.Answer:    // the model finished its turn
-case wombat.Paused:    // it asked the user a question (ask_user); answer it and resume
-case wombat.Submitted: // it called a terminal tool; the tool's arguments are the result
+case core.Answer:    // the model finished its turn
+case core.Paused:    // it asked the user a question (ask_user); answer it and resume
+case core.Submitted: // it called a terminal tool; the tool's arguments are the result
+case core.Deferred:  // a call waits for a person's decision; core.Decide resumes it
 }
 ```
 
 **Multi-turn:** pass the previous transcript to the next run.
 
 ```go
-run = agent.Start(ctx, wombat.Then(run.Messages(), "What was it times three?"))
+run = agent.Start(ctx, core.Then(run.Messages(), "What was it times three?"))
 ```
 
-Use `wombat.AnswerPause` or `wombat.Resume` instead when the previous turn ended
-in `Paused`.
+Use `core.AnswerPause` or `core.Resume` instead when the previous turn ended
+in `Paused`, and `core.Decide` when it ended in `Deferred`.
 
 **Add your own tool.** A tool is a name, a JSON schema, its capabilities and a
 plain Go function:
@@ -276,9 +313,9 @@ weather := tool.Typed(tool.Def{
 	return "Sunny, 22°C in " + in.City, nil
 })
 
-agent, err := wombat.New(
-	wombat.WithClient(client),
-	wombat.WithTools(append(builtin.Default(builtin.Deps{}), weather)...),
+agent, err := core.New(
+	core.WithClient(client),
+	core.WithTools(append(builtin.Default(builtin.Deps{}), weather)...),
 )
 ```
 
@@ -292,14 +329,16 @@ treats it with suspicion.
 
 | Concept | What it is |
 |---|---|
-| `Agent` | Built once with `wombat.New(options...)`. Immutable and safe to share across goroutines |
+| `Agent` | Built once with `core.New(options...)`. Immutable and safe to share across goroutines |
 | `Run` | One execution of an agent on an input. Iterate with `Next()` / `Event()`, then check `Err()` and `Outcome()` |
 | `Event` | Something a UI can render: `TextDelta`, `ReasoningDelta`, `ToolStart`, `Spend`, `ContextTrimmed`, … |
-| `Outcome` | How a successful run ended: `Answer`, `Paused` or `Submitted`. Failures come from `run.Err()` and are matched with `errors.Is` |
+| `Outcome` | How a successful run ended: `Answer`, `Paused`, `Submitted` or `Deferred`. Failures come from `run.Err()` and are matched with `errors.Is` |
 | `tool.Def` | A tool: name, description, JSON schema, capabilities (`Caps`) and a `func(ctx, args) (string, error)` |
 | Middleware | Wrappers around the model client (`llm.Chain`) or around tools: retry, logging, cost tracking, permission, timeouts |
 | Budget | `governor.WithBudget(ctx, limits)` returns a `context.Context` that is cancelled when a limit is exceeded |
 | Strategy | Decides which part of a long transcript is sent to the model (`TokenWindow`, `DropTagged`, …) |
+| `daemon.Manager` | Runs sessions: takes their events from the inbox, runs one turn per session at a time, fires timers, delivers the outbox |
+| `daemon.Store` | Where the sessions, the inbox, the timers and the outbox are kept: `daemon.MemoryStore()` or `pkg/store/postgres` |
 
 <a id="en-tools"></a>
 
@@ -321,94 +360,200 @@ treats it with suspicion.
 | `save_tool_result` | Saves an earlier tool result to disk without repeating it |
 | `ask_user` | Pauses the run to ask the user a question |
 
-Optional extras: `view_media` (lets the model look at images and PDFs, CLI flag
-`-media`), `delegate` (a sub-agent, `-delegate`), `load_skill` / `unload_skill`
-(`-skills-dir`), and MCP tools named `<server>__<tool>` (`-mcp`).
+Optional extras, each a key in `wombatd.yaml`: `view_media` (lets the model
+look at images and PDFs, `tools.media`), `delegate` (a sub-agent,
+`tools.delegate`), `load_skill` / `unload_skill` (`tools.skills_dir`), and MCP
+tools named `<server>__<tool>` (`tools.mcp`).
+
+wombatd also gives every session's agent the daemon's own tools, which no
+permission policy asks about — they touch nothing on the machine:
+
+| Tool | What it does |
+|---|---|
+| `send_message` | Says something to the people the session works for, through the outbox |
+| `set_timer` | Wakes the session later: once (`in` / `at`), or repeatedly (`every`) |
+| `cancel_timer` / `list_timers` | Manage the session's timers |
 
 <a id="en-config"></a>
 
 ## Configuration
 
-The CLIs read their settings from environment variables, which `scripts/wombat`
-and `make` load from `.env`. In library code, `openai.ConfigFromEnv()` and
-`anthropic.ConfigFromEnv()` read the same variables and return a plain `Config`
-struct you can edit before calling `New`. The library reads nothing else from
-the environment behind your back, apart from falling back to the API key.
+`wombatd` reads one YAML file, `wombatd.yaml` by default (`-config path`
+names another). `wombatd.example.yaml` shows every key with its default and
+what it is for. Your file names only what it changes, and a key wombatd does
+not know is an error naming its line, not a setting that silently did not
+take effect.
+
+| Section | What it sets |
+|---|---|
+| `server` | `addr`, `token` (bearer auth), `cors`, `metrics`, `log` |
+| `store` | `driver` (`memory` or `postgres`) and `dsn` |
+| `daemon` | `poll`, `max_runs` (turns at once), `attempts` (tries per event), `idle` |
+| `outbox` | `webhook` (where each message is POSTed) and its `headers` |
+| `model` | `provider`, `name`, `base_url`, `api_key`, `proxy`, `headers`, `stream`, `max_tokens`, `system` |
+| `tools` | `working_dir`, `permission`, `confine`, `confine_network`, `mcp`, `skills_dir`, `media`, `delegate` |
+| `turn` | `budget_usd`, `wall`, `max_iters`, `tool_parallelism`, `context_window`, `compact_at` |
+| `mode` | `build`, `plan` or `review` |
+| `done` | `check` (a command that must pass), `attempts`, `accept`, `regressions` |
+| `review` | `enabled`, `sweeps`, `dry`, `iters`, `fix` |
+| `record` | `tape`, `tape_mode`, `trace`, `trace_html` |
+
+A build that has to pass its tests, an acceptance gate and an adversarial
+review before it counts as done, kept in Postgres:
+
+```yaml
+store:
+  driver: postgres
+  dsn: postgres://wombat:wombat@127.0.0.1:55432/wombat
+model:
+  provider: anthropic
+  base_url: ""
+  name: claude-sonnet-5-5
+  api_key: sk-ant-…
+turn:
+  budget_usd: 5
+done:
+  check: go test ./...
+  accept: true
+review:
+  enabled: true
+  sweeps: 6
+```
+
+**Provider variables, for the library and the benchmarks.** In library code,
+`openai.ConfigFromEnv()` and `anthropic.ConfigFromEnv()` read the variables
+below into a plain `Config` you can edit before calling `New`; the library
+reads nothing else from the environment behind your back, apart from falling
+back to the API key (and Anthropic to `ANTHROPIC_BASE_URL`) when the `Config`
+leaves it empty. `make bench`, `make judge` and `make models` load them from
+`.env` — copy `.env.example`, which documents each one. wombatd reads none of
+them but that fallback.
 
 | Variable | Description |
 |---|---|
-| `WOMBAT_PROVIDER` | `openai` or `anthropic`. Set it explicitly: the CLIs have different defaults |
+| `WOMBAT_PROVIDER` | `openai` or `anthropic`, for the benchmark suite |
 | `WOMBAT_MODEL` | Default model for whichever provider is selected |
-| **OpenAI-compatible** | |
 | `OPENAI_BASE_URL` | Origin plus `/v1`, for example `https://api.openai.com/v1`. `/chat/completions` is appended |
 | `OPENAI_API_KEY` | Sent as `Authorization: Bearer …`. Leave it empty for local servers that need no auth |
-| `OPENAI_MODEL` | Takes priority over `WOMBAT_MODEL` |
-| `OPENAI_PROXY` | HTTP proxy, as `host:port` or a full URL |
-| `OPENAI_EXTRA_HEADERS` | Extra headers, one `Name: value` per line |
-| `OPENAI_STREAM` | `auto` (default), `always` or `never` |
-| `OPENAI_TEMPERATURE`, `OPENAI_TOP_P` | Sampling parameters |
-| **Anthropic** | |
+| `OPENAI_MODEL`, `OPENAI_PROXY`, `OPENAI_EXTRA_HEADERS`, `OPENAI_STREAM`, `OPENAI_TEMPERATURE`, `OPENAI_TOP_P` | Model, proxy, extra headers (one `Name: value` per line), `auto` / `always` / `never`, sampling |
 | `ANTHROPIC_API_KEY` | Required |
-| `ANTHROPIC_MODEL` | Takes priority over `WOMBAT_MODEL`. There is no built-in default model |
-| `ANTHROPIC_BASE_URL` | Default `https://api.anthropic.com` (falls back to `AGENT_LLM_BASE_URL`) |
-| `ANTHROPIC_PROXY` | HTTP proxy (falls back to `AGENT_LLM_PROXY`) |
-| `ANTHROPIC_CUSTOM_HEADERS` | Extra headers, one `Name: value` per line |
-| `ANTHROPIC_BETA` | Comma-separated beta flags |
-| `ANTHROPIC_STREAM` | `auto` (default), `always` or `never` |
-| `ANTHROPIC_TEMPERATURE`, `ANTHROPIC_TOP_P` | Sampling parameters |
-| **Scripts** | |
-| `WOMBAT_ENV` | Env file that `scripts/wombat` loads (default `./.env`). For `make`, pass `ENV=path` |
+| `ANTHROPIC_MODEL`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_PROXY`, `ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_BETA`, `ANTHROPIC_STREAM`, `ANTHROPIC_TEMPERATURE`, `ANTHROPIC_TOP_P` | The same for Anthropic; `ANTHROPIC_BETA` is comma-separated beta flags |
 
-`.env.example` documents each of these in more detail.
+<a id="en-always"></a>
+
+## Always on
+
+`pkg/daemon` keeps sessions going with nobody watching, after Anthropic's
+"Building always-on agents". Nothing starts a turn but an **event** in a
+session's **inbox**, and what the agent has to say goes to an **outbox**.
+
+- **The inbox.** A person's message, a decision on a call that was waiting
+  for one, a timer that fired, anything a client posts to `POST /api/events` —
+  a webhook, an alert — is a row, safe once the request returns. An event
+  with a `dedup_key` is received once however often it is delivered, and an
+  event about a `thread` — an issue, a chat thread — finds the session for
+  that thread, or starts one.
+- **One turn at a time.** A worker takes a session's pending events, all of
+  them, and runs one turn on them; what arrives meanwhile is the next turn's.
+  `daemon.max_runs` caps turns across sessions.
+- **Trying again.** A turn the daemon stopped, or that the provider failed in a
+  way it says is passing (a rate limit, a 5xx, the network), runs again — from
+  the transcript it started from, so nothing is in the conversation twice — up
+  to `daemon.attempts`. A daemon that died mid-turn has its events put back
+  when the next one starts.
+- **Timers.** The agent sets its own with `set_timer` — once, to follow up, or
+  every so often — and a client with `POST /api/timers`. A timer that is due
+  puts an event in the inbox; a daemon that was down fires each one once when
+  it comes back, not once for every period it missed.
+- **Decisions.** A call the policy wants a person to approve ends the turn
+  instead of holding it open: the session is saved mid-call, takes nothing but
+  decisions, and resumes once they are all in — the approved calls run then,
+  and the model reads their real output.
+- **The outbox.** The reply to a message, a question the model asks, the calls
+  waiting for a decision, and what the agent chooses to say with
+  `send_message` — a timer's turn says nothing unless it does. A client
+  long-polls `GET /api/outbox?after=<last id>&wait=30s` and acks with
+  `POST /api/outbox/{id}/ack`; with `outbox.webhook` set, wombatd POSTs each
+  message itself, in order, trying one up to 10 times, with a growing pause,
+  before it moves on to the ones behind it.
+
+An event from outside, about a thread, and a reminder for tomorrow morning:
+
+```bash
+curl -s localhost:8080/api/events -H 'Content-Type: application/json' -d '{
+  "thread": "github:you/repo#12", "kind": "issue_comment", "source": "github",
+  "dedup_key": "delivery-8f2c", "payload": {"body": "the build is red again"}}'
+curl -s localhost:8080/api/timers -H 'Content-Type: application/json' -d '{
+  "session_id": "<id>", "note": "check whether the fix went out", "at": "2026-11-16T09:00:00Z"}'
+```
+
+**Keeping it.** With the default `store.driver: memory`, everything is gone
+when wombatd stops. With `postgres`, it is kept in four tables — `sessions`,
+`inbox`, `timers` and `outbox` — which wombatd creates on its first start, and
+a restart carries on where it stopped. One wombatd to a schema: a second one
+on the same schema is refused at the start (add `?search_path=name` to the DSN
+to give each its own). For a local database:
+
+```bash
+make pg-up        # Postgres 17 in podman, on 127.0.0.1:55432
+```
+
+```yaml
+store:
+  driver: postgres
+  dsn: postgres://wombat:wombat@127.0.0.1:55432/wombat
+```
+
+<a id="en-http"></a>
+
+## HTTP API
+
+`wombatd` serves the `httpapi` package, a plain `http.Handler` over a
+`daemon.Manager`:
+
+| Method and path | Purpose |
+|---|---|
+| `POST /api/sessions` | Create a session with its first message: `{"prompt": "..."}`, and optionally `title`, `permission`, `workspace`, `model`, `max_iters` |
+| `GET /api/sessions` / `GET /api/sessions/{id}` | List sessions, newest first / one session |
+| `DELETE /api/sessions/{id}` | Cancel and forget a session, its timers and messages included |
+| `GET /api/sessions/{id}/events` | Server-Sent Events across every turn. Reconnect with `Last-Event-ID` to resume |
+| `GET /api/sessions/{id}/messages` | The transcript |
+| `POST /api/sessions/{id}/messages` | A message, for the next turn: `{"prompt": "..."}` |
+| `POST /api/sessions/{id}/steer` | A message for the turn that is still running |
+| `GET /api/sessions/{id}/approvals` | Calls waiting for a decision |
+| `POST /api/sessions/{id}/approvals/{use_id}` | Decide one: `{"allow": true}` |
+| `POST /api/events` | An event from outside: `{"session_id" or "thread", "kind", "source", "dedup_key", "payload"}` |
+| `GET /api/inbox` | Events, newest first: `?session=`, `?status=`, `?limit=` |
+| `GET /api/outbox` | Messages, oldest first: `?after=`, `?wait=` (at most 60s), `?session=`, `?status=`, `?limit=` |
+| `POST /api/outbox/{id}/ack` | Mark a message handled |
+| `GET /api/timers` / `POST /api/timers` / `DELETE /api/timers/{id}` | List (`?session=`, `?status=`), set (`{"session_id", "note", "in" or "at", "every"}`) and cancel timers |
+| `GET /api/health`, `GET /api/config`, `GET /metrics` | Liveness, what this server offers, Prometheus |
+
+A message, a decision and an event are answered with `202 Accepted`, because
+they are queued: what they lead to arrives on the event stream and in the
+outbox. A new session is `201 Created`, and an event whose `dedup_key` was
+seen before is `200`, with the event received the first time. Every error has
+the same shape, `{"error": {"kind": "...", "message": "..."}}`, with a bounded
+`kind` a client can branch on. The package documentation has the details.
 
 <a id="en-cli"></a>
 
-## Command-line tools
+## Commands and make targets
 
-`make bin` builds all of them into `bin/`.
-
-| Binary | Purpose |
-|---|---|
-| `wombat-jsonl` | Runs one agent turn and writes a JSON-Lines event stream to stdout. `scripts/wombat` wraps it with a renderer |
-| `wombat-serve` | HTTP + SSE server with a built-in web UI |
-| `wombat-bench` | Runs the benchmark suite and reports pass@k |
-| `wombat-judge` | Scores the episodes that `wombat-bench` produced |
-| `wombat-trace-html` | Turns a trace file into a self-contained HTML report |
-| `wombat-tsgen` | Generates TypeScript types for the event stream and the HTTP API |
-
-**Common `wombat-jsonl` / `scripts/wombat` flags**
-
-| Area | Flags |
-|---|---|
-| Model | `-provider openai\|anthropic`, `-model ID`, `-system "prompt"`, `-max-tokens N` |
-| Workspace | `-working-dir DIR` (where shell and git tools run), `-read-only` (hide tools that write or execute) |
-| Safety | `-permission off\|readonly\|workspace\|ask`, `-confine`, `-confine-network loopback\|none\|full` |
-| Limits | `-budget USD`, `-wall 10m`, `-max-iters N` (default 30) |
-| Conversation | `-session FILE` (multi-turn), `-resume FILE` (continue a transcript, read-only) |
-| Long tasks | `-context-window TOKENS`, `-compact-at 0.85`, `-check 'go test ./...'`, `-check-attempts N` |
-| Extras | `-skills-dir skills`, `-delegate`, `-mcp mcp.json`, `-media` |
-| Recording | `-tape FILE`, `-tape-mode auto\|record\|replay`, `-trace FILE`, `-trace-html FILE`, `-metrics-file FILE` |
-| Logging | `-log debug\|info\|warn\|error`, `-v`, and `-r` (show reasoning, `scripts/wombat` only) |
-
-Run `bin/wombat-jsonl -h` for the full list, including the build, review and
-acceptance workflow flags (`-plan-only`, `-accept`, `-review`, …).
-
-**Common `wombat-serve` flags:** `-addr :8080`, `-working-dir DIR`,
-`-permission workspace` (default), `-budget 1.0` (USD per turn),
-`-max-iters 12`, `-sessions-dir DIR` (keep sessions across restarts), `-cors`,
-`-confine`, `-mcp`.
-
-**Make targets**
+There is one command, `wombatd -config wombatd.yaml`. `make bin` builds it
+into `bin/`.
 
 | Target | What it does |
 |---|---|
 | `make` | gofmt check, `go vet`, `go build` (the default target) |
 | `make test` | `go test -race ./...` |
-| `make bin` | Builds every command into `bin/` |
-| `make serve` | Starts `wombat-serve` with `.env` loaded. Pass extra flags with `FLAGS="..."` |
+| `make bin` | Builds `bin/wombatd` |
+| `make serve` | Builds and runs wombatd with `wombatd.yaml`; `CONFIG=other.yaml` picks another file |
+| `make pg-up` / `make pg-down` | Starts / removes a Postgres in podman, on port 55432 |
+| `make test-pg` | The Postgres store's tests against it, a daemon restart among them |
 | `make bench` | Runs the benchmarks, for example `make bench N=8 C=4 TASKS=todo-app,fix-bug` |
+| `make judge` | Scores a benchmark run's episodes: `make judge IN=runs/episodes.jsonl` |
 | `make models` | Lists the model IDs your OpenAI-compatible endpoint offers |
-| `make ts` | Regenerates `web/events.ts` |
 | `make help` | Lists the documented targets |
 
 <a id="en-guide"></a>
@@ -426,22 +571,28 @@ Three independent layers:
 
 | Layer | What it does | How to enable |
 |---|---|---|
-| **Permission policy** | Allows, denies or asks a human about each tool call, looking at the actual command, path and arguments | `-permission …` (CLI), `permission.Gate` (library) |
+| **Permission policy** | Allows, denies or asks a human about each tool call, looking at the actual command, path and arguments | `tools.permission` (wombatd), `permission.Gate` (library) |
 | **Environment scrubbing** | Commands the agent runs inherit only an allowlist of environment variables, so your API keys are not visible to them | On by default |
-| **OS sandbox** | Commands run under `sandbox-exec` (macOS) or `bwrap` (Linux): writes only inside the workspace and the temp directory, credential directories unreadable, network loopback-only by default | `-confine` |
+| **OS sandbox** | Commands run under `sandbox-exec` (macOS) or `bwrap` (Linux): writes only inside the workspace and the temp directory, credential directories unreadable, network loopback-only by default | `tools.confine: true` |
 
-Permission levels:
+Permission levels in wombatd, from the loosest to the strictest.
+`tools.permission` sets one for every session; a session may ask for a
+stricter one when it is created (`"permission": "readonly"`), never a looser
+one:
 
 | Level | Behavior |
 |---|---|
-| `off` | No checks (the `wombat-jsonl` default) |
-| `readonly` | Only read-only tools run |
-| `workspace` | Reads and writes inside the working directory are allowed, and so are common harmless commands (`go test`, `ls`, `cat`, …). Anything else needs approval |
-| `ask` | Every call needs approval |
+| `off` | No gate at all: every call runs. Only the operator can choose it |
+| `workspace` | Reads and writes inside the working directory are allowed, and so are common harmless commands (`go test`, `ls`, `cat`, …). Anything else — another command, the network, a path outside — waits for a decision (the default) |
+| `ask` | Every call waits for a decision |
+| `readonly` | Only read-only tools run; everything else is refused |
 
-`wombat-jsonl` has no way to ask you, so "needs approval" means "denied", and
-the model is told why. Use `wombat-serve` if you want to approve calls in the
-browser. In library code:
+The daemon's own tools (`send_message`, the timer tools) run under every level.
+
+A call that waits for a decision does not hold the turn open: the turn ends
+on it, the outbox says what is waiting, and the decision comes back over the
+API, however long it takes. In library code, an approver either answers at
+once or defers:
 
 ```go
 approver := permission.ApproverFunc(func(ctx context.Context, r permission.Request) (bool, error) {
@@ -451,14 +602,16 @@ approver := permission.ApproverFunc(func(ctx context.Context, r permission.Reque
 	return answer == "y", nil
 })
 
-agent, err := wombat.New(
-	wombat.WithClient(client),
-	wombat.WithTools(builtin.Default(builtin.Deps{})...),
-	wombat.WithToolMiddleware(permission.Gate(permission.Workspace("."), approver)),
+agent, err := core.New(
+	core.WithClient(client),
+	core.WithTools(builtin.Default(builtin.Deps{})...),
+	core.WithToolMiddleware(permission.Gate(permission.Workspace("."), approver)),
 )
 ```
 
-A `nil` approver turns every "ask" into "deny".
+With `permission.Defer()` as the approver, the run ends in `core.Deferred`
+instead, and `core.Decide(run.Messages(), deferred, verdicts)` resumes it
+once someone has decided. A `nil` approver turns every "ask" into "deny".
 
 ### Budgets
 
@@ -477,28 +630,29 @@ Going over any limit cancels the context, and everything in flight (HTTP
 requests, child processes) stops. `context.Cause(ctx)` tells you which limit
 tripped. Cost is computed from `llm.DefaultPricing`. A model that is not in that
 table costs `0`, so for such models rely on `Wall` and `Steps`, or pass your
-own rates with `wombat.WithPricing`. CLI: `-budget`, `-wall`, `-max-iters`.
+own rates with `core.WithPricing`. In wombatd the budget is per turn:
+`turn.budget_usd`, `turn.wall`, `turn.max_iters`.
 
 ### Long conversations
 
 ```go
-wombat.WithContextWindow(200_000),
-wombat.WithStrategy(wombat.TokenWindow(0.7, 0.5)),                  // trim at 70%, back to ~50%
-wombat.WithCompaction(160_000, 50_000, wombat.Summarize(client, "")), // summarize old turns
+core.WithContextWindow(200_000),
+core.WithStrategy(core.TokenWindow(0.7, 0.5)),                  // trim at 70%, back to ~50%
+core.WithCompaction(160_000, 50_000, core.Summarize(client, "")), // summarize old turns
 ```
 
 Old tool results are shortened first, and only then are whole old exchanges
 dropped. Compaction replaces the oldest part of the transcript with a summary.
-CLI: `-context-window 200000 -compact-at 0.85`.
+wombatd: `turn.context_window: 200000` and `turn.compact_at: 0.85`.
 
 ### Checking that the work is done, and steering
 
 ```go
-wombat.WithCompletionCheck(3, wombat.CommandCheck(runner, "go test ./...", 0))
+core.WithCompletionCheck(3, core.CommandCheck(runner, "go test ./...", 0))
 ```
 
 When the model says it is finished, the check runs. If it fails, the model gets
-the output and keeps working, up to 3 times. CLI: `-check 'go test ./...'`.
+the output and keeps working, up to 3 times. wombatd: `done.check: go test ./...`.
 
 To redirect a run while it is going, call `run.Steer("use the v2 API")`. Over
 HTTP, use `POST /api/sessions/{id}/steer`.
@@ -518,12 +672,9 @@ description: Reading a repository's history. Load before any question about the 
 ...
 ```
 
-```bash
-scripts/wombat -skills-dir skills "who last changed run.go, and why?"
-```
-
-The model sees a catalogue of skills and calls `load_skill` to load one. A skill
-can also unlock tools that stay hidden until it is loaded:
+In wombatd, `tools.skills_dir: skills`. The model sees a catalogue of skills
+and calls `load_skill` to load one. A skill can also unlock tools that stay
+hidden until it is loaded:
 
 ```go
 skills, _ := skill.LoadDir("./skills", func(err error) { log.Print(err) })
@@ -531,7 +682,7 @@ reg := skill.New(skills...)
 reg.Gate("git-history", "git_log") // git_log appears only after git-history is loaded
 g := reg.Bind(builtin.Default(deps))
 
-agent, _ := wombat.New(wombat.WithClient(client), g.Install())
+agent, _ := core.New(core.WithClient(client), g.Install())
 ```
 
 This repository ships four example skills in `skills/`.
@@ -542,16 +693,16 @@ A `delegate` tool runs a whole child agent. The child shares the parent's
 budget, permission gate and tracing, because they all travel on the `context`.
 
 ```go
-child, _ := wombat.New(wombat.WithClient(client), wombat.WithName("researcher"),
-	wombat.WithTools(tool.Filter(all, tool.OnlyCaps(tool.CapReadOnly))...))
+child, _ := core.New(core.WithClient(client), core.WithName("researcher"),
+	core.WithTools(tool.Filter(all, tool.OnlyCaps(tool.CapReadOnly))...))
 
-parent, _ := wombat.New(wombat.WithClient(client),
-	wombat.WithTools(append(all, wombat.DelegateTool(child))...),
-	wombat.WithToolTimeoutFallback(0), // the child is bounded by its own iteration cap
+parent, _ := core.New(core.WithClient(client),
+	core.WithTools(append(all, core.DelegateTool(child))...),
+	core.WithToolTimeoutFallback(0), // the child is bounded by its own iteration cap
 )
 ```
 
-CLI: `-delegate` adds a read-only researcher sub-agent.
+wombatd: `tools.delegate: true` adds a read-only researcher sub-agent.
 
 ### MCP (Model Context Protocol)
 
@@ -571,104 +722,81 @@ same format as desktop MCP clients:
 }
 ```
 
-```bash
-scripts/wombat -mcp mcp.json "list my open pull requests"
-```
-
-Tools appear as `<server>__<tool>`. Their MCP hints (`readOnlyHint`, …) become
-capabilities, so permission policies apply to them exactly as to built-in tools.
-In code, use `mcp.LoadConfig`, `mcp.ConnectAll` and `conns.Tools()`.
+In wombatd, `tools.mcp: mcp.json`; the servers are started once and shared by
+every session. Tools appear as `<server>__<tool>`. Their MCP hints
+(`readOnlyHint`, …) become capabilities, so permission policies apply to them
+exactly as to built-in tools. In code, use `mcp.LoadConfig`, `mcp.ConnectAll`
+and `conns.Tools()`.
 
 ### Record and replay
 
 ```go
 tp, _ := tape.Open("run.jsonl", tape.Auto)
 defer tp.Close()
-agent, _ := wombat.New(wombat.WithClient(client), tp.Install())
+agent, _ := core.New(core.WithClient(client), tp.Install())
 ```
 
 Model responses and tool results are recorded, keyed by a hash of the request.
-A replay is fast, deterministic and makes no network calls. CLI:
-`-tape run.jsonl -tape-mode replay`.
+A replay is fast, deterministic and makes no network calls. wombatd:
+`record.tape: run.jsonl` and `record.tape_mode: replay`.
 
 ### Tracing and metrics
 
-```bash
-scripts/wombat -trace run.ndjson -trace-html run.html "..."
-bin/wombat-trace-html run.ndjson        # or render an existing trace later
+```yaml
+record:
+  trace: run.ndjson         # every session's spans
+  trace_html: run.html      # rendered as a self-contained report on shutdown
 ```
 
 Traces use OpenTelemetry `gen_ai.*` attribute names, nest sub-agents
-automatically, and never record message content. `wombat-serve` exposes
-Prometheus metrics on `GET /metrics`, and `wombat-jsonl -metrics-file` writes a
-one-off dump.
-
-### HTTP API
-
-`wombat-serve` (or the `httpapi` package, a plain `http.Handler`) serves
-multi-turn sessions:
-
-| Method and path | Purpose |
-|---|---|
-| `POST /api/sessions` | Create a session and start its first turn: `{"prompt": "..."}` |
-| `GET /api/sessions/{id}/events` | Server-Sent Events stream. Reconnect with `Last-Event-ID` to resume |
-| `POST /api/sessions/{id}/messages` | Send the next turn: `{"prompt": "..."}` |
-| `POST /api/sessions/{id}/steer` | Send a message to the turn that is still running |
-| `GET /api/sessions/{id}/approvals` | List calls waiting for a human |
-| `POST /api/sessions/{id}/approvals/{use_id}` | Answer one: `{"allow": true}` |
-| `DELETE /api/sessions/{id}` | Cancel and delete a session |
-
-```bash
-curl -s localhost:8080/api/sessions -H 'Content-Type: application/json' \
-     -d '{"prompt": "what does this repo do?"}'      # returns {"id": "...", ...}
-curl -N localhost:8080/api/sessions/<id>/events
-```
-
-The full list (health, config, listing sessions, the transcript) is in the
-`httpapi` package documentation. TypeScript types for every event and request
-are in `web/events.ts`, generated from the Go types.
+automatically, and never record message content. wombatd exposes Prometheus
+metrics on `GET /metrics` (`server.metrics`, on by default).
 
 ### Benchmarks and evaluation
 
 ```bash
-make bench TASKS=easy N=4                 # or: bin/wombat-bench -tasks hard -n 4
-bin/wombat-judge -in runs/episodes.jsonl  # score the episodes afterwards
+make bench TASKS=easy N=4                 # the suite, as a test that runs only when asked
+make judge IN=runs/episodes.jsonl         # score the episodes afterwards
 ```
 
-`benchmarks/` holds eight coding tasks in two tiers. The easy tier should always
-score 100%; if it does not, the harness is broken. The hard tier is the one that
-tells agents apart. Results are reported as pass@k. `eval/` measures whether the
-harness mechanisms themselves work; see [eval/README.md](eval/README.md).
+`eval/benchmarks/` holds eight coding tasks in two tiers. The easy tier should
+always score 100%; if it does not, the harness is broken. The hard tier is the
+one that tells agents apart. Results are reported as pass@k. The rest of
+`eval/` measures whether the harness mechanisms themselves work; see
+[eval/README.md](eval/README.md).
 
 <a id="en-layout"></a>
 
 ## Project layout
 
 ```
-.                 Agent, Run, Event, Outcome, Convo, Strategy   ← start here
-llm/              provider-neutral types, Client interface, middleware, pricing
-llm/anthropic/    Anthropic Messages API client
-llm/openai/       OpenAI-compatible client
-tool/             tool definitions, dispatch, middleware (retry, timeout, breaker, …)
-tool/builtin/     the 12 built-in tools, view_media, plain and sandboxed runners
-permission/       per-call authorization, with a human in the loop
-governor/         budgets as context cancellation
-skill/            skills: instructions and tools that load on demand
-skills/           example skills
-mcp/              Model Context Protocol client
-tape/             record and replay
-trace/            spans, NDJSON output, HTML report
-metric/           Prometheus metrics
-httpapi/          multi-turn sessions over SSE
-accept/           deterministic "is it really done?" gates (build, vet, test, TODO.md)
-review/           adversarial code review that reports defects as failing tests
-rl/               episodes, verifiers, pass@k
-benchmarks/       eight coding tasks
-eval/             evaluation of the harness itself
-cmd/              the command-line tools
-scripts/          wombat (run and render), pretty.py (the renderer)
-web/              TypeScript event types, generated
-docs/             design notes
+pkg/core/             Agent, Run, Event, Outcome, Convo, Strategy   ← start here
+pkg/core/llm/         provider-neutral types, Client interface, middleware, pricing
+pkg/core/llm/anthropic/   Anthropic Messages API client
+pkg/core/llm/openai/      OpenAI-compatible client
+pkg/core/tool/        tool definitions, dispatch, middleware (retry, timeout, breaker, …)
+pkg/core/tool/builtin/    the 12 built-in tools, and view_media
+pkg/core/sandbox/     the runners every command goes through: filtered, and confined
+pkg/core/permission/  per-call authorization, with a human in the loop
+pkg/core/governor/    budgets as context cancellation
+pkg/core/skill/       skills: instructions and tools that load on demand
+pkg/core/mcp/         Model Context Protocol client
+pkg/core/tape/        record and replay
+pkg/core/trace/       spans, NDJSON output, HTML report
+pkg/core/metric/      Prometheus metrics
+pkg/core/accept/      deterministic "is it really done?" gates (build, vet, test, TODO.md)
+pkg/core/review/      adversarial code review that reports defects as failing tests
+pkg/daemon/           always on: sessions, the inbox, timers, deferred decisions, the outbox
+pkg/daemon/storetest/ what a store has to do, as tests both stores pass
+pkg/store/postgres/   the sessions and the three tables in Postgres
+pkg/httpapi/          the daemon over HTTP: events in, SSE and the outbox out
+cmd/wombatd/          the service; everything configured by wombatd.yaml
+eval/                 evaluation of the harness itself
+eval/rl/              episodes, verifiers, pass@k
+eval/benchmarks/      eight coding tasks, and the suite that runs them
+internal/             fspath, safeenv, shellquote, sse, yaml, and the wiring checks
+skills/               example skills
+docs/                 design notes
 ```
 
 <a id="en-dev"></a>
@@ -678,12 +806,12 @@ docs/             design notes
 ```bash
 make              # gofmt check + go vet + go build
 make test         # go test -race ./...
-make ts           # regenerate web/events.ts after changing event types
+make pg-up && make test-pg   # the Postgres store, against a real database
 ```
 
-The test suite runs offline against scripted model clients and needs no API key.
-The only thing you need installed is the Go toolchain: there are no third-party
-modules to download.
+The test suite runs offline against scripted model clients and needs no API
+key; the Postgres tests skip unless they are given a database. The only
+module it downloads is `pgx`, for `pkg/store/postgres`.
 
 <a id="en-faq"></a>
 
@@ -691,15 +819,16 @@ modules to download.
 
 | Symptom | Fix |
 |---|---|
-| `scripts/wombat: no env file` | Run `cp .env.example .env` and fill it in, or point `WOMBAT_ENV` at your env file |
-| `no API key` error | Set `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` in `.env`, and check that `WOMBAT_PROVIDER` matches |
-| `no model on the request and no client default` | Set `WOMBAT_MODEL` (or `ANTHROPIC_MODEL`), or pass `-model` |
-| Not sure which model IDs your endpoint accepts | `make models` |
-| Token counts and cost stay at 0, so the budget never trips | Some gateways drop usage data when streaming. Set `OPENAI_STREAM="never"` (or `ANTHROPIC_STREAM`). Also check that the model is priced in `llm/pricing.go` |
-| Output seems frozen with a reasoning model | It is thinking. Use `scripts/wombat -r` to see the reasoning stream |
-| HTTP 400 when using `-media` | The model does not accept images. Drop `-media` |
-| Every shell command is refused | You are using `-permission workspace` or `ask` with `wombat-jsonl`, which cannot ask you. Use `-permission off` with `-confine`, or use `wombat-serve` |
-| Prompt with quotes or `&&` breaks under `make` | Use `scripts/wombat "..."` rather than a make target |
+| `wombatd.yaml does not exist` | Run `cp wombatd.example.yaml wombatd.yaml` and fill in the model section, or pass `-config path` |
+| `unknown key "…" in …` | A misspelt key, with its line number. `wombatd.example.yaml` shows every key there is |
+| `no API key` error | Set `model.api_key`, and check that `model.provider` matches the key |
+| `no model on the request and no client default` | Set `model.name` |
+| Not sure which model IDs your endpoint accepts | `make models` (reads `.env`) |
+| Token counts and cost stay at 0, so the budget never trips | Some gateways drop usage data when streaming. Set `model.stream: never`. Also check that the model is priced in `pkg/core/llm/pricing.go` |
+| HTTP 400 with `tools.media: true` | The model does not accept images. Turn `tools.media` off |
+| A session sits in `approving` | It is waiting for a decision: `GET /api/sessions/{id}/approvals`, then POST one. It takes nothing else until then |
+| `another daemon is running on this schema` | Another wombatd uses that Postgres schema. Stop it, or give this one its own with `?search_path=name` in `store.dsn` |
+| Messages pile up in the inbox | Look at `GET /api/inbox?session=…` and the log: a session waiting on a decision runs nothing else, and `daemon.max_runs` caps turns at once |
 
 <a id="en-design"></a>
 
@@ -715,13 +844,13 @@ shape the API:
    needs (a filesystem, a runner, an HTTP client) is passed in when it is
    constructed, so a tool is an ordinary function you can test directly.
 2. **A run is a stream of events**, not a return value plus callbacks. A
-   terminal, a JSONL pipe and a web UI all consume the same stream.
+   terminal, an SSE stream and a test all consume the same stream.
 3. **A budget is a `context.Context`.** Going over a limit cancels it, and every
    blocking call in the process already knows how to unwind from that.
 
 The full write-up covers context structure, skills, fault tolerance, tracing,
-permissions and evaluation, and what was gained and lost compared with the
-OCaml original: **[docs/DESIGN.md](docs/DESIGN.md)**.
+permissions, the always-on daemon and evaluation, and what was gained and lost
+compared with the OCaml original: **[docs/DESIGN.md](docs/DESIGN.md)**.
 
 <a id="en-license"></a>
 

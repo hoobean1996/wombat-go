@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hoobean1996/wombat-go"
-	"github.com/hoobean1996/wombat-go/governor"
-	"github.com/hoobean1996/wombat-go/llm"
+	"wombat/pkg/core"
+	"wombat/pkg/core/governor"
+	"wombat/pkg/core/llm"
 )
 
 // Config drives a suite run.
@@ -182,7 +182,7 @@ func runSample(ctx context.Context, cfg Config, p *Probe, arm Arm, sample int) (
 		return Obs{}, fmt.Errorf("eval: %s/%s: building the agent: %w", p.ID, arm.Name, err)
 	}
 	if p.MaxIters > 0 {
-		if agent, err = agent.With(wombat.WithMaxIters(p.MaxIters)); err != nil {
+		if agent, err = agent.With(core.WithMaxIters(p.MaxIters)); err != nil {
 			return Obs{}, fmt.Errorf("eval: %s/%s: capping the agent at %d iterations: %w", p.ID, arm.Name, p.MaxIters, err)
 		}
 	}
@@ -192,7 +192,7 @@ func runSample(ctx context.Context, cfg Config, p *Probe, arm Arm, sample int) (
 	defer cancel()
 
 	started := time.Now()
-	run := agent.Start(runCtx, wombat.Ask(p.Prompt))
+	run := agent.Start(runCtx, core.Ask(p.Prompt))
 	defer run.Close()
 
 	o := observe(run)

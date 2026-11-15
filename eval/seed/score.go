@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/hoobean1996/wombat-go/eval/judge"
-	"github.com/hoobean1996/wombat-go/llm"
-	"github.com/hoobean1996/wombat-go/rl"
+	"wombat/eval/judge"
+	"wombat/eval/rl"
+	"wombat/pkg/core/llm"
 )
 
 // Clone deep-copies an episode so a mutation cannot reach the original.

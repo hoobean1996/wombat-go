@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hoobean1996/wombat-go/eval/judge"
-	"github.com/hoobean1996/wombat-go/llm/openai"
-	"github.com/hoobean1996/wombat-go/rl"
+	"wombat/eval/judge"
+	"wombat/eval/rl"
+	"wombat/pkg/core/llm/openai"
 )
 
 // The detection test, and the shape of it matters more than the result.

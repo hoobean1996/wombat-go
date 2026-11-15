@@ -38,6 +38,11 @@ import (
 // git over ssh does not work from a child by default — the agent socket signs
 // for every key the user has loaded, which is a capability and not a setting.
 // A caller who wants either decision the other way adds or removes names.
+//
+// Leaving SSH_AUTH_SOCK out hides where the socket is, and no more: the
+// socket itself is still there, usually under TMPDIR or /tmp, which a child
+// can list as well as the harness can. An environment filter cannot close a
+// socket; sandbox.Confined is what does.
 var DefaultAllow = []string{
 	// The process basics.
 	"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "TZ",

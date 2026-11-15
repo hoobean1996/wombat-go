@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"sync"
 
-	"github.com/hoobean1996/wombat-go/rl"
+	"wombat/eval/rl"
 )
 
 // Verifier adapts the pipeline into an [rl.Verifier], so a judged score lands

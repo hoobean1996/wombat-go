@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/hoobean1996/wombat-go/eval/judge"
-	"github.com/hoobean1996/wombat-go/eval/seed"
+	"wombat/eval/judge"
+	"wombat/eval/seed"
 )
 
 // The first real measurement of whether this eval detects anything.

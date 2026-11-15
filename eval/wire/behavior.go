@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hoobean1996/wombat-go/llm"
+	"wombat/pkg/core/llm"
 )
 
 // Behavior is one scripted wire outcome.
@@ -139,7 +139,7 @@ func RateLimit(after time.Duration) Behavior {
 // The body matters more than the status: providers give overflow no distinct
 // code, so llm.ClassifyStatus has to recognise it from the prose. Get that
 // wrong and the error is a plain bad request, which is not retryable, so
-// wombat.WithOverflowRecovery never engages and a run that could have
+// core.WithOverflowRecovery never engages and a run that could have
 // compacted simply dies. That failure is invisible from the outside, which is
 // why it is worth a wire test rather than a unit test over the classifier.
 func ContextOverflow() Behavior {

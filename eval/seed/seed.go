@@ -25,10 +25,10 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/hoobean1996/wombat-go"
-	"github.com/hoobean1996/wombat-go/eval/judge"
-	"github.com/hoobean1996/wombat-go/llm"
-	"github.com/hoobean1996/wombat-go/rl"
+	"wombat/eval/judge"
+	"wombat/eval/rl"
+	"wombat/pkg/core"
+	"wombat/pkg/core/llm"
 )
 
 // Defect is one injectable fault.
@@ -83,8 +83,8 @@ func appendToAnswer(ep *rl.Episode, sentence string) error {
 		blocks = append(blocks, b)
 	}
 	ep.Messages[i] = llm.Message{Role: llm.RoleAssistant, Content: blocks}
-	if a, ok := ep.Outcome.(wombat.Answer); ok {
-		ep.Outcome = wombat.Answer{Text: a.Text + "\n\n" + sentence}
+	if a, ok := ep.Outcome.(core.Answer); ok {
+		ep.Outcome = core.Answer{Text: a.Text + "\n\n" + sentence}
 	}
 	return nil
 }
