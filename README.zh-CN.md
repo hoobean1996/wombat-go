@@ -8,6 +8,7 @@
 
 ![Go](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go&logoColor=white)
 ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 </div>
 
@@ -27,6 +28,7 @@
 - [开发](#zh-dev)
 - [常见问题](#zh-faq)
 - [设计说明](#zh-design)
+- [许可证](#zh-license)
 
 <a id="zh-what"></a>
 
@@ -697,3 +699,9 @@ effects）**：每一种副作用（LLM 调用、工具、文件 I/O、时间、
 
 完整的设计文档涵盖上下文结构、skills、容错、链路追踪、权限、评测，以及与 OCaml 原版
 相比的得与失：**[docs/DESIGN.md](docs/DESIGN.md)**（英文）。
+
+<a id="zh-license"></a>
+
+## 许可证
+
+wombat-go 以 [MIT 许可证](LICENSE)发布。

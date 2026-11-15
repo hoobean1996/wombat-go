@@ -8,6 +8,7 @@
 
 ![Go](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go&logoColor=white)
 ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 </div>
 
@@ -27,6 +28,7 @@
 - [Development](#en-dev)
 - [Troubleshooting](#en-faq)
 - [Design notes](#en-design)
+- [License](#en-license)
 
 <a id="en-what"></a>
 
@@ -720,3 +722,9 @@ shape the API:
 The full write-up covers context structure, skills, fault tolerance, tracing,
 permissions and evaluation, and what was gained and lost compared with the
 OCaml original: **[docs/DESIGN.md](docs/DESIGN.md)**.
+
+<a id="en-license"></a>
+
+## License
+
+wombat-go is released under the [MIT License](LICENSE).
