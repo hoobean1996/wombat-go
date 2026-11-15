@@ -100,31 +100,39 @@ var DefaultPricing Pricing = Table{
 	"claude-3-7-sonnet": {In: 3, Out: 15, CacheWrite: 3.75, CacheRead: 0.30},
 	"claude-3-5-haiku":  {In: 0.80, Out: 4, CacheWrite: 1.00, CacheRead: 0.08},
 
-	// DeepSeek. CacheWrite is 0 because context caching there is automatic and
-	// not separately billed — writing a rate of 0 is the accurate answer, not a
-	// missing entry, and the family is priced so the numbers below are what a
-	// budget trips on.
+	// DeepSeek, from https://api-docs.deepseek.com/quick_start/pricing/ as of
+	// 2026-11-15, which lists USD per 1M tokens. In is the cache-miss input
+	// price, CacheRead the cache-hit one. CacheWrite is 0 because the page bills
+	// no cache writes — writing a rate of 0 is the accurate answer, not a
+	// missing entry.
 	//
-	// VERIFY THESE against the current price list before trusting a bill: they
-	// were entered by hand and this vendor has changed them more than once.
+	// VERIFY THESE against that page before trusting a bill: they were entered
+	// by hand and this vendor has changed them more than once.
 	//
-	// Observed live: asking api.deepseek.com for "deepseek-chat" comes back
-	// with model "deepseek-v4-flash". The table matches on the RESPONSE id, so
-	// the alias needs its own row or it prices at zero.
+	// These are the PEAK rates. Off-peak is half: peak is 01:00-04:00 and
+	// 06:00-10:00 UTC, Monday to Friday, excluding Chinese public holidays,
+	// and one number per model cannot express that. A run costs at most what
+	// this reports and often half of it, which is the direction an estimate
+	// should err.
 	//
-	// Two things make these approximate on purpose. The published rates are in
-	// RMB and are converted here at 7.1 RMB/USD, a rate that moves. And they
-	// halve outside Beijing peak hours (Mon-Fri 09:00-12:00 and 14:00-18:00),
-	// which one number per model cannot express — so these are the PEAK rates.
-	// A run costs at most what this reports and often half of it, which is the
-	// direction an estimate should err.
+	// The table matches on the RESPONSE id, so every id the API answers with
+	// needs its own row or it prices at zero. Observed live on 2026-11-15:
+	// asking for "deepseek-chat" or "deepseek-flash" comes back as
+	// "deepseek-flash". The page says the legacy "deepseek-v4-flash" ids are
+	// served by the same model and billed at the Flash price, so they keep rows
+	// at that price; "deepseek-v4" is the catch-all for the rest of that family.
 	//
-	// flash and pro must stay separate rows: pro is 3x flash across the board,
-	// and a "deepseek-v4" prefix row alone would bill pro at flash rates.
-	"deepseek-v4-pro":   {In: 1.27, Out: 3.80, CacheWrite: 0, CacheRead: 0.042},
-	"deepseek-v4-flash": {In: 0.42, Out: 1.27, CacheWrite: 0, CacheRead: 0.014},
-	"deepseek-v4":       {In: 0.42, Out: 1.27, CacheWrite: 0, CacheRead: 0.014},
-	"deepseek-chat":     {In: 0.42, Out: 1.27, CacheWrite: 0, CacheRead: 0.014},
+	// flash and pro must stay separate rows: pro costs several times flash in
+	// every column, and a "deepseek-v4" prefix row alone would bill pro at
+	// flash rates.
+	//
+	// deepseek-reasoner is not on the page any more; its row is the last
+	// published price, unverified.
+	"deepseek-flash":    {In: 0.30, Out: 1.20, CacheWrite: 0, CacheRead: 0.006},
+	"deepseek-v4-pro":   {In: 1.32, Out: 3.96, CacheWrite: 0, CacheRead: 0.044},
+	"deepseek-v4-flash": {In: 0.30, Out: 1.20, CacheWrite: 0, CacheRead: 0.006},
+	"deepseek-v4":       {In: 0.30, Out: 1.20, CacheWrite: 0, CacheRead: 0.006},
+	"deepseek-chat":     {In: 0.30, Out: 1.20, CacheWrite: 0, CacheRead: 0.006},
 	"deepseek-reasoner": {In: 0.55, Out: 2.19, CacheWrite: 0, CacheRead: 0.14},
 }
 
