@@ -102,19 +102,42 @@ func WithBudget(parent context.Context, l Limits) (context.Context, context.Canc
 	}
 }
 
-// FromContext returns the budget attached to ctx, or an unlimited one.
+// FromContext returns the budget attached to ctx, or a fresh unlimited one.
 //
 // It never returns nil. Callers therefore never nil-check, and code that runs
 // outside a governed context — a unit test, a one-off script — behaves as if
 // there were no caps rather than crashing.
+//
+// The fallback is a throwaway, not a shared default: whatever is charged to it
+// is recorded nowhere else. It used to be one process-wide budget that every
+// ungoverned caller charged, so a run's Progress included the calls of every
+// other ungoverned run in the process, and the sub-agent depth one run saw was
+// whatever concurrent runs had left it at. A run that wants a tally without any
+// caps gets its own from [Ensure], which the agent loop calls for every run.
 func FromContext(ctx context.Context) *Budget {
-	if b, ok := ctx.Value(budgetKey{}).(*Budget); ok {
+	if b, ok := ctx.Value(budgetKey{}).(*Budget); ok && b != nil {
 		return b
 	}
-	return unlimited
+	return &Budget{start: time.Now()}
 }
 
-var unlimited = &Budget{start: time.Now()}
+// Ensure returns ctx unchanged if it already carries a budget, and otherwise
+// ctx with a fresh, unlimited one attached.
+//
+// It is how a run that was given no limits still has a tally of its own: the
+// cost middleware, the loop's step counter and the delegate tools' depth
+// accounting all charge whatever [FromContext] finds, and without this they
+// would each charge a different throwaway. Everything that inherits the
+// returned context — sub-agents in particular — shares the one budget, exactly
+// as it would share one installed by [WithBudget].
+//
+// No cancel func, because an unlimited budget never cancels anything.
+func Ensure(ctx context.Context) context.Context {
+	if b, ok := ctx.Value(budgetKey{}).(*Budget); ok && b != nil {
+		return ctx
+	}
+	return context.WithValue(ctx, budgetKey{}, &Budget{start: time.Now()})
+}
 
 // abort cancels the run. Called with b.mu held.
 func (b *Budget) abort(reason error) {

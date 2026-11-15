@@ -1,16 +1,15 @@
 package anthropic
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"strings"
-	"time"
 
+	"github.com/hoobean1996/wombat-go/internal/sse"
 	"github.com/hoobean1996/wombat-go/llm"
-	"github.com/hoobean1996/wombat-go/llm/internal/sse"
+	"github.com/hoobean1996/wombat-go/llm/internal/httpcall"
 )
 
 // streamEvent is the union of every Messages-API stream event. One struct
@@ -82,27 +81,18 @@ func (s *streamState) at(i int) *blockAcc {
 // readStream consumes the event stream and assembles the same llm.Response the
 // non-streaming path would have produced.
 //
-// cancel is the request context's cause-cancel: it powers the idle watchdog,
-// which is the one timeout net/http cannot express. ResponseHeaderTimeout is
-// already spent by the time we get here — the headers arrived — so a stream
-// that wedges mid-body has nothing else watching it.
-func (c *Client) readStream(
-	ctx context.Context,
-	body io.Reader,
-	onDelta func(llm.Delta),
-	model string,
-	cancel context.CancelCauseFunc,
-) (llm.Response, error) {
-	idle := time.AfterFunc(streamIdleTimeout, func() { cancel(errStreamIdle) })
-	defer idle.Stop()
-
+// body is already behind the call's idle watchdog (httpcall.Watchdog.Body),
+// which is the one timeout net/http cannot express: ResponseHeaderTimeout is
+// spent by the time we get here, so a stream that wedges mid-body has nothing
+// else watching it. A read error is returned as transport; when it was the
+// watchdog or the caller that cut the read off, the caller's
+// httpcall.Settle says which.
+func readStream(body io.Reader, onDelta func(llm.Delta), model string) (llm.Response, error) {
 	st := streamState{model: model}
 	r := sse.NewReader(body)
 	saw := false
 
 	for r.Next() {
-		idle.Reset(streamIdleTimeout)
-
 		ev := r.Event()
 		if len(ev.Data) == 0 {
 			continue
@@ -114,7 +104,7 @@ func (c *Client) readStream(
 	}
 
 	if err := r.Err(); err != nil {
-		return llm.Response{}, abortError(ctx, fmt.Errorf("anthropic: read stream: %w", err))
+		return llm.Response{}, llm.ClassifyTransport(fmt.Errorf("anthropic: read stream: %w", err))
 	}
 	if !saw {
 		// A 200 with an empty body is a proxy or gateway artifact, never the
@@ -320,7 +310,7 @@ func streamError(e *apiError) error {
 	}
 	return &llm.APIError{
 		Class:   class,
-		Message: truncate(scrub(e.Type+": "+e.Message), maxErrorMessage),
+		Message: httpcall.Truncate(scrub(e.Type+": "+e.Message), httpcall.MaxErrorMessage),
 	}
 }
 

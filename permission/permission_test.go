@@ -364,6 +364,33 @@ func TestFSRoot(t *testing.T) {
 	}
 }
 
+// TestFilesystemRootContainsEverything is a regression test. The containment
+// check prefixed root+"/", which for a root of "/" is "//": FSRoot("/") then
+// denied /etc/hosts as outside "/" and denied every relative path too, since
+// those resolve against the root, and SafeCommands("/") could never allow a
+// command that named an absolute path.
+func TestFilesystemRootContainsEverything(t *testing.T) {
+	slash := string(filepath.Separator)
+	abs := filepath.Join(slash, "etc", "hosts")
+
+	r := FSRoot(slash)
+	for _, p := range []string{abs, slash, "rel/x"} {
+		if got, why := r(t.Context(), Request{Tool: viewFile(nil), Use: useOf("u1", args("path", p))}); got != Allow {
+			t.Errorf("FSRoot(/) on %q = %v (%q), want Allow", p, got, why)
+		}
+	}
+
+	s := SafeCommands(slash)
+	for _, kv := range [][]string{
+		{"command", "cat " + abs},
+		{"command", "go test ./...", "exec_dir", filepath.Join(slash, "tmp")},
+	} {
+		if got, why := s(t.Context(), Request{Tool: bash(nil), Use: useOf("u1", args(kv...))}); got != Allow {
+			t.Errorf("SafeCommands(/) on %v = %v (%q), want Allow", kv, got, why)
+		}
+	}
+}
+
 // TestFSRootIgnoresNonStringPathKeys: a tool whose "path" is an array is not a
 // path, and reading one as a path would be a decision made on garbage.
 func TestFSRootIgnoresNonStringPathKeys(t *testing.T) {
@@ -441,6 +468,9 @@ func TestReadOnlyPolicy(t *testing.T) {
 		{"read plus network is not read-only", fetchURL(c), Deny},
 		{"orchestration", delegate(c), Deny},
 		{"a tool that declares nothing", def("mystery", 0, 0, c), Deny},
+		// Their handler never runs, so there is nothing to restrict.
+		{"a pause tool", def("ask_user", tool.CapPause, 0, c), Allow},
+		{"a terminal tool", def("submit", tool.CapTerminal, 0, c), Allow},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got, why := p.Decide(t.Context(), Request{Tool: tc.tool}); got != tc.want {
@@ -468,6 +498,9 @@ func TestWorkspacePolicy(t *testing.T) {
 		{"a self-contained tool is allowed", calculator(c), args("expression", "2+2"), Allow},
 		{"a network call asks", fetchURL(c), args("url", "https://example.com"), Ask},
 		{"a filesystem tool with no path asks", viewFile(c), args("pattern", "TODO"), Ask},
+		// Not "may I ask you something?" before asking it.
+		{"a pause tool is allowed", def("ask_user", tool.CapPause, 0, c), args("question", "which env?"), Allow},
+		{"a terminal tool is allowed", def("submit", tool.CapTerminal, 0, c), args("summary", "done"), Allow},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, why := p.Decide(t.Context(), Request{Tool: tc.tool, Use: useOf("u1", tc.args)})
@@ -475,6 +508,16 @@ func TestWorkspacePolicy(t *testing.T) {
 				t.Errorf("Workspace().Decide(%s) = %v (%q), want %v", tc.tool.Name, got, why, tc.want)
 			}
 		})
+	}
+}
+
+// A policy that must not let the model ask anything — a headless run nobody can
+// answer — still says so by name, ahead of the ready-made rules.
+func TestControlFlowCanStillBeDeniedByName(t *testing.T) {
+	p := Workspace(root)
+	p.Rules = append([]Rule{DenyTools("ask_user")}, p.Rules...)
+	if got, why := p.Decide(t.Context(), Request{Tool: def("ask_user", tool.CapPause, 0, nil)}); got != Deny {
+		t.Errorf("Decide(ask_user) = %v (%q), want Deny", got, why)
 	}
 }
 

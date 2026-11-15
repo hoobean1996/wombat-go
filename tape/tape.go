@@ -109,6 +109,20 @@
 //     wombat.WithDispatcher that bypasses the tool chain — none of it is
 //     recorded and none of it is replayed.
 //
+//   - Where a tool ran. A tool entry is keyed on the tool's name and its input
+//     bytes and nothing else: not the host, not the working directory, not
+//     what the filesystem held. `view_file {"path":"main.go"}` is the same key
+//     in every checkout, so a tape opened against a different workspace — or
+//     against the same one after it changed — answers that call with what the
+//     RECORDING's workspace held, silently. That is the point for a resume,
+//     where the workspace is the one the crashed run left behind, and wrong for
+//     anything else: give each workspace its own tape.
+//
+//   - Sampling defaults set on the client. Temperature and TopP are part of
+//     the key when the request sets them; a default a client applies from its
+//     own config happens below this middleware, so recordings made through
+//     clients configured differently share keys.
+//
 // # File format
 //
 // JSONL, one entry per line, append-only, each line self-describing:

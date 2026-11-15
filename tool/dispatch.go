@@ -55,6 +55,10 @@ type Result struct {
 	// model — they are the harness's own notes about what this observation
 	// is, so a transcript strategy can act on meaning rather than position.
 	Tags []string
+
+	// Media is what the tool attached with [Attach]. Unlike Tags it does reach
+	// the model, alongside Output.
+	Media []llm.Media
 }
 
 // Block converts the result into the content block that closes the tool_use.
@@ -64,7 +68,17 @@ func (r Result) Block() llm.ContentBlock {
 	if r.Err != nil {
 		return llm.ToolResult{ToolUseID: r.UseID, Content: r.Err.Error(), IsError: true}
 	}
-	return llm.ToolResult{ToolUseID: r.UseID, Content: r.Output, IsError: false}
+	return llm.ToolResult{ToolUseID: r.UseID, Content: r.Output, IsError: false, Media: r.Media}
+}
+
+// Size is how many bytes the result puts in front of the model: its output
+// text and whatever media it carries.
+func (r Result) Size() int {
+	n := len(r.Output)
+	for _, m := range r.Media {
+		n += len(m.Data)
+	}
+	return n
 }
 
 // Blocks converts a batch, preserving order.
@@ -98,13 +112,24 @@ type dispatcher struct {
 // DispatchOption configures a Dispatcher.
 type DispatchOption func(*dispatcher)
 
-// WithParallelism runs up to n calls of a batch concurrently.
+// WithParallelism runs up to n calls of a batch concurrently — the calls that
+// only read.
 //
-// The default is 1. Goroutines make concurrent dispatch trivial — the
-// technical obstacle that forces sequential execution in effect-handler
-// runtimes does not exist here — but the remaining reason is semantic: a batch
-// may contain two writes to the same path, and the model does not promise its
-// batches are independent. Opt in when the tool set is known to be safe.
+// Goroutines make concurrent dispatch trivial; what makes it unsafe is
+// semantic. A batch may contain two writes to the same path, or a write and the
+// `go test` that is meant to see it, and the model does not promise its batch
+// is independent — it wrote the calls in an order and may well mean it.
+//
+// So the batch is scheduled by what each tool declares. A run of consecutive
+// calls to [CapReadOnly] tools is fanned out, up to n at a time; any other
+// call — mutating, exec, a tool that declares nothing, a name the set does not
+// know — is a barrier: it starts only when everything before it has finished,
+// and nothing after it starts until it has. Results come back in the model's
+// order regardless. A turn of five greps and a view_file runs at once; a turn
+// that writes a file and then tests it runs exactly as written.
+//
+// The default is 1, which runs everything in order. The agent's own default is
+// higher; see wombat.WithToolParallelism.
 func WithParallelism(n int) DispatchOption {
 	return func(d *dispatcher) {
 		if n > 0 {
@@ -163,6 +188,9 @@ func (d *dispatcher) Dispatch(ctx context.Context, set Set, uses []llm.ToolUse) 
 
 		ann.mu.Lock()
 		out[i].Tags = ann.tags
+		if err == nil {
+			out[i].Media = ann.media
+		}
 		ann.mu.Unlock()
 	}
 
@@ -174,16 +202,35 @@ func (d *dispatcher) Dispatch(ctx context.Context, set Set, uses []llm.ToolUse) 
 	}
 
 	sem := make(chan struct{}, d.parallel)
-	var wg sync.WaitGroup
-	for i := range uses {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			run(i)
-		}()
+	for start := 0; start < len(uses); {
+		if !concurrent(set, uses[start]) {
+			run(start) // a barrier: alone, in order
+			start++
+			continue
+		}
+		end := start + 1
+		for end < len(uses) && concurrent(set, uses[end]) {
+			end++
+		}
+		var wg sync.WaitGroup
+		for i := start; i < end; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				run(i)
+			}()
+		}
+		wg.Wait()
+		start = end
 	}
-	wg.Wait()
 	return out
+}
+
+// concurrent reports whether a call may run alongside its neighbours: a tool
+// that declares it only reads, and declares nothing that contradicts it.
+func concurrent(set Set, u llm.ToolUse) bool {
+	d, ok := set.Find(u.Name)
+	return ok && d.Has(CapReadOnly) && d.Caps&(CapMutating|CapExec|CapPause|CapTerminal) == 0
 }

@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/hoobean1996/wombat-go/internal/safeenv"
 )
 
 // DefaultVerifierFile is where the planner records what must be verified.
@@ -211,6 +213,7 @@ func runNamedTests(ctx context.Context, cfg Config, names []string) map[string]s
 	pattern := "^(" + strings.Join(names, "|") + ")$"
 	cmd := exec.CommandContext(tctx, "go", "test", "-run", pattern, "-v", "./...")
 	cmd.Dir = cfg.Workspace
+	cmd.Env = safeenv.Environ()     // runs the agent's code: no harness credentials
 	text, _ := cmd.CombinedOutput() // a failing test is the normal case here
 
 	for _, m := range rePassLine.FindAllStringSubmatch(string(text), -1) {

@@ -500,6 +500,7 @@ func TestUnknownSessionOnEveryRoute(t *testing.T) {
 		{http.MethodGet, "/api/sessions/nope/events", ""},
 		{http.MethodGet, "/api/sessions/nope/messages", ""},
 		{http.MethodPost, "/api/sessions/nope/messages", `{"prompt":"x"}`},
+		{http.MethodPost, "/api/sessions/nope/steer", `{"prompt":"x"}`},
 		{http.MethodGet, "/api/sessions/nope/approvals", ""},
 		{http.MethodPost, "/api/sessions/nope/approvals/u1", `{"allow":true}`},
 	} {
@@ -1148,4 +1149,36 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// ===== steering =====
+
+func TestSteerReachesTheTurnInProgress(t *testing.T) {
+	t.Parallel()
+	c, release := apiScript(apiText("v1 plan"), apiText("v2 plan")).held()
+	h := apiServe(t, c, nil, nil)
+
+	// Idle sessions take a new turn, not a steering message.
+	idle := apiServe(t, apiScript(apiText("hi")), nil, nil)
+	first := idle.start(`{"prompt":"one"}`)
+	idle.awaitState(first.ID, httpapi.Idle, httpapi.Done)
+	idle.wantErr(idle.do(http.MethodPost, "/api/sessions/"+first.ID+"/steer", `{"prompt":"x"}`),
+		http.StatusConflict, "not_running")
+
+	info := h.start(`{"prompt":"plan it"}`)
+	<-c.entered // the turn is inside the provider
+	h.wantErr(h.do(http.MethodPost, "/api/sessions/"+info.ID+"/steer", `{"prompt":""}`),
+		http.StatusBadRequest, "bad_request")
+	resp := h.do(http.MethodPost, "/api/sessions/"+info.ID+"/steer", `{"prompt":"use v2"}`)
+	var got httpapi.SessionInfo
+	h.decode(resp, http.StatusAccepted, &got)
+
+	release()
+	h.awaitState(info.ID, httpapi.Idle, httpapi.Done)
+	c.mu.Lock()
+	calls := c.calls
+	c.mu.Unlock()
+	if calls != 2 {
+		t.Errorf("model calls = %d, want 2: the steering message is answered too", calls)
+	}
 }

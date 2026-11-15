@@ -266,13 +266,20 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 type breakerState struct {
 	failures  int
 	openUntil time.Time
+
+	// trips counts how many times the breaker has opened. A call notes it on
+	// the way in, and an outcome that arrives after the count moved on belongs
+	// to the time before the trip; see the bookkeeping in WithCircuitBreaker.
+	trips int
 }
 
 // WithCircuitBreaker stops calling a tool that keeps failing.
 //
 // After threshold CONSECUTIVE failures the breaker opens for cooldown and
-// further calls fail fast with [ErrCircuitOpen]; one success closes it. State
-// is per tool name, so a broken shell does not silence the file reader.
+// further calls fail fast with [ErrCircuitOpen]; one success closes it — a
+// success from a call that was already in flight when the breaker opened does
+// not, since it says nothing about the tool after the trip. State is per tool
+// name, so a broken shell does not silence the file reader.
 //
 // The state is PER PROCESS, deliberately, and this is the opposite choice from
 // [WithDedupRepeats] — read the two together, because it is an easy pair to get
@@ -326,6 +333,7 @@ func WithCircuitBreaker(threshold int, cooldown time.Duration) Middleware {
 				breakers[d.Name] = b
 			}
 			remaining := time.Until(b.openUntil)
+			trips := b.trips
 			mu.Unlock()
 
 			if remaining > 0 {
@@ -347,6 +355,13 @@ func WithCircuitBreaker(threshold int, cooldown time.Duration) Middleware {
 
 			mu.Lock()
 			switch {
+			case b.trips != trips:
+				// The breaker opened while this call was in flight, so its
+				// outcome predates the trip and is neither counted nor
+				// forgiven. Without this a slow call that started before
+				// the trip and happened to succeed closed the breaker that
+				// its siblings' failures had just opened, and the next call
+				// went straight back to the tool the breaker was protecting.
 			case err == nil:
 				b.failures, b.openUntil = 0, time.Time{}
 			default:
@@ -354,6 +369,7 @@ func WithCircuitBreaker(threshold int, cooldown time.Duration) Middleware {
 				if b.failures >= threshold {
 					b.openUntil = time.Now().Add(cooldown)
 					b.failures = 0
+					b.trips++
 				}
 			}
 			mu.Unlock()

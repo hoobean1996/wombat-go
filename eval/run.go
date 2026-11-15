@@ -181,6 +181,11 @@ func runSample(ctx context.Context, cfg Config, p *Probe, arm Arm, sample int) (
 	if err != nil {
 		return Obs{}, fmt.Errorf("eval: %s/%s: building the agent: %w", p.ID, arm.Name, err)
 	}
+	if p.MaxIters > 0 {
+		if agent, err = agent.With(wombat.WithMaxIters(p.MaxIters)); err != nil {
+			return Obs{}, fmt.Errorf("eval: %s/%s: capping the agent at %d iterations: %w", p.ID, arm.Name, p.MaxIters, err)
+		}
+	}
 
 	limits := p.Limits
 	runCtx, cancel := governor.WithBudget(ctx, limits)

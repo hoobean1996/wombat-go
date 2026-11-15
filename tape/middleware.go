@@ -105,9 +105,20 @@ func (t *Tape) LLM() llm.Middleware {
 // Install it with wombat.WithToolMiddleware, which places it outside retry,
 // the circuit breaker and truncation — so what is recorded is the logical
 // verdict the model was shown, not an intermediate attempt.
+//
+// Pause and terminal tools pass straight through, untaped. The agent loop
+// dispatches such a call only to get a verdict on it from the middleware; its
+// handler never runs, so there is no effect to protect and nothing worth
+// recording. Taping them would also break every tape recorded before those
+// calls went through the chain at all: Replay would find no entry and turn a
+// pause the recording made into a miss.
 func (t *Tape) Tools() tool.Middleware {
 	return func(next tool.Handler) tool.Handler {
 		return func(ctx context.Context, d tool.Def, use llm.ToolUse) (string, error) {
+			if d.Caps&(tool.CapPause|tool.CapTerminal) != 0 {
+				return next(ctx, d, use)
+			}
+
 			// d.Name, not use.Name: the dispatcher has already resolved the
 			// model's chosen name against the set, and the resolved definition
 			// is what will actually run.
@@ -123,7 +134,7 @@ func (t *Tape) Tools() tool.Middleware {
 				if err := ctx.Err(); err != nil {
 					return "", err
 				}
-				return decodeToolResponse(raw, key)
+				return decodeToolResponse(ctx, raw, key)
 			} else if t.mode == Replay {
 				return "", fmt.Errorf("%w for tool %q %s", ErrTapeMiss, d.Name, key)
 			}
@@ -135,7 +146,9 @@ func (t *Tape) Tools() tool.Middleware {
 			// an is_error tool_result the model reads and reacts to — so
 			// dropping it would replay a different conversation. The
 			// concession is that the sentinel is lost: see the package doc.
-			enc, eerr := encodeToolResponse(out, err)
+			// Media rides on the call's context rather than in the return
+			// value, so it is read from there — and put back there on replay.
+			enc, eerr := encodeToolResponse(out, err, tool.Attached(ctx))
 			if eerr != nil {
 				t.mu.Lock()
 				t.setWriteErr(fmt.Errorf("tape: encode tool response: %w", eerr))
@@ -148,12 +161,13 @@ func (t *Tape) Tools() tool.Middleware {
 	}
 }
 
-func decodeToolResponse(raw json.RawMessage, key string) (string, error) {
+func decodeToolResponse(ctx context.Context, raw json.RawMessage, key string) (string, error) {
 	var tr toolResponse
 	if err := json.Unmarshal(raw, &tr); err != nil {
 		return "", fmt.Errorf("tape: decode recorded tool response %s: %w", key, err)
 	}
 	if tr.OK {
+		tool.Attach(ctx, tr.Media...)
 		return tr.Output, nil
 	}
 	return tr.Output, errors.New(tr.Error)

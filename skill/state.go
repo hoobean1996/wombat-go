@@ -49,11 +49,21 @@ func WithState(ctx context.Context, s *State) context.Context {
 // is an ordinary function that runs anywhere. The consequence is deliberate:
 // activations made against a throwaway are not shared with anything, so a
 // gated tool stays hidden. Nothing is silently global.
+//
+// The one place that refuses the throwaway is load_skill inside a dispatch —
+// see [ErrNoState] — because there a missing State is a wiring mistake that
+// would otherwise only show up as gated tools that never appear.
 func StateFrom(ctx context.Context) *State {
-	if s, ok := ctx.Value(stateKey{}).(*State); ok && s != nil {
+	if s, ok := stateOn(ctx); ok {
 		return s
 	}
 	return NewState()
+}
+
+// stateOn returns the State attached to ctx, reporting false when there is none.
+func stateOn(ctx context.Context) (*State, bool) {
+	s, ok := ctx.Value(stateKey{}).(*State)
+	return s, ok && s != nil
 }
 
 // Activate records name as loaded, with body naming the tool_use whose result

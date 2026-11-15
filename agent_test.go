@@ -5,11 +5,15 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/hoobean1996/wombat-go/llm"
+	"github.com/hoobean1996/wombat-go/metric"
 	"github.com/hoobean1996/wombat-go/tool"
+	"github.com/hoobean1996/wombat-go/trace"
 )
 
 func TestNewValidation(t *testing.T) {
@@ -224,6 +228,123 @@ func TestAgentWithDerivesWithoutMutating(t *testing.T) {
 	if strings.Contains(d2.System(), "extra") {
 		t.Errorf("sibling branches share a block slice: d2 = %q", d2.System())
 	}
+}
+
+// TestAgentWithInstallsObservationOnce is a regression test.
+//
+// New layers the metrics and tracing middleware onto the client, the tool
+// chain and the run context. With used to hand New the configuration New had
+// already layered, so a derived agent got every layer twice: one model call
+// was counted as two in wombat_llm_calls_total, its tokens twice, every tool
+// call twice, and every span recorded twice. Nothing failed — the dashboard
+// simply showed double the traffic for every agent built with With.
+func TestAgentWithInstallsObservationOnce(t *testing.T) {
+	type counts struct{ leaf, llmCalls, tokens, toolCalls, iterations, llmSpans, toolSpans int }
+
+	run := func(t *testing.T, derive func(a *Agent, leaf llm.Client) (*Agent, error)) counts {
+		t.Helper()
+		var leafCalls atomic.Int64
+		sc := scripted(
+			llm.Response{Content: toolTurn("t1", "echo", `{}`).Content, StopReason: llm.StopToolUse,
+				Usage: llm.Usage{InputTokens: 10, OutputTokens: 5}},
+			llm.Response{Content: textTurn("done").Content, StopReason: llm.StopEndTurn,
+				Usage: llm.Usage{InputTokens: 10, OutputTokens: 5}},
+		)
+		leaf := llm.ClientFunc(func(ctx context.Context, req llm.Request) (llm.Response, error) {
+			leafCalls.Add(1)
+			return sc.Complete(ctx, req)
+		})
+
+		reg := metric.NewRegistry()
+		sink := &kindCounter{}
+		a := newAgent(t, leaf, []tool.Def{echoTool("echo", "ok")},
+			WithMetrics(metric.New(reg)), WithTracing(trace.New(sink)))
+		d, err := derive(a, leaf)
+		if err != nil {
+			t.Fatalf("With: %v", err)
+		}
+		if _, err := d.Run(context.Background(), Ask("go")); err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		return counts{
+			leaf:       int(leafCalls.Load()),
+			llmCalls:   int(metricTotal(reg, metric.NameLLMCalls)),
+			tokens:     int(metricTotal(reg, metric.NameLLMTokens)),
+			toolCalls:  int(metricTotal(reg, metric.NameToolCalls)),
+			iterations: int(metricTotal(reg, metric.NameIterations)),
+			llmSpans:   sink.count(trace.KindLLM),
+			toolSpans:  sink.count(trace.KindTool),
+		}
+	}
+
+	// Two model calls of 15 tokens each, one tool call, two iterations.
+	want := counts{leaf: 2, llmCalls: 2, tokens: 30, toolCalls: 1, iterations: 2, llmSpans: 2, toolSpans: 1}
+
+	tests := []struct {
+		name   string
+		derive func(a *Agent, leaf llm.Client) (*Agent, error)
+	}{
+		{"the agent itself", func(a *Agent, _ llm.Client) (*Agent, error) { return a, nil }},
+		{"derived once", func(a *Agent, _ llm.Client) (*Agent, error) { return a.With(WithMaxIters(5)) }},
+		{"derived twice", func(a *Agent, _ llm.Client) (*Agent, error) {
+			d, err := a.With(WithMaxIters(5))
+			if err != nil {
+				return nil, err
+			}
+			return d.With(WithName("grandchild"))
+		}},
+		// A replacement client must be wrapped exactly like the original was,
+		// not left bare and not wrapped around the old client's layers.
+		{"derived with a new client", func(a *Agent, leaf llm.Client) (*Agent, error) {
+			return a.With(WithClient(leaf))
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := run(t, tc.derive); got != want {
+				t.Errorf("observed %+v, want %+v — the leaf is the ground truth, and anything above it "+
+					"means a layer was installed more than once", got, want)
+			}
+		})
+	}
+}
+
+// kindCounter is a trace sink that counts spans by kind.
+type kindCounter struct {
+	mu sync.Mutex
+	n  map[trace.Kind]int
+}
+
+func (k *kindCounter) Emit(sp trace.Span) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.n == nil {
+		k.n = map[trace.Kind]int{}
+	}
+	k.n[sp.Kind]++
+}
+
+func (k *kindCounter) count(kind trace.Kind) int {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.n[kind]
+}
+
+// metricTotal sums every series of one metric: counter values, or observation
+// counts for a histogram.
+func metricTotal(reg *metric.Registry, name string) float64 {
+	var sum float64
+	for _, s := range reg.Snapshot() {
+		if s.Name != name {
+			continue
+		}
+		if s.Type == "histogram" {
+			sum += float64(s.Count)
+		} else {
+			sum += s.Value
+		}
+	}
+	return sum
 }
 
 func TestToolChoiceEndgameForcing(t *testing.T) {

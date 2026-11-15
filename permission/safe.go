@@ -84,22 +84,87 @@ const shellMetacharactersNoPipe = ";&`$()<>\n\r"
 // before the kernel sees it is to stop having an opinion.
 const pathExpansionChars = "~"
 
-// unsafeFlags make an allowlisted program run another program or delete a file.
+// unsafeFlags make an allowlisted program run another program, delete a file or
+// write one, whichever entry it was allowed under.
 //
-// This is find(1), and it is a patch on the sharpest edge rather than a
-// solution — see the limitations section of [SafeCommands]. `find . -exec rm
-// -rf {} +` contains no shell metacharacter at all, so without this the
-// allowlist would admit arbitrary code execution through an entry whose whole
-// justification is that it only looks at files.
+// This is a patch on the sharpest edges rather than a solution — see the
+// limitations section of [SafeCommands]. `find . -exec rm -rf {} +` contains no
+// shell metacharacter at all, so without this the allowlist would admit
+// arbitrary code execution through an entry whose whole justification is that
+// it only looks at files; `go test -toolexec=./x.sh` and `go vet -vettool=./x`
+// are the same hole in the go command.
+//
+// Keys are flag NAMES, without dashes, and a word is matched by name however it
+// is spelled: -exec, --exec, -exec=prog, "-exec" and -e\xec all reach the
+// program as the same flag. Matching the literal token was the original bug —
+// `go test -exec=./evil.sh` was allowed because "-exec=./evil.sh" is not
+// "-exec".
 var unsafeFlags = map[string]bool{
-	"-exec":    true,
-	"-execdir": true,
-	"-ok":      true,
-	"-okdir":   true,
-	"-delete":  true,
-	"-fprint":  true,
-	"-fprintf": true,
-	"-fls":     true,
+	// find(1)
+	"exec":    true,
+	"execdir": true,
+	"ok":      true,
+	"okdir":   true,
+	"delete":  true,
+	"fprint":  true,
+	"fprint0": true,
+	"fprintf": true,
+	"fls":     true,
+
+	// The go command. Each takes a program and runs it: -exec runs the test
+	// binary under it (go test, go run), -toolexec runs every compiler and
+	// linker invocation through it, -vettool replaces vet.
+	"toolexec": true,
+	"vettool":  true,
+}
+
+// flagRule lists flags that disqualify ONE allowlist entry: they turn a
+// subcommand that is on the list for being harmless into one that is not.
+type flagRule struct {
+	// names are long option names, without dashes.
+	names []string
+
+	// abbrev reports that the program accepts any unambiguous prefix of a
+	// long option, as git does: `git branch --del x` is `--delete`. A
+	// double-dash word that is a prefix of a name therefore counts as it.
+	abbrev bool
+
+	// short holds single-letter options the program lets you bundle, as git
+	// does: `git branch -dr` is `-d -r`. Every letter of a single-dash word is
+	// checked against it. Empty for a program that does not bundle.
+	short string
+}
+
+// entryFlags maps an allowlist entry, words joined by one space, to the flags
+// that disqualify it.
+//
+// Per entry rather than global because the same letter means different things
+// to different programs: -w is "write the user's global Go environment" to go
+// env and "match whole words" to grep, and refusing it everywhere would put
+// `grep -w` and `wc -w` in front of a person for nothing.
+var entryFlags = map[string]flagRule{
+	// Rewrites the user's go env file — global, persistent configuration
+	// outside any workspace, applied to every later go command.
+	"go env": {names: []string{"w", "u"}},
+
+	// On the list for LISTING branches. These delete, rename, copy over,
+	// force-reset or re-point one, which is destroying work exactly as much as
+	// the git commands the list leaves out.
+	"git branch": {
+		names: []string{
+			"delete", "move", "copy", "force",
+			"set-upstream-to", "unset-upstream", "edit-description",
+		},
+		abbrev: true,
+		short:  "dDmMcCfu",
+	},
+
+	// On the list for READING history. --output turns them into writers that
+	// can overwrite any file in reach; --ext-diff runs the external diff
+	// program named in git config.
+	"git diff": {names: []string{"output", "ext-diff"}, abbrev: true},
+	"git log":  {names: []string{"output", "ext-diff"}, abbrev: true},
+	"git show": {names: []string{"output", "ext-diff"}, abbrev: true},
 }
 
 // SafeCommands allows a shell command that is recognisably harmless.
@@ -132,28 +197,47 @@ var unsafeFlags = map[string]bool{
 //  3. Every absolute path appearing as a token is inside root, and no token
 //     contains a ".." element. Relative tokens are not resolved and do not
 //     need to be: with ".." refused they cannot climb out of the directory the
-//     command runs in, and rule 4 puts that directory inside root.
+//     command runs in, and rule 5 puts that directory inside root. No token
+//     may be one the shell could still expand into such a path: a glob on a
+//     dot element (`.*` matches ".." in older bash) or a brace expansion
+//     (`{..,x}`).
 //
-//  4. exec_dir, if present, is inside root.
+//  4. No token is a flag that runs a program or writes where it should not —
+//     [unsafeFlags] for every entry, and [entryFlags] for the entries that are
+//     only harmless without them (`go env -w`, `git branch -D`). A flag is
+//     matched by name in any spelling: `-exec`, `--exec` and `-exec=prog` are
+//     one flag to the program and therefore one flag here.
+//
+//  5. exec_dir, if present, is inside root.
+//
+// Every rule reads the words the way the shell will hand them to the program —
+// quotes removed, backslash escapes applied — not the raw characters, because
+// `-e"x"ec` is -exec and `.\./x` is ../x to the shell. See [lex].
 //
 // # What this is NOT
 //
 // Loudly, because the failure mode of a safety feature nobody understands is
 // an operator who thinks they are protected.
 //
-// This is a heuristic over a string. It does not parse the shell, it does not
-// know what any program on the list actually does with its arguments, and it
-// cannot follow a path through a variable, a config file or a symlink. A
-// program on the allowlist can itself be a shell: `echo` cannot run anything,
-// `find` very much can, which is why [unsafeFlags] exists and why that map is
-// a patch and not a proof. `tail -f` never returns. `grep -r` reads every file
+// This is a heuristic over a string. It reads words the way the shell does
+// and nothing more: it does not know what any program on the list actually
+// does with its arguments, and it cannot follow a path through a variable, a
+// config file or a symlink. A program on the allowlist can itself be a shell:
+// `echo` cannot run anything, `find` very much can, which is why [unsafeFlags]
+// exists and why that map is a patch and not a proof. Configuration is the
+// same story one step removed — git runs whatever core.fsmonitor or
+// diff.external names, and a workspace the agent can write to includes
+// .git/config — and so is `go test` itself, which runs whatever test code is in
+// the tree. `tail -f` never returns. `grep -r` reads every file
 // under the directory it is pointed at, and the whole point of rule 3 is that
 // it can only be pointed inside root — textually, with no symlink resolution,
 // exactly like [FSRoot], with exactly the same TOCTOU race.
 //
 // It exists so that nobody is asked about `go test` twenty times in one
 // afternoon. Anything it cannot prove obvious falls through to a human, and
-// real containment is a container.
+// real containment is a sandbox around the process — builtin.SandboxRunner, or
+// a container — which does not have to read the command to hold. With one in
+// place this rule is what it should be: a way to ask less, not a boundary.
 //
 // root must not be empty and is resolved to an absolute path when the rule is
 // built; both are construction-time programmer errors and panic.
@@ -197,13 +281,24 @@ func SafeCommands(root string, extra ...string) Rule {
 
 		var matched []string
 		for _, seg := range segments {
-			words := shellWords(seg)
-			m := longestPrefixMatch(allow, words)
+			// Read the stage the way the shell will, quotes and escapes
+			// resolved, so every check below sees the arguments the program
+			// will actually receive rather than the characters that spell them.
+			words, ok := lex(seg)
+			if !ok {
+				return Undecided, ""
+			}
+			texts := make([]string, len(words))
+			for i, w := range words {
+				texts[i] = w.text
+			}
+			m := longestPrefixMatch(allow, texts)
 			if m == nil {
 				return Undecided, ""
 			}
+			rules := rulesFor(m)
 			for _, w := range words {
-				if !safeWord(abs, w) {
+				if !safeWord(abs, rules, w) {
 					return Undecided, ""
 				}
 			}
@@ -334,18 +429,32 @@ func longestPrefixMatch(allow [][]string, words []string) []string {
 	return best
 }
 
+// rulesFor collects the [entryFlags] rules that apply under a matched allowlist
+// entry: its own, and those of every entry it extends. A caller's extra entry
+// "go env -json" is still go env, and -w still rewrites the user's environment
+// under it; looking up only the longest match would have let it through.
+func rulesFor(entry []string) []flagRule {
+	var out []flagRule
+	for k := 1; k <= len(entry); k++ {
+		if r, ok := entryFlags[strings.Join(entry[:k], " ")]; ok {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // safeWord reports whether one shell word is one this rule is willing to vouch
-// for: not a find(1) flag that runs programs, no ".." element, and no absolute
-// path outside root.
-func safeWord(root, word string) bool {
-	// Quotes are stripped before anything else. `cat "/etc/passwd"` is a token
-	// that does not START with a slash, and a containment check that reads it
-	// literally would wave it through having checked nothing.
-	bare := strings.Trim(word, `'"`)
-	if unsafeFlags[bare] {
+// for, given the flag rules of the allowlist entry its stage matched: not a
+// flag that runs a program or writes, nothing the shell could expand into a
+// path this rule never saw, no ".." element, and no absolute path outside root.
+func safeWord(root string, rules []flagRule, w shellWord) bool {
+	if flagDisqualifies(rules, w.text) {
 		return false
 	}
-	for _, cand := range pathCandidates(bare) {
+	if expandsUnseen(w) {
+		return false
+	}
+	for _, cand := range pathCandidates(w.text) {
 		if cand == "" {
 			continue
 		}
@@ -361,16 +470,181 @@ func safeWord(root, word string) bool {
 	return true
 }
 
+// flagDisqualifies reports whether word, as the program receives it, is a flag
+// that [unsafeFlags] or one of rules refuses.
+//
+// The name is what is compared, never the token: leading dashes are dropped and
+// a value attached with '=' is cut off, so -exec, --exec and -exec=prog are all
+// "exec". Being stricter than the program here only ever sends a command to a
+// person, which is the direction this rule is allowed to be wrong in.
+func flagDisqualifies(rules []flagRule, word string) bool {
+	if len(word) < 2 || word[0] != '-' || word == "--" {
+		return false
+	}
+	name := strings.TrimLeft(word, "-")
+	if i := strings.IndexByte(name, '='); i >= 0 {
+		name = name[:i]
+	}
+	if unsafeFlags[name] {
+		return true
+	}
+
+	double := strings.HasPrefix(word, "--")
+	for _, rule := range rules {
+		for _, n := range rule.names {
+			if name == n || (rule.abbrev && double && name != "" && strings.HasPrefix(n, name)) {
+				return true
+			}
+		}
+		if !double && rule.short != "" && strings.ContainsAny(name, rule.short) {
+			return true
+		}
+	}
+	return false
+}
+
+// expandsUnseen reports whether the shell could turn w into words this rule
+// never examined, through an expansion that survives the metacharacter check.
+//
+// Two survive it. Pathname expansion: an element beginning with a dot and
+// holding an unquoted *, ? or [ can match "..", because a leading dot written
+// in the pattern matches the dot entries too — `cat .*/secret` reads
+// ../secret wherever /bin/sh is an older bash, macOS's included. And bash's
+// brace expansion, which /bin/sh also does on macOS: `cat {..,x}/secret` is
+// `cat ../secret x/secret`, with no ".." element anywhere in the text. A glob
+// anywhere else (`*.go`) or a brace with nothing to expand (`@{u}`) is left
+// alone; only the forms that can produce a path are refused.
+func expandsUnseen(w shellWord) bool {
+	if open := strings.IndexByte(w.mask, '{'); open >= 0 {
+		if n := strings.IndexByte(w.mask[open:], '}'); n >= 0 {
+			if inner := w.mask[open+1 : open+n]; strings.Contains(inner, ",") || strings.Contains(inner, "..") {
+				return true
+			}
+		}
+	}
+	// text and mask have the same length, so one set of element boundaries,
+	// taken from text, serves both: a quoted '/' still separates path elements.
+	start := 0
+	for i := 0; i <= len(w.text); i++ {
+		if i < len(w.text) && w.text[i] != '/' {
+			continue
+		}
+		if strings.HasPrefix(w.text[start:i], ".") && strings.ContainsAny(w.mask[start:i], "*?[") {
+			return true
+		}
+		start = i + 1
+	}
+	return false
+}
+
 // pathCandidates yields the parts of one word that could name a file.
 //
-// The word itself, plus whatever follows the first '=' — `--file=/etc/passwd`
-// is one token and the path in it is real. Splitting on '=' can only make this
-// rule stricter (a false candidate that looks like an escape sends the call to
-// a human), which is the direction errors are allowed to go here.
-func pathCandidates(bare string) []string {
-	out := []string{bare}
-	if i := strings.IndexByte(bare, '='); i >= 0 {
-		out = append(out, strings.Trim(bare[i+1:], `'"`))
+// The word itself; whatever follows the first '=', since `--file=/etc/passwd`
+// is one token and the path in it is real; and, for a single-dash word, what
+// follows the option letter, since `-f/etc/passwd` and `-I../include` attach
+// the value directly. Extra candidates can only make this rule stricter (a false
+// candidate that looks like an escape sends the call to a human), which is the
+// direction errors are allowed to go here.
+func pathCandidates(word string) []string {
+	out := []string{word}
+	if i := strings.IndexByte(word, '='); i >= 0 {
+		out = append(out, word[i+1:])
+	}
+	if len(word) > 2 && word[0] == '-' && word[1] != '-' {
+		out = append(out, word[2:])
 	}
 	return out
+}
+
+// shellWord is one word of a pipeline stage as the shell hands it to the
+// program.
+type shellWord struct {
+	// text is the word after quote removal and backslash escapes: the
+	// argument the program receives.
+	text string
+
+	// mask is text with every quoted or escaped byte replaced by 0. What is
+	// left is exactly what the shell may still expand — an unquoted * or { —
+	// and the two strings always have the same length.
+	mask string
+}
+
+// lex splits one pipeline stage into words the way /bin/sh does, once
+// [pipeline] has refused every metacharacter.
+//
+// It exists because every check in this file is only as good as its picture of
+// the arguments, and splitting on spaces gives the wrong picture: to a shell,
+// `-e"x"ec` and `-e\xec` are the word -exec, and `'.'"."/secret` and
+// `.\./secret` are ../secret. A rule reading the raw tokens waved all four
+// through, two of them as `find . -e"x"ec rm {} +`.
+//
+// The subset is the one that remains after pipeline's checks: blanks separate
+// words; single quotes keep everything literally; double quotes keep everything
+// but a backslash before \ or ", which escapes it ($, ` and newline are
+// already refused); an unquoted backslash makes the next byte literal. ok is
+// false for what it will not reason about — an unterminated quote, a trailing
+// backslash. Bytes, not runes, which is safe because every byte it acts on is
+// ASCII and can never occur inside a multi-byte UTF-8 sequence.
+func lex(stage string) (words []shellWord, ok bool) {
+	var text, mask strings.Builder
+	inWord := false
+
+	literal := func(b byte) { text.WriteByte(b); mask.WriteByte(0) }
+	flush := func() {
+		if inWord {
+			words = append(words, shellWord{text: text.String(), mask: mask.String()})
+		}
+		text.Reset()
+		mask.Reset()
+		inWord = false
+	}
+
+	for i := 0; i < len(stage); i++ {
+		switch c := stage[i]; c {
+		case ' ', '\t':
+			flush()
+
+		case '\'':
+			// An empty pair still makes a word: '' is an empty argument.
+			inWord = true
+			end := strings.IndexByte(stage[i+1:], '\'')
+			if end < 0 {
+				return nil, false
+			}
+			for _, b := range []byte(stage[i+1 : i+1+end]) {
+				literal(b)
+			}
+			i += end + 1
+
+		case '"':
+			inWord = true
+			for i++; ; i++ {
+				if i >= len(stage) {
+					return nil, false
+				}
+				if stage[i] == '"' {
+					break
+				}
+				if stage[i] == '\\' && i+1 < len(stage) && (stage[i+1] == '\\' || stage[i+1] == '"') {
+					i++
+				}
+				literal(stage[i])
+			}
+
+		case '\\':
+			if i+1 >= len(stage) {
+				return nil, false
+			}
+			inWord = true
+			i++
+			literal(stage[i])
+
+		default:
+			inWord = true
+			text.WriteByte(c)
+			mask.WriteByte(c)
+		}
+	}
+	flush()
+	return words, true
 }

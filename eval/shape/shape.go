@@ -127,6 +127,8 @@ func blockKind(b llm.ContentBlock) string {
 		return "tool_result"
 	case llm.Thinking:
 		return "thinking"
+	case llm.Media:
+		return "media"
 	default:
 		return "unknown"
 	}

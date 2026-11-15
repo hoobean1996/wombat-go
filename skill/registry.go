@@ -14,6 +14,21 @@ import (
 // the input schema is what should have prevented the call in the first place.
 var ErrUnknownSkill = errors.New("skill: unknown skill")
 
+// ErrNoState reports that load_skill was dispatched inside an agent run whose
+// context carries no [State] — the run was wired without
+// wombat.WithRunContext(... skill.WithState(ctx, skill.NewState()) ...).
+//
+// It is an error rather than a quiet fallback because the fallback lies. With
+// no State to record it in, the activation lands on a throwaway: load_skill
+// reports the skill activated and its tools available, the gated tools never
+// appear, a second load pastes the whole body again, and nothing anywhere says
+// why. Failing the first load names the missing wiring where a person will see
+// it. Outside a dispatch — a test calling the handler directly — the throwaway
+// is still used, so the handler stays callable anywhere.
+var ErrNoState = errors.New("skill: this run has no skill.State, so loaded skills cannot be tracked; " +
+	"install one with wombat.WithRunContext(func(ctx context.Context) context.Context { " +
+	"return skill.WithState(ctx, skill.NewState()) })")
+
 // Registry is the static catalogue: every skill the process knows about, plus
 // the tool gates declared over them.
 //

@@ -154,6 +154,43 @@ wombat.DropTagged(40, 12, skill.Tag)   // evict skill bodies, keep everything el
 the transcript. It reclaims exactly the nine kilobytes and leaves the reasoning
 around them intact — only possible because content is a typed block list.
 
+A window counted in messages cannot help the run that needs it most: one
+instruction followed by a hundred tool calls has exactly one place such a
+window may cut, at the very start, and one message can be a line of grep or
+sixty kilobytes of log. `TokenWindow` cuts in tokens, and inside the exchanges:
+
+```go
+wombat.WithContextWindow(200_000),
+wombat.WithStrategy(wombat.TokenWindow(0.7, 0.5)),       // trim at 70%, back to about 50%
+wombat.WithCompaction(160_000, 50_000, wombat.Summarize(client, "")),
+```
+
+Old tool results are elided first — each keeps its place and its `tool_use`,
+with a note saying what was there — and only then are old exchanges dropped
+whole. The estimate is calibrated against the prompt tokens the provider
+reports after every call, and the boundary moves in quantized steps of token
+mass, so the prefix the provider caches is not edited every turn. Compaction
+is the heavier tool: past its trigger the old part of the transcript is
+replaced, for the rest of the run, by a summary of it. `ContextTrimmed`,
+`TranscriptCompacted` and `ContextOverflow` events say when each happened.
+
+## What a tool hands back
+
+- **Long output is kept, not lost.** `bash` returns the start and the end of
+  what a command printed, because a failing test run's assertion is at the end.
+  The whole of it is saved to a file the clipped result names, so a model that
+  needs the one stack frame in the middle greps that file instead of paying for
+  the run again.
+- **Pictures are observations too.** `tool.Attach(ctx, llm.Media{...})` adds
+  an image or a PDF to a call's result, and both providers carry it to the
+  model. `builtin.ViewMedia` (`-media` on the CLI) lets the model look at a
+  screenshot or a rendered chart rather than at its bytes.
+- **Reads run together; anything else is a barrier.** A turn's calls run up to
+  four at a time, but only read-only tools overlap: a write, a command, or a
+  tool that declares nothing waits for every call before it and holds back
+  every call after it. A turn of five greps runs at once; a turn that writes a
+  file and then tests it runs exactly as written.
+
 ## Skills
 
 Discovery is static, load and unload are dynamic:
@@ -164,16 +201,15 @@ reg := skill.New(skills...)
 reg.Gate("git-history", "git_log")     // hidden until the skill is loaded
 g := reg.Bind(builtin.Default(deps))
 
-a, _ := wombat.New(
-    wombat.WithClient(client),
-    wombat.WithToolSet(g.Set),                              // gated visibility
-    wombat.WithToolMiddleware(g.Middleware),                // gate enforcement
-    wombat.WithSystemBlock("available_skills", g.Index),    // the catalogue
-    wombat.WithRunContext(func(ctx context.Context) context.Context {
-        return skill.WithState(ctx, skill.NewState())       // per-run activation
-    }),
-)
+a, _ := wombat.New(wombat.WithClient(client), g.Install())
 ```
+
+`Install` is the gated set, the middleware that enforces it, the catalogue and
+a per-run activation state, as one option. They used to be four options to pass
+together, and leaving one out failed quietly — a hidden tool that still ran
+when named, or a `load_skill` that reported success while its tools never
+appeared — so `New` also asks a set that needs per-run state whether a run
+would have it, and logs a warning when it would not.
 
 Live, against a real model: turn 1 offers 12 tools, the model reads the
 catalogue and calls `load_skill("git-history")`, turn 2 offers 14.
@@ -242,9 +278,13 @@ The model sees a short message; the stack goes to `slog`.
 ```go
 tp, _ := tape.Open("run.jsonl", tape.Auto)
 defer tp.Close()
-client = llm.Chain(client, tp.LLM())
-opts = append(opts, wombat.WithToolMiddleware(tp.Tools()))
+a, _ := wombat.New(wombat.WithClient(client), tp.Install())
 ```
+
+`Install` puts the model half outside the client's retry layer and the tool
+half in the tool chain. Recording only the model half was the easy mistake, and
+it replays the model asking for every side effect again — and the tools
+performing them again.
 
 Entries are keyed by a **content hash of the request**, not by position. The
 OCaml original keyed by position and died with `tape misalignment` the moment a
@@ -318,6 +358,66 @@ examined the dangerous half of `go test; rm -rf /` at all.
 "try an approach the policy allows outright" and it hit the same wall three
 times. It now names the commands and the constraint.
 
+**A policy is not a sandbox either.** Every process the tools started used to
+inherit the harness's environment, provider key included, so one `go test` a
+policy waved through was enough to print it. `OSRunner` now passes an
+allowlist — the process basics, the toolchain's own settings, proxies — and
+nothing else; `WithEnvAllow`, `WithEnv` and `WithInheritedEnv` change that, and
+the verifiers that run the agent's code get the same filtered environment. For
+containment rather than hygiene, `SandboxRunner` runs every command under
+`sandbox-exec` on macOS or `bwrap` on Linux: writes only inside the workspace
+and the temp directory, the usual credential directories unreadable, the
+network loopback-only unless asked otherwise. It refuses to run rather than
+running unconfined, and `-confine` turns it on in the CLIs.
+
+## Knowing when it is done
+
+A run that ends because the model said so is only as good as that judgement,
+and the benchmark report below has a line for each way it goes wrong.
+`WithCompletionCheck` asks something better at the moment it matters:
+
+```go
+wombat.WithCompletionCheck(3, wombat.CommandCheck(runner, "go test ./...", 0))
+```
+
+A rejected answer is followed by a user turn carrying the check's output; a
+rejected terminal call gets it as its `tool_result`, as an error. After the
+given number of rejections the run ends as the model wanted, and the last
+`CompletionChecked` event says the check still disagreed — a check that can
+never pass must not hold a run until its iteration cap, at full price. Run it
+through the same `Runner` as the agent's own commands: a check that escapes
+the sandbox is a way out of it.
+
+The other direction is a person who can see the run going wrong.
+`run.Steer("use the v2 API")` puts a message in front of the model at its next
+step without stopping the turn; one that arrives too late for it comes back
+from `run.Undelivered()` rather than being dropped. Over HTTP it is
+`POST /api/sessions/{id}/steer`.
+
+## MCP
+
+`mcp/` connects to Model Context Protocol servers, over stdio or Streamable
+HTTP, and offers their tools like any others:
+
+```go
+servers, _ := mcp.LoadConfig("mcp.json")    // {"mcpServers": {...}}, as desktop clients write it
+conns, err := mcp.ConnectAll(ctx, servers)
+defer conns.Close()
+tools := append(builtin.Default(deps), conns.Tools()...)
+```
+
+A tool is offered as `<server>__<tool>`, and its annotations become
+capabilities — `readOnlyHint` is `CapReadOnly`, `openWorldHint` is
+`CapNetwork`, and a tool that says nothing is taken to write and to reach the
+network — so the read-only filters, the permission policies and the parallel
+scheduler treat it as they would a built-in one. Those hints are the server's
+claims about itself; `"ignoreHints": true` takes every tool of that server to
+mutate. A stdio server gets the same filtered environment as the agent's
+commands plus exactly the `env` its entry names (`"${GITHUB_TOKEN}"` passes one
+through), the images a tool returns reach the model as images, and a server
+that dies fails its calls with the end of its stderr. `-mcp mcp.json` wires it
+into `wombat-jsonl` and `wombat-serve`.
+
 ## Evaluation
 
 `rl/` turns a run into an `Episode`: a trajectory with a reward. `Rollout` runs
@@ -360,15 +460,24 @@ identically.
 `httpapi/` is the same agent behind Server-Sent Events, for a UI:
 
 ```
-POST /v1/sessions              → {"id": …}
-POST /v1/sessions/{id}/turns   → start a turn
-GET  /v1/sessions/{id}/events  → SSE, honours Last-Event-ID
-POST /v1/approvals/{id}        → answer a permission prompt
+POST   /api/sessions                          {"prompt": …} → creates the session and starts its first turn
+GET    /api/sessions/{id}/events              SSE, honours Last-Event-ID
+POST   /api/sessions/{id}/messages            {"prompt": …} → the next turn of the conversation
+POST   /api/sessions/{id}/steer               {"prompt": …} → a message for the turn still running
+GET    /api/sessions/{id}/approvals           what is waiting on a human
+POST   /api/sessions/{id}/approvals/{use_id}  {"allow": true|false} → answer a permission prompt
+DELETE /api/sessions/{id}                     cancel and drop
 ```
+
+The full table — health, config, listing, the transcript, `/metrics` — is in
+the `httpapi` package doc.
 
 Sequence numbers are **session-global, not per turn**, so a UI that reconnects
 across a turn boundary resumes at the event it dropped instead of at the start
-of the current turn. `cmd/wombat-serve` wires it up with a single-file browser
+of the current turn. With `-sessions-dir` (an `httpapi.Store`) the sessions
+survive a restart: a turn the restart interrupted comes back failed, with its
+transcript as it was when the turn began, and a model that was waiting on a
+question is still waiting on it. `cmd/wombat-serve` wires it up with a single-file browser
 client, and `cmd/wombat-tsgen` reflects over the event registry to generate
 `web/events.ts`, so the TypeScript types cannot drift from the Go ones.
 
@@ -421,9 +530,10 @@ llm/                  wire vocabulary, Client, middleware, pricing
 llm/anthropic/        Messages API client (net/http, no curl subprocess)
 llm/openai/           OpenAI-compatible client
 tool/                 Def, Set, Typed, dispatch, middleware, fault attribution
-tool/builtin/         the twelve built-in tools
+tool/builtin/         the twelve built-in tools, view_media, and the runners: filtered and sandboxed
 skill/                progressive disclosure: tools that appear when a skill loads
 permission/           per-call authorization, with a human in the loop
+mcp/                  Model Context Protocol client: a server's tools as tool.Defs
 governor/             budgets as context cancellation
 tape/                 content-hash record and replay
 trace/                OTel-shaped spans, NDJSON and a self-contained HTML report

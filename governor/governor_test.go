@@ -1,6 +1,6 @@
 // Tests are white-box (package governor) on purpose: the package's whole job
 // is enforcement, and a couple of the invariants worth pinning — that
-// FromContext falls back to the shared `unlimited` singleton, that a
+// FromContext falls back to a throwaway rather than a shared budget, that a
 // non-*Budget value under budgetKey{} is ignored — are only observable from
 // inside. Everything else here goes through the exported surface anyway.
 package governor
@@ -219,15 +219,19 @@ func TestFromContextNeverNil(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b := FromContext(tt.ctx())
+			ctx := tt.ctx()
+			b := FromContext(ctx)
 			if b == nil {
-				t.Fatal("FromContext returned nil, want the unlimited budget")
-			}
-			if b != unlimited {
-				t.Errorf("FromContext returned %p, want the shared unlimited budget %p", b, unlimited)
+				t.Fatal("FromContext returned nil, want an unlimited budget")
 			}
 			if got := b.Progress().Limits; got != (Limits{}) {
 				t.Errorf("Progress().Limits = %+v, want the zero Limits", got)
+			}
+			// A throwaway, not a shared default: two lookups on a context
+			// with no budget must not be able to see each other's charges.
+			if FromContext(ctx) == b {
+				t.Error("FromContext returned the same budget twice for a context with none; " +
+					"that budget is shared by every ungoverned caller in the process")
 			}
 		})
 	}
@@ -239,10 +243,6 @@ func TestFromContextNeverNil(t *testing.T) {
 func TestUngovernedSpendIsInert(t *testing.T) {
 	b := FromContext(context.Background())
 
-	// NOTE: this is the process-wide `unlimited` singleton, so its counters are
-	// shared with every other ungoverned caller. Assert only that nothing
-	// panics and nothing is cancelled; the tallies are not this budget's to
-	// own. See the report for why that sharing is worth a second look.
 	b.AddCall(12.34, Tokens{In: 1, Out: 2, CacheRead: 3, CacheWrite: 4})
 	b.Step()
 	b.AddToolCall("k")
@@ -251,9 +251,68 @@ func TestUngovernedSpendIsInert(t *testing.T) {
 	}
 	b.ExitSubagent()
 
-	if got := b.Progress().Limits; got != (Limits{}) {
-		t.Errorf("Progress().Limits = %+v, want the zero Limits", got)
+	p := b.Progress()
+	if p.Limits != (Limits{}) {
+		t.Errorf("Progress().Limits = %+v, want the zero Limits", p.Limits)
 	}
+	// The tally is this budget's own...
+	if p.Calls != 1 || p.Steps != 1 || p.ToolCalls != 1 || p.Depth != 0 {
+		t.Errorf("Progress() = %+v, want exactly the one call, step and tool call charged here", p)
+	}
+	// ...and nobody else's. The fallback used to be one process-wide budget,
+	// so every ungoverned run reported the sum of all of them.
+	if got := FromContext(context.Background()).Progress().Calls; got != 0 {
+		t.Errorf("a fresh ungoverned lookup sees %d calls, want 0 — the charges above leaked into it", got)
+	}
+}
+
+// TestEnsure: a context with no budget gets its own, which everything derived
+// from the context then shares; a context that already has one keeps it.
+func TestEnsure(t *testing.T) {
+	t.Run("attaches a budget that derived contexts share", func(t *testing.T) {
+		ctx := Ensure(context.Background())
+		b := FromContext(ctx)
+		if FromContext(ctx) != b {
+			t.Fatal("two lookups on an Ensured context returned different budgets")
+		}
+		child, cancel := context.WithCancel(ctx)
+		defer cancel()
+		FromContext(child).AddCall(1, Tokens{In: 10})
+		if got := b.Progress().Calls; got != 1 {
+			t.Errorf("parent budget saw %d calls, want the child's 1", got)
+		}
+		if got := b.Progress().Limits; got != (Limits{}) {
+			t.Errorf("Limits = %+v, want unlimited", got)
+		}
+	})
+
+	t.Run("keeps an existing budget", func(t *testing.T) {
+		ctx, cancel := WithBudget(context.Background(), Limits{Steps: 3})
+		defer cancel()
+		if got := Ensure(ctx); got != ctx {
+			t.Error("Ensure replaced the context of one that already carried a budget")
+		}
+		if got := FromContext(Ensure(ctx)).Progress().Limits.Steps; got != 3 {
+			t.Errorf("Limits.Steps = %d, want the caller's 3", got)
+		}
+	})
+
+	t.Run("two ensured contexts do not share", func(t *testing.T) {
+		a, b := Ensure(context.Background()), Ensure(context.Background())
+		FromContext(a).Step()
+		if got := FromContext(b).Progress().Steps; got != 0 {
+			t.Errorf("an unrelated run's step leaked: Steps = %d, want 0", got)
+		}
+	})
+
+	t.Run("a wrong type under the key is replaced, not trusted", func(t *testing.T) {
+		ctx := Ensure(context.WithValue(context.Background(), budgetKey{}, "not a budget"))
+		b := FromContext(ctx)
+		b.Step()
+		if FromContext(ctx) != b {
+			t.Error("Ensure did not attach a real budget over the bogus value")
+		}
+	})
 }
 
 func TestFromContextReturnsTheSameBudget(t *testing.T) {

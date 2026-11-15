@@ -6,6 +6,7 @@ import (
 	"io"
 
 	"github.com/hoobean1996/wombat-go/llm"
+	"github.com/hoobean1996/wombat-go/llm/internal/httpcall"
 )
 
 // apiMessage is the non-streaming response body, and also the payload of the
@@ -34,10 +35,16 @@ type apiBlock struct {
 	Input     json.RawMessage `json:"input"`
 }
 
-// decodeMessage reads the non-streaming response.
-func decodeMessage(r io.Reader, requestedModel string) (llm.Response, error) {
+// decodeMessage reads the non-streaming response, refusing a body larger than
+// limit bytes. Unbounded, a json.Decoder over a misbehaving gateway's body
+// reads until the process runs out of memory, one value at a time.
+func decodeMessage(r io.Reader, requestedModel string, limit int) (llm.Response, error) {
+	raw, err := httpcall.ReadBody(r, "anthropic", limit)
+	if err != nil {
+		return llm.Response{}, err
+	}
 	var msg apiMessage
-	if err := json.NewDecoder(r).Decode(&msg); err != nil {
+	if err := json.Unmarshal(raw, &msg); err != nil {
 		// A 2xx whose body is not the JSON we asked for means something
 		// between us and the model mangled it — a truncated body, a gateway
 		// error page served with the wrong status. Transport class, so the

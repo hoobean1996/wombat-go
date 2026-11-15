@@ -416,45 +416,6 @@ func TestClassifyStatusMapping(t *testing.T) {
 	}
 }
 
-func TestRetryAfterParsing(t *testing.T) {
-	tests := []struct {
-		name string
-		hdr  string
-		want time.Duration
-	}{
-		{name: "absent", hdr: "", want: 0},
-		{name: "integer seconds", hdr: "30", want: 30 * time.Second},
-		{name: "zero", hdr: "0", want: 0},
-		{name: "negative is ignored", hdr: "-1", want: 0},
-		{name: "garbage is ignored", hdr: "later", want: 0},
-		{name: "past HTTP date is ignored", hdr: "Mon, 02 Jan 2006 15:04:05 GMT", want: 0},
-		// Unlike llm/anthropic, this parser uses Atoi, so a fractional value
-		// falls through to the date parser and yields 0. RFC 9110 says
-		// delay-seconds is an integer, so that is defensible — pinned so the
-		// divergence between the two clients is deliberate, not accidental.
-		{name: "fractional seconds are not understood", hdr: "1.5", want: 0},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			h := http.Header{}
-			if tt.hdr != "" {
-				h.Set("Retry-After", tt.hdr)
-			}
-			if got := retryAfter(h); got != tt.want {
-				t.Errorf("retryAfter(%q): got %v, want %v", tt.hdr, got, tt.want)
-			}
-		})
-	}
-	t.Run("future HTTP date", func(t *testing.T) {
-		h := http.Header{}
-		h.Set("Retry-After", time.Now().Add(90*time.Second).UTC().Format(http.TimeFormat))
-		got := retryAfter(h)
-		if got < 80*time.Second || got > 91*time.Second {
-			t.Errorf("retryAfter(future date): got %v, want roughly 90s", got)
-		}
-	})
-}
-
 // TestCancelledContextIsNotClassifiedAsTransport: a cancelled call is the
 // caller's decision, and dressing it up as a transport blip would have the
 // retry middleware hammer a run the operator just stopped.
@@ -597,13 +558,19 @@ func TestTruncateBoundsAQuotedBody(t *testing.T) {
 	if got := truncate("short"); got != "short" {
 		t.Errorf("truncate(short): got %q, want %q", got, "short")
 	}
+	const suffix = "… (truncated)"
 	long := strings.Repeat("x", (2<<10)+50)
 	got := truncate(long)
-	if !strings.HasSuffix(got, "…") {
-		t.Errorf("truncate(long): got a %d-byte string with no ellipsis", len(got))
+	if !strings.HasSuffix(got, suffix) {
+		t.Errorf("truncate(long): got a %d-byte string that does not say it was cut", len(got))
 	}
-	if len(got) > (2<<10)+len("…") {
-		t.Errorf("truncate(long): got %d bytes, want at most %d", len(got), (2<<10)+len("…"))
+	if len(got) > (2<<10)+len(suffix) {
+		t.Errorf("truncate(long): got %d bytes, want at most %d", len(got), (2<<10)+len(suffix))
+	}
+	// A cut that lands inside a rune backs off to its start rather than
+	// quoting half a character into an error message.
+	if got := truncate(strings.Repeat("x", (2<<10)-1) + "中文"); strings.ContainsRune(got, '\uFFFD') || !strings.HasSuffix(got, "x"+suffix) {
+		t.Errorf("truncate cut mid-rune: ...%q", got[len(got)-20:])
 	}
 }
 

@@ -370,3 +370,27 @@ func TestJoin(t *testing.T) {
 		}
 	}
 }
+
+// TestLoadSkillRefusesARunWithNoState is a regression test. Dispatched in a run
+// wired without skill.WithState, load_skill used to activate the skill on a
+// throwaway State and report success: the gated tools never appeared, and the
+// only symptom was a model calling tools it had been told were unlocked.
+func TestLoadSkillRefusesARunWithNoState(t *testing.T) {
+	_, g, h := gatedFixture(t)
+
+	res := dispatch1(t, t.Context(), h, g.Set, loadUse("u1", "demo"))
+	if !errors.Is(res.Err, ErrNoState) {
+		t.Fatalf("error = %v, want ErrNoState naming the missing wiring", res.Err)
+	}
+	if !strings.Contains(res.Err.Error(), "WithRunContext") {
+		t.Errorf("error = %q, want it to say how to fix the wiring", res.Err)
+	}
+
+	// Outside a dispatch there is no run to have wired, and the handler stays
+	// an ordinary function: it still works against a throwaway.
+	d, _ := g.Set.Find(LoadToolName)
+	out, err := d.Fn(t.Context(), json.RawMessage(`{"name":"demo"}`))
+	if err != nil || !strings.Contains(out, demoBody) {
+		t.Errorf("direct call = (%q, %v), want the body", out, err)
+	}
+}

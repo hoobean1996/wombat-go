@@ -58,6 +58,9 @@ type Session struct {
 	// Cond.Wait cannot be selected on.
 	changed chan struct{}
 
+	// run is the turn in progress, for Steer; nil between turns.
+	run *wombat.Buffered
+
 	// msgs is the conversation so far, replaced wholesale at the end of every
 	// turn with the run's own final transcript.
 	msgs  []llm.Message
@@ -72,6 +75,69 @@ type Session struct {
 
 	// cancel ends the turn in flight. nil between turns.
 	cancel context.CancelFunc
+
+	// dropped marks a session deleted or expired, which the store forgets;
+	// saveSeq numbers snapshots under mu, and savedSeq — under saveMu — is
+	// the newest one written, so a slow save of an older snapshot never
+	// overwrites a newer one.
+	dropped  bool
+	saveSeq  uint64
+	saveMu   sync.Mutex
+	savedSeq uint64
+}
+
+// recordLocked snapshots the session for the store, with msgs standing in for
+// the transcript when it is not nil. Callers hold s.mu.
+func (s *Session) recordLocked(msgs []llm.Message) (SessionRecord, uint64) {
+	if msgs == nil {
+		msgs = s.msgs
+	}
+	s.saveSeq++
+	return SessionRecord{
+		ID: s.id, Options: s.opts, Created: s.created, Updated: s.updated,
+		Turns: s.turns, State: s.state, Messages: msgs, Spend: s.spend,
+		Outcome: s.outcome, Answer: s.answer, Error: s.errText, ErrorKind: s.errKind,
+		PauseID: s.pauseID, Events: s.base + len(s.frames),
+	}, s.saveSeq
+}
+
+// persist writes a snapshot unless a newer one has been written already, or
+// the session has been dropped. A failed save is logged: the conversation
+// goes on, it is only its survival across a restart that is at risk.
+func (s *Session) persist(rec SessionRecord, seq uint64) {
+	st := s.m.cfg.Store
+	if st == nil {
+		return
+	}
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	s.mu.Lock()
+	dropped := s.dropped
+	s.mu.Unlock()
+	if dropped || seq <= s.savedSeq {
+		return
+	}
+	if err := st.Save(rec); err != nil {
+		s.m.logger().Warn("session store: save failed", "session", s.id, "err", err)
+		return
+	}
+	s.savedSeq = seq
+}
+
+// drop closes the session and has the store forget it. The store is told
+// after the pump has finished, so its last save cannot bring the session back.
+func (s *Session) drop() {
+	s.mu.Lock()
+	s.dropped = true
+	s.mu.Unlock()
+	s.close()
+	if st := s.m.cfg.Store; st != nil {
+		s.saveMu.Lock()
+		defer s.saveMu.Unlock()
+		if err := st.Delete(s.id); err != nil {
+			s.m.logger().Warn("session store: delete failed", "session", s.id, "err", err)
+		}
+	}
 }
 
 // ID returns the session's opaque identifier.
@@ -129,6 +195,15 @@ func (s *Session) infoLocked() SessionInfo {
 //     appending — a cancelled turn leaves one, and a provider rejects a
 //     transcript that still has it open.
 func (s *Session) Send(prompt string) (int, error) {
+	// Registered before the unlock below, so it runs after it: the snapshot
+	// is taken under the lock and written outside it.
+	var rec SessionRecord
+	var seq uint64
+	defer func() {
+		if seq > 0 {
+			s.persist(rec, seq)
+		}
+	}()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -180,10 +255,15 @@ func (s *Session) Send(prompt string) (int, error) {
 	s.turns = turn
 	s.state = Running
 	s.cancel = cancel
+	s.run = buf
 	s.turnStart = time.Now()
 	s.pauseID = ""
 	s.outcome, s.answer, s.errText, s.errKind = "", "", "", ""
 	s.emitLocked(turn, TurnStarted{Turn: turn, Prompt: prompt})
+	// Saved as running with the turn's own input, prompt included: if the
+	// process dies before the turn ends, the restored session still knows
+	// what it was asked.
+	rec, seq = s.recordLocked(in.Messages)
 
 	s.wg.Add(1)
 	go s.pump(ctx, turn, buf, cancel)
@@ -191,6 +271,22 @@ func (s *Session) Send(prompt string) (int, error) {
 }
 
 // pump copies one run's events into the session log and records how it ended.
+// Steer passes prompt to the turn in progress; see wombat.Run.Steer. It is
+// echoed into the session's log, like a prompt, so a second client watching
+// the session sees what was said.
+func (s *Session) Steer(prompt string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrNoSuchSession
+	}
+	if s.run == nil || !s.run.Steer(prompt) {
+		return ErrNotRunning
+	}
+	s.emitLocked(s.turns, SteerSent{Turn: s.turns, Prompt: prompt})
+	return nil
+}
+
 func (s *Session) pump(ctx context.Context, turn int, buf *wombat.Buffered, cancel context.CancelFunc) {
 	defer s.wg.Done()
 	defer cancel()
@@ -251,8 +347,20 @@ func (s *Session) pump(ctx context.Context, turn int, buf *wombat.Buffered, canc
 	s.errText, s.errKind = end.Error, end.ErrorKind
 	s.pauseID = pauseID
 	s.cancel = nil
+	s.run = nil
+	// What was sent with Steer and never reached the model — the turn paused,
+	// failed or was cancelled first — is handed back, so the UI can offer to
+	// send it as the next turn instead of losing it.
+	end.Undelivered = buf.Undelivered()
+	if s.closed && !s.dropped && end.State == Failed {
+		// Not deleted, so the manager is shutting down: the turn was cut
+		// short by the restart, not by anything about the turn.
+		s.errText, s.errKind = "the server shut down while this turn was running", KindInterrupted
+	}
 	s.emitLocked(turn, end)
+	rec, seq := s.recordLocked(nil)
 	s.mu.Unlock()
+	s.persist(rec, seq)
 
 	s.m.logger().Info("turn ended", "session", s.id, "turn", turn,
 		"state", string(end.State), "cost_usd", end.Spend.CostUSD)

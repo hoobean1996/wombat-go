@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 
@@ -53,11 +54,53 @@ type streamOptions struct {
 // chatMessage is one wire message. Content is a pointer because an assistant
 // turn that is nothing but tool calls must send `"content": null` — omitting
 // the key entirely makes some gateways reject the turn.
+//
+// Parts, when set, replaces Content with the array form a user message needs
+// to carry an image or a file. It is only ever set when there is media to
+// carry: the string form is what every text-only gateway accepts, and what a
+// text-only transcript has always encoded to.
 type chatMessage struct {
-	Role       string     `json:"role"`
-	Content    *string    `json:"content"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
-	ToolCalls  []toolCall `json:"tool_calls,omitempty"`
+	Role       string
+	Content    *string
+	Parts      []contentPart
+	ToolCallID string
+	ToolCalls  []toolCall
+}
+
+// MarshalJSON writes "content" as the parts array, the string, or null, in
+// that order of preference, and keeps the field order the struct always had.
+func (m chatMessage) MarshalJSON() ([]byte, error) {
+	var content any
+	switch {
+	case m.Parts != nil:
+		content = m.Parts
+	case m.Content != nil:
+		content = *m.Content
+	}
+	return json.Marshal(struct {
+		Role       string     `json:"role"`
+		Content    any        `json:"content"`
+		ToolCallID string     `json:"tool_call_id,omitempty"`
+		ToolCalls  []toolCall `json:"tool_calls,omitempty"`
+	}{m.Role, content, m.ToolCallID, m.ToolCalls})
+}
+
+// contentPart is one element of a multi-part user message: text, an image as a
+// data URL, or a file — a PDF — as base64 file data.
+type contentPart struct {
+	Type     string    `json:"type"`
+	Text     string    `json:"text,omitempty"`
+	ImageURL *imageURL `json:"image_url,omitempty"`
+	File     *filePart `json:"file,omitempty"`
+}
+
+type imageURL struct {
+	URL string `json:"url"`
+}
+
+type filePart struct {
+	Filename string `json:"filename,omitempty"`
+	FileData string `json:"file_data"`
 }
 
 type toolCall struct {
@@ -101,7 +144,10 @@ var emptySchema = json.RawMessage(`{"type":"object","properties":{}}`)
 
 // encodeRequest renders one llm.Request as a chat-completions body.
 func encodeRequest(req llm.Request, model string, maxTokens int, stream bool) ([]byte, error) {
-	msgs := encodeMessages(req.System, req.Messages)
+	msgs, err := encodeMessages(req.System, req.Messages)
+	if err != nil {
+		return nil, err
+	}
 	if len(msgs) == 0 {
 		// Caught here rather than at the provider so the failure is cheap and
 		// says what is actually wrong. Classified as a bad request because
@@ -154,7 +200,10 @@ func encodeRequest(req llm.Request, model string, maxTokens int, stream bool) ([
 	}
 	// No UTF-8 scrubbing pass, unlike the OCaml original: encoding/json already
 	// replaces invalid bytes with U+FFFD when it writes a string, so malformed
-	// tool output cannot produce a body the provider rejects.
+	// tool output cannot produce a body the provider rejects. How it spells the
+	// replacement (a \ufffd escape in older Go, the raw UTF-8 bytes ef bf bd in
+	// current Go) differs between releases and does not matter: both decode to
+	// the same string.
 	return out, nil
 }
 
@@ -203,7 +252,7 @@ func encodeToolChoice(tc llm.ToolChoice) (any, error) {
 // encodeMessages flattens the conversation. The system prompt becomes the
 // leading message (OpenAI has no out-of-band system field), and each domain
 // message expands to one or more wire messages.
-func encodeMessages(system string, msgs []llm.Message) []chatMessage {
+func encodeMessages(system string, msgs []llm.Message) ([]chatMessage, error) {
 	out := make([]chatMessage, 0, len(msgs)+1)
 	if system != "" {
 		out = append(out, chatMessage{Role: "system", Content: strptr(system)})
@@ -213,10 +262,14 @@ func encodeMessages(system string, msgs []llm.Message) []chatMessage {
 		case llm.RoleAssistant:
 			out = append(out, encodeAssistant(m.Content))
 		default:
-			out = append(out, encodeUser(m.Content)...)
+			user, err := encodeUser(m.Content)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, user...)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // encodeAssistant folds one assistant turn into exactly one wire message: text
@@ -285,11 +338,21 @@ func encodeAssistant(blocks []llm.ContentBlock) chatMessage {
 // which role a block was allowed to appear in, so an externally supplied
 // transcript with a tool_use in a user turn reached both encoders. Dropping it
 // here is now belt and braces rather than the only line of defence.
-func encodeUser(blocks []llm.ContentBlock) []chatMessage {
+//
+// Media follows the same constraint. A user turn with no tool results carries
+// its media as parts of the one user message. A tool message, though, can only
+// hold text, so media that rides on a tool result — or anywhere in a results
+// turn — goes into ONE user message placed after every tool message of the
+// turn, each item introduced by the call it came from. That keeps the tool
+// messages contiguous, which is the API's rule, and keeps the media next to
+// the result it belongs to, which is the model's.
+func encodeUser(blocks []llm.ContentBlock) ([]chatMessage, error) {
 	var (
 		leading  string
 		haveText bool
+		media    []contentPart // media in a turn with no tool results
 		tools    []chatMessage
+		trailing []contentPart // media that has to follow the tool messages
 	)
 	for _, b := range blocks {
 		switch v := b.(type) {
@@ -314,14 +377,64 @@ func encodeUser(blocks []llm.ContentBlock) []chatMessage {
 				ToolCallID: v.ToolUseID.String(),
 				Content:    strptr(v.Content),
 			})
+			if len(v.Media) > 0 {
+				trailing = append(trailing, contentPart{Type: "text",
+					Text: fmt.Sprintf("Attached to the result of tool call %s:", v.ToolUseID)})
+				for _, m := range v.Media {
+					p, err := mediaPart(m)
+					if err != nil {
+						return nil, err
+					}
+					trailing = append(trailing, p)
+				}
+			}
+		case llm.Media:
+			p, err := mediaPart(v)
+			if err != nil {
+				return nil, err
+			}
+			if len(tools) > 0 {
+				trailing = append(trailing, p)
+			} else {
+				media = append(media, p)
+			}
 		}
 	}
 
-	out := make([]chatMessage, 0, len(tools)+1)
-	if haveText {
+	out := make([]chatMessage, 0, len(tools)+2)
+	switch {
+	case len(media) > 0:
+		var parts []contentPart
+		if haveText {
+			parts = append(parts, contentPart{Type: "text", Text: leading})
+		}
+		out = append(out, chatMessage{Role: "user", Parts: append(parts, media...)})
+	case haveText:
 		out = append(out, chatMessage{Role: "user", Content: strptr(leading)})
 	}
-	return append(out, tools...)
+	out = append(out, tools...)
+	if len(trailing) > 0 {
+		out = append(out, chatMessage{Role: "user", Parts: trailing})
+	}
+	return out, nil
+}
+
+// mediaPart renders an image as a data URL and a PDF as file data.
+func mediaPart(m llm.Media) (contentPart, error) {
+	data := "data:" + m.MediaType + ";base64," + base64.StdEncoding.EncodeToString(m.Data)
+	switch {
+	case m.IsImage():
+		return contentPart{Type: "image_url", ImageURL: &imageURL{URL: data}}, nil
+	case m.MediaType == "application/pdf":
+		name := m.Name
+		if name == "" {
+			name = "document.pdf"
+		}
+		return contentPart{Type: "file", File: &filePart{Filename: name, FileData: data}}, nil
+	default:
+		return contentPart{}, &llm.APIError{Class: llm.ErrBadRequest,
+			Message: fmt.Sprintf("openai: cannot send media of type %q (want an image or application/pdf)", m.MediaType)}
+	}
 }
 
 func strptr(s string) *string { return &s }

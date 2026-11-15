@@ -36,6 +36,10 @@ var DefaultOverflowEscalation = []Strategy{
 // agent simply dies the first time its history outgrows the window. That is
 // the wrong failure for the one error the harness is actually equipped to fix.
 //
+// The rungs are CUMULATIVE: level N is rungs 1 through N applied in order, so
+// a semantic first rung such as [DropTagged] stays in force when the ladder
+// moves on to windowing.
+//
 // The escalation is STICKY for the rest of the run. Once level N has been
 // needed, later calls start there instead of re-discovering the overflow, and
 // each rediscovery is a full round trip that is paid for and thrown away. The
@@ -61,6 +65,9 @@ func WithOverflowRecovery(escalation ...Strategy) llm.Middleware {
 			for {
 				level := st.level()
 				req.Messages = applyLevel(ctx, escalation, level, original)
+				if level > 0 {
+					recordSent(ctx, req.Messages)
+				}
 
 				resp, err := next.Complete(ctx, req)
 				if err == nil || !errors.Is(err, llm.ErrContextWindow) {
@@ -82,6 +89,12 @@ func WithOverflowRecovery(escalation ...Strategy) llm.Middleware {
 					"strategy", escalation[next-1].String(),
 					"messages_before", len(req.Messages),
 					"messages_after", len(shrunk))
+				Emit(ctx, ContextOverflow{
+					Level:          next,
+					Strategy:       escalation[next-1].String(),
+					MessagesBefore: len(req.Messages),
+					MessagesAfter:  len(shrunk),
+				})
 			}
 		})
 	}
@@ -106,12 +119,26 @@ func nextRung(ctx context.Context, escalation []Strategy, level int, current, or
 }
 
 // applyLevel materializes the transcript at an escalation level. Level 0 is
-// the transcript as the agent's own strategy already produced it.
+// the transcript as the agent's own strategy already produced it; level N
+// applies rungs 1 through N in order, each to the previous one's output.
+//
+// Cumulative, because a ladder is read as one: "drop the skill bodies, then
+// keep 20, then keep 8" means every rung goes a step further than the one
+// before it. Applying only rung N to the original — which is what this used to
+// do — made the rungs alternatives instead of steps. Once the level reached a
+// window, the skill bodies the first rung had dropped came back inside it, so a
+// transcript that only fit with BOTH dropped could never be made to fit; and
+// because the level is sticky, every later call of the run paid for the bodies
+// again. For a ladder of windows alone the two readings agree, since a window
+// of a window is just the narrower window.
 func applyLevel(ctx context.Context, escalation []Strategy, level int, msgs []llm.Message) []llm.Message {
 	if level <= 0 || level > len(escalation) {
 		return msgs
 	}
-	return escalation[level-1].Apply(View{Messages: msgs, Results: resultsFrom(ctx)})
+	for _, rung := range escalation[:level] {
+		msgs = rung.Apply(viewFrom(ctx, msgs))
+	}
+	return msgs
 }
 
 // ===== per-run overflow level =====

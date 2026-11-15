@@ -219,6 +219,7 @@ func TestDispatchParallelismActuallyOverlaps(t *testing.T) {
 			return "", ctx.Err()
 		}
 	})
+	block.Caps = CapReadOnly // only reads run side by side
 
 	d := NewDispatcher(Direct, WithParallelism(2))
 	done := make(chan []Result, 1)
@@ -261,6 +262,7 @@ func TestDispatchParallelismIsBounded(t *testing.T) {
 		inflight.Add(-1)
 		return "ok", nil
 	})
+	d.Caps = CapReadOnly
 
 	uses := make([]llm.ToolUse, 12)
 	for i := range uses {
@@ -272,6 +274,60 @@ func TestDispatchParallelismIsBounded(t *testing.T) {
 		NewDispatcher(Direct, WithParallelism(limit)).Dispatch(context.Background(), NewSet(d), uses)
 		if got := maxInflight.Load(); got > int64(limit) {
 			t.Errorf("WithParallelism(%d): peak concurrency = %d, want <= %d", limit, got, limit)
+		}
+	}
+}
+
+// TestDispatchRunsAnythingButAReadAsABarrier: under parallelism, reads fan out
+// and every other call runs alone, in the model's order — a write is never in
+// flight with the reads around it, and a read after a write sees it written.
+func TestDispatchRunsAnythingButAReadAsABarrier(t *testing.T) {
+	var mu sync.Mutex
+	var log []string
+	var inflight atomic.Int64
+	overlapWithWrite := false
+	mk := func(name string, caps Cap) Def {
+		d := def(t, name, func(_ context.Context, in json.RawMessage) (string, error) {
+			n := inflight.Add(1)
+			defer inflight.Add(-1)
+			var arg struct{ ID string }
+			_ = json.Unmarshal(in, &arg)
+			if caps&CapMutating != 0 && n > 1 {
+				overlapWithWrite = true
+			}
+			time.Sleep(5 * time.Millisecond)
+			if caps&CapMutating != 0 && inflight.Load() > 1 {
+				overlapWithWrite = true
+			}
+			mu.Lock()
+			log = append(log, arg.ID)
+			mu.Unlock()
+			return arg.ID, nil
+		})
+		d.Caps = caps
+		return d
+	}
+	set := NewSet(mk("read", CapReadOnly), mk("write", CapMutating), mk("plain", 0))
+	uses := []llm.ToolUse{
+		use("1", "read", `{"ID":"r1"}`), use("2", "read", `{"ID":"r2"}`),
+		use("3", "write", `{"ID":"w"}`),
+		use("4", "read", `{"ID":"r3"}`), use("5", "plain", `{"ID":"p"}`), use("6", "read", `{"ID":"r4"}`),
+	}
+	got := NewDispatcher(Direct, WithParallelism(4)).Dispatch(context.Background(), set, uses)
+	if overlapWithWrite {
+		t.Error("the write ran while another call was in flight")
+	}
+	pos := map[string]int{}
+	for i, id := range log {
+		pos[id] = i
+	}
+	// r1 and r2 finish before w starts; w before r3; r3 before p; p before r4.
+	if !(pos["r1"] < pos["w"] && pos["r2"] < pos["w"] && pos["w"] < pos["r3"] && pos["r3"] < pos["p"] && pos["p"] < pos["r4"]) {
+		t.Errorf("completion order %v breaks a barrier", log)
+	}
+	for i, r := range got {
+		if r.UseID != uses[i].ID {
+			t.Errorf("result %d is %s, want results in the model's order", i, r.UseID)
 		}
 	}
 }

@@ -25,7 +25,8 @@ type Answer struct {
 }
 
 // Paused means the model called a tool with [tool.CapPause] — it wants input
-// from the user.
+// from the user — and the tool middleware let the call through. The tool's
+// handler was never invoked.
 //
 // Resume by answering the tool_use and calling the agent again:
 //
@@ -36,8 +37,16 @@ type Paused struct {
 	Schema    PauseSchema
 }
 
-// Submitted means the model called a tool with [tool.CapTerminal]. The tool's
-// handler was never invoked; its arguments are the structured return value.
+// Submitted means the model called a tool with [tool.CapTerminal] and the tool
+// middleware let the call through. The tool's handler was never invoked; its
+// arguments are the structured return value.
+//
+// The transcript ends with that call unanswered, together with any other call
+// the model made in the same turn, none of which was dispatched. That is the
+// right shape for a finished task, and the wrong one to send again: to carry on
+// from a Submitted run anyway, use [Then] or [Resume], which close every
+// dangling call before the new instruction. [Continue] would be rejected by
+// [Convo.Validate].
 type Submitted struct {
 	Tool    string
 	Payload json.RawMessage

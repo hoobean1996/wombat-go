@@ -34,7 +34,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -45,6 +44,7 @@ import (
 	"time"
 
 	"github.com/hoobean1996/wombat-go/llm"
+	"github.com/hoobean1996/wombat-go/llm/internal/httpcall"
 )
 
 // Defaults applied by [New] when the corresponding Config field is zero.
@@ -64,42 +64,22 @@ const BetaContextManagement = "context-management-2025-06-27"
 // $ANTHROPIC_API_KEY is set.
 var ErrNoAPIKey = errors.New("anthropic: no API key (set Config.APIKey or $ANTHROPIC_API_KEY)")
 
-// errStreamIdle is the cancellation cause when a stream goes silent. It is
-// unexported because callers should match on llm.ErrTransport instead: an idle
-// stream is a stall, and the retry middleware already knows what to do with
-// those.
-var errStreamIdle = errors.New("anthropic: stream went silent")
-
-// Transport and call deadlines.
+// Transport deadlines.
 //
-// The values are a layered budget, mirroring what the OCaml client built by
-// hand out of curl --max-time plus two select deadlines:
+// The values are the first layer of a budget whose other two layers — the
+// stream idle watchdog and the total cap — live in llm/internal/httpcall,
+// shared with every other provider client:
 //
 //   - responseHeaderTimeout catches a server that accepts the connection and
 //     then never answers — the CLOSE_WAIT wedge seen in production;
-//   - streamIdleTimeout catches a stream that starts and then stops mid-body,
-//     which no net/http timeout covers (Anthropic pings every few seconds, so
-//     two minutes of silence means the socket is dead, not that the model is
-//     thinking);
-//   - requestTimeout is the total cap, and applies ONLY when the caller's
-//     context carries no deadline of its own. A caller that set a deadline —
-//     including governor.WithBudget's wall clock — always wins.
+//   - httpcall.StreamIdleTimeout catches a stream that starts and then stops
+//     mid-body, which no net/http timeout covers;
+//   - httpcall.RequestTimeout is the total cap, and applies ONLY when the
+//     caller's context carries no deadline of its own.
 const (
 	dialTimeout           = 10 * time.Second
 	tlsTimeout            = 10 * time.Second
 	responseHeaderTimeout = 90 * time.Second
-	streamIdleTimeout     = 2 * time.Minute
-	requestTimeout        = 10 * time.Minute
-)
-
-// maxErrorBody bounds how much of a failure body we read, and maxErrorMessage
-// how much of it reaches the error string. An HTML error page from a gateway
-// is megabytes of nothing; the provider's own JSON error puts the useful part
-// first, which is also what llm.ClassifyStatus scans for context-window
-// markers.
-const (
-	maxErrorBody    = 64 << 10
-	maxErrorMessage = 2 << 10
 )
 
 // Config configures a [Client]. The zero value is usable as long as
@@ -386,6 +366,10 @@ type Client struct {
 	// caller mutating its own map later cannot reach into a live client.
 	extra map[string]string
 	hc    *http.Client
+	// idle, total and maxBody are the httpcall defaults; fields only so a test
+	// can shorten them.
+	idle, total time.Duration
+	maxBody     int
 }
 
 // New validates cfg and builds a client. It performs no I/O.
@@ -437,6 +421,9 @@ func New(cfg Config) (*Client, error) {
 		topP:        cfg.TopP,
 		extra:       canonicalHeaders(cfg.ExtraHeaders),
 		hc:          cfg.HTTPClient,
+		idle:        httpcall.StreamIdleTimeout,
+		total:       httpcall.RequestTimeout,
+		maxBody:     httpcall.MaxResponseBody,
 	}
 	if c.maxTokens == 0 {
 		c.maxTokens = DefaultMaxTokens
@@ -624,22 +611,14 @@ func (c *Client) Complete(ctx context.Context, req llm.Request) (llm.Response, e
 		return llm.Response{}, err
 	}
 
-	// Only impose our own cap when the caller has not. Middleware and the
-	// governor both express their intent as a context deadline, and silently
-	// shortening it here would make those settings a lie.
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, requestTimeout)
-		defer cancel()
-	}
-
-	// The idle watchdog needs a cancel func that outlives the request build,
-	// so the derived context is created here even though the timer only starts
-	// once the response body is in hand.
-	var cancelCause context.CancelCauseFunc
+	// The shared call budget: our own total cap only when the caller set no
+	// deadline, and for a stream a watchdog that cancels on silence.
+	ctx, cancel := httpcall.Bound(ctx, c.total)
+	defer cancel()
+	var watch *httpcall.Watchdog
 	if stream {
-		ctx, cancelCause = context.WithCancelCause(ctx)
-		defer cancelCause(nil)
+		ctx, watch = httpcall.Watch(ctx, c.idle)
+		defer watch.Stop()
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
@@ -650,18 +629,26 @@ func (c *Client) Complete(ctx context.Context, req llm.Request) (llm.Response, e
 
 	resp, err := c.hc.Do(httpReq)
 	if err != nil {
-		return llm.Response{}, abortError(ctx, fmt.Errorf("anthropic: POST %s: %w", c.endpoint, err))
+		return llm.Response{}, httpcall.Abort(ctx, "anthropic", fmt.Errorf("anthropic: POST %s: %w", c.endpoint, err))
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return llm.Response{}, statusError(resp)
+		return llm.Response{}, httpcall.StatusError(resp)
 	}
 
+	var out llm.Response
 	if stream {
-		return c.readStream(ctx, resp.Body, req.OnDelta, model, cancelCause)
+		out, err = readStream(watch.Body(resp.Body), req.OnDelta, model)
+	} else {
+		out, err = decodeMessage(resp.Body, model, c.maxBody)
 	}
-	return decodeMessage(resp.Body, model)
+	// A body read cut off by the context is the context's doing, and only the
+	// cause says whether that was a stall or the caller stopping the run.
+	if err = httpcall.Settle(ctx, "anthropic", err); err != nil {
+		return llm.Response{}, err
+	}
+	return out, nil
 }
 
 // setHeaders writes the protocol headers, then lets Config.ExtraHeaders have
@@ -683,67 +670,6 @@ func (c *Client) setHeaders(r *http.Request, stream bool) {
 		r.Header.Set(k, v)
 	}
 }
-
-// abortError decides whether a failed call was a stall or a decision.
-//
-// The distinction matters to the retry middleware: a dead socket or an expired
-// deadline is worth another attempt, whereas a context cancelled by the
-// governor is the run being stopped on purpose and must surface its cause
-// intact so errors.Is(err, governor.ErrBudgetExhausted) still answers.
-func abortError(ctx context.Context, err error) error {
-	cause := context.Cause(ctx)
-	switch {
-	case ctx.Err() == nil || cause == nil:
-		return llm.ClassifyTransport(err)
-	case errors.Is(cause, context.DeadlineExceeded), errors.Is(cause, errStreamIdle):
-		return llm.ClassifyTransport(fmt.Errorf("%w: %w", cause, err))
-	default:
-		return fmt.Errorf("anthropic: call aborted: %w", cause)
-	}
-}
-
-// statusError classifies a non-2xx response.
-func statusError(resp *http.Response) error {
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
-	msg := truncate(scrub(string(body)), maxErrorMessage)
-	return llm.ClassifyStatus(resp.StatusCode, msg, retryAfter(resp.Header))
-}
-
-// retryAfter reads the provider's backoff hint. Anthropic sends integer
-// seconds; the HTTP-date form is accepted too because gateways in front of it
-// sometimes do not.
-func retryAfter(h http.Header) time.Duration {
-	v := strings.TrimSpace(h.Get("Retry-After"))
-	if v == "" {
-		return 0
-	}
-	if secs, err := strconv.ParseFloat(v, 64); err == nil {
-		if secs <= 0 {
-			return 0
-		}
-		return time.Duration(secs * float64(time.Second))
-	}
-	if t, err := http.ParseTime(v); err == nil {
-		if d := time.Until(t); d > 0 {
-			return d
-		}
-	}
-	return 0
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	// Cut on a rune boundary so the truncation itself cannot introduce the
-	// invalid UTF-8 that scrub just removed.
-	for n > 0 && !utf8Start(s[n]) {
-		n--
-	}
-	return s[:n] + "… (truncated)"
-}
-
-func utf8Start(b byte) bool { return b&0xC0 != 0x80 }
 
 // scrub replaces invalid UTF-8 with U+FFFD.
 //

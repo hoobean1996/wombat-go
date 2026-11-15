@@ -7,8 +7,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/hoobean1996/wombat-go/internal/sse"
 	"github.com/hoobean1996/wombat-go/llm"
-	"github.com/hoobean1996/wombat-go/llm/internal/sse"
 )
 
 // streamChunk is one `data:` payload of a streamed completion.

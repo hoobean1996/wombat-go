@@ -22,12 +22,72 @@ export interface WombatIterStart {
   max: number;
 }
 
+export interface WombatTurnTruncated {
+  type: "turn_truncated";
+  attempt: number;
+  max_tokens: number;
+}
+
+export interface WombatEmptyTurn {
+  type: "empty_turn";
+  attempt: number;
+  stop_reason?: string;
+  reasoning_bytes?: number;
+}
+
+export interface WombatSteered {
+  type: "steered";
+  messages: number;
+}
+
+export interface WombatCompletionChecked {
+  type: "completion_checked";
+  attempt: number;
+  accepted: boolean;
+  feedback?: string;
+  gave_up?: boolean;
+  error?: string;
+  ms: number;
+}
+
+export interface WombatContextTrimmed {
+  type: "context_trimmed";
+  strategy: string;
+  dropped?: number;
+  elided?: number;
+  tokens: number;
+}
+
+export interface WombatTranscriptCompacted {
+  type: "transcript_compacted";
+  folded: number;
+  tokens_before: number;
+  tokens_after: number;
+  summary_bytes: number;
+}
+
 export interface WombatLLMStart {
   type: "llm_start";
   model?: string;
   purpose?: string;
   tools: number;
   forced_tool?: string;
+}
+
+export interface WombatLLMRetry {
+  type: "llm_retry";
+  attempt: number;
+  of: number;
+  wait_ms: number;
+  error?: string;
+}
+
+export interface WombatContextOverflow {
+  type: "context_overflow";
+  level: number;
+  strategy: string;
+  messages_before: number;
+  messages_after: number;
 }
 
 export interface WombatReasoningDelta {
@@ -146,11 +206,26 @@ export interface WombatApiTurnEnded {
   error?: string;
   error_kind?: string;
   spend: WombatApiSpend;
+  undelivered?: string[];
+}
+
+export interface WombatApiSteerSent {
+  type: "steer_sent";
+  turn: number;
+  prompt: string;
 }
 
 export type WombatEvent =
   | WombatIterStart
+  | WombatTurnTruncated
+  | WombatEmptyTurn
+  | WombatSteered
+  | WombatCompletionChecked
+  | WombatContextTrimmed
+  | WombatTranscriptCompacted
   | WombatLLMStart
+  | WombatLLMRetry
+  | WombatContextOverflow
   | WombatReasoningDelta
   | WombatToolArgsDelta
   | WombatTextDelta
@@ -164,7 +239,8 @@ export type WombatEvent =
   | WombatPermissionRequested
   | WombatPermissionDecided
   | WombatApiTurnStarted
-  | WombatApiTurnEnded;
+  | WombatApiTurnEnded
+  | WombatApiSteerSent;
 
 /** Every "type" value the stream can carry. */
 export type WombatEventKind = WombatEvent["type"];
@@ -180,7 +256,15 @@ export function isKind<K extends WombatEventKind>(
 /** Every event name the SSE endpoint uses, for addEventListener. */
 export const WOMBAT_EVENT_KINDS: readonly WombatEventKind[] = [
   "iter_start",
+  "turn_truncated",
+  "empty_turn",
+  "steered",
+  "completion_checked",
+  "context_trimmed",
+  "transcript_compacted",
   "llm_start",
+  "llm_retry",
+  "context_overflow",
   "reasoning_delta",
   "tool_args_delta",
   "text_delta",
@@ -195,6 +279,7 @@ export const WOMBAT_EVENT_KINDS: readonly WombatEventKind[] = [
   "permission_decided",
   "turn_started",
   "turn_ended",
+  "steer_sent",
 ];
 
 // ===== HTTP API =====

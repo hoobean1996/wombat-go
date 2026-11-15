@@ -386,10 +386,11 @@ func ParallelDelegateTool(child *Agent, opts ...DelegateOption) tool.Def {
 //
 // Running on the parent's context is the payoff of the whole context-scoped
 // design, and the reason delegation is a tool rather than a subsystem. The
-// budget, the skill activation set, the transcript tape, the tracer and the
-// cancellation that a governor abort produces are all values on ctx, so the
-// child inherits every one of them by inheriting the context — no runtime to
-// fork, no handler stack to reinstall, no child config to thread through. The
+// budget, the skill activation set, the transcript tape, the tracer, the
+// permission gate that allowed this delegation and the cancellation that a
+// governor abort produces are all values on ctx, so the child inherits every
+// one of them by inheriting the context — no runtime to fork, no handler stack
+// to reinstall, no child config to thread through. The
 // one thing that does NOT carry over is any state the child agent's own
 // [WithRunContext] decorators re-create; that is the intended escape hatch for
 // a child that must start with, say, a clean skill activation set.

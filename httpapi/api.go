@@ -65,6 +65,7 @@ const (
 	kindNoSuchSession   = "no_such_session"
 	kindNoSuchApproval  = "no_such_approval"
 	kindBusy            = "busy"
+	kindNotRunning      = "not_running"
 	kindDone            = "done"
 	kindAlreadyAnswered = "already_answered"
 	kindTooManySessions = "too_many_sessions"
@@ -301,6 +302,7 @@ func New(m *Manager, opts ...Option) http.Handler {
 	mux.HandleFunc("GET /api/sessions/{id}/events", a.events)
 	mux.HandleFunc("GET /api/sessions/{id}/messages", a.getMessages)
 	mux.HandleFunc("POST /api/sessions/{id}/messages", a.postMessage)
+	mux.HandleFunc("POST /api/sessions/{id}/steer", a.steer)
 	mux.HandleFunc("GET /api/sessions/{id}/approvals", a.listApprovals)
 	mux.HandleFunc("POST /api/sessions/{id}/approvals/{use_id}", a.resolveApproval)
 
@@ -463,6 +465,31 @@ func (a *api) postMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := s.Send(prompt); err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, s.Info())
+}
+
+// steer passes a message to the turn in progress; see wombat.Run.Steer. 202
+// when the run took it, 409 with not_running when there is no turn to take it.
+func (a *api) steer(w http.ResponseWriter, r *http.Request) {
+	s, err := a.session(r)
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	var req SendRequest
+	if err := decodeBody(w, r, &req); err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	prompt := strings.TrimSpace(req.Prompt)
+	if prompt == "" {
+		a.fail(w, r, fmt.Errorf("%w: prompt is required", ErrBadRequest))
+		return
+	}
+	if err := s.Steer(prompt); err != nil {
 		a.fail(w, r, err)
 		return
 	}
@@ -756,6 +783,8 @@ func classify(err error) (status int, kind string) {
 		return http.StatusNotFound, kindNotFound
 	case errors.Is(err, ErrBusy):
 		return http.StatusConflict, kindBusy
+	case errors.Is(err, ErrNotRunning):
+		return http.StatusConflict, kindNotRunning
 	case errors.Is(err, ErrDone):
 		// A conflict with the resource's state, exactly like ErrBusy: the
 		// session exists and the request is well formed, but a conversation

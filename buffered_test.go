@@ -241,6 +241,61 @@ func TestBufferedCloseIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestBufferedCloseKeepsEventsAlreadyProduced is a regression test.
+//
+// Close used to call Run.Close, which empties the run's event channel itself.
+// That made it a second consumer racing the drain goroutine, and every event it
+// won was thrown away. With an event buffer the loss is not even confined to
+// the shutdown: whatever the run produced BEFORE the cancel and had parked in
+// the channel went too, so a follower reading to the end never saw it.
+//
+// The drain goroutine is stalled on the buffer's lock so the channel visibly
+// holds the run's output when Close is called. Holding it a little past the
+// run's end gives a competing consumer every chance to show itself; then the
+// lock is released and everything the run produced must arrive.
+func TestBufferedCloseKeepsEventsAlreadyProduced(t *testing.T) {
+	const deltas = 20
+	emitted := make(chan struct{})
+	cl := llm.ClientFunc(func(ctx context.Context, req llm.Request) (llm.Response, error) {
+		for range deltas {
+			req.OnDelta(llm.Delta{Text: "x"})
+		}
+		close(emitted)
+		<-ctx.Done() // still working when Close arrives
+		return llm.Response{}, ctx.Err()
+	})
+	a := newAgent(t, cl, nil, WithEventBuffer(64))
+	b := Buffer(a.Start(context.Background(), Ask("go")))
+
+	b.mu.Lock() // stall drain: it blocks in append, the channel fills up
+	<-emitted
+	parked := len(b.run.events)
+	if parked == 0 {
+		b.mu.Unlock()
+		t.Fatal("nothing parked in the channel; the fixture no longer exercises the race")
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		_ = b.Close()
+		close(closed)
+	}()
+	for deadline := time.Now().Add(100 * time.Millisecond); time.Now().Before(deadline); {
+		if len(b.run.events) < parked {
+			break // something other than drain is consuming
+		}
+		time.Sleep(time.Millisecond)
+	}
+	b.mu.Unlock()
+	<-closed
+
+	// IterStart, LLMStart, then every delta. The client's failure emits nothing.
+	if got, want := b.Len(), deltas+2; got != want {
+		t.Errorf("Buffered holds %d events after Close, want %d: Close consumed events the run had already "+
+			"produced, racing the drain goroutine for them", got, want)
+	}
+}
+
 // TestBufferedEvictionDropsTheOldest exercises the ring directly: producing
 // 8000+ events through a real run would be slow and would tell us nothing the
 // buffer's own bookkeeping does not.

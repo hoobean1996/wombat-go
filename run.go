@@ -2,6 +2,7 @@ package wombat
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"runtime/debug"
@@ -41,8 +42,9 @@ func Continue(prior []llm.Message) Input {
 // The siblings are not a corner case. A model that asks a question routinely
 // asks it alongside other work: one assistant turn carrying
 // [tool_use grep_search, tool_use ask_user] is an ordinary thing for a model to
-// emit. The loop returns Paused the moment it recognises the pause tool, BEFORE
-// dispatching anything, so those siblings never ran and never will.
+// emit. The loop returns Paused as soon as the pause call is allowed through,
+// WITHOUT dispatching any of its siblings, so those siblings never ran and
+// never will.
 //
 // Answering only the pause leaves them dangling, and the consequence is not a
 // warning: [Convo.Validate] rejects the resumed transcript, the turn fails
@@ -186,6 +188,27 @@ type Run struct {
 	truncated   int
 	truncNotice string
 
+	// tokens is this run's calibrated token estimator, handed to strategies
+	// as View.Tokens. compactRetryAt holds off a compaction that failed until
+	// the transcript has grown enough to be worth another attempt, and
+	// trimmed is what the last ContextTrimmed event reported, so the event
+	// marks a change instead of repeating every iteration.
+	tokens         *tokenEstimator
+	compactRetryAt int
+	trimmed        [2]int
+
+	// steering holds what Steer queued and the loop has not delivered yet;
+	// ended is set once the run can take no more, and what was still queued
+	// then moves to undelivered. Guarded by steerMu, because Steer is called
+	// from the consumer's side.
+	// rejections counts the times the completion check sent the model back.
+	rejections int
+
+	steerMu     sync.Mutex
+	steering    []string
+	ended       bool
+	undelivered []string
+
 	span *trace.Active
 }
 
@@ -200,7 +223,15 @@ func (a *Agent) Start(ctx context.Context, in Input) *Run {
 		events:  make(chan Event, a.cfg.eventBuffer),
 		convo:   Convo(in.Messages),
 		results: make(map[llm.ToolUseID]ResultInfo),
+		tokens:  newTokenEstimator(),
 	}
+
+	// Every run has a budget, even one given no limits, so that what it spends
+	// is tallied as ITS spend: Progress, the Spend events and the sub-agent
+	// depth all read it. A context that already carries one — a caller's
+	// WithBudget, or a parent run's when this is a sub-agent — keeps it, which
+	// is what makes a delegated task charge its parent's tally.
+	ctx = governor.Ensure(ctx)
 
 	// The event sink and the transcript resolver are per-run, so they travel
 	// on the context; the middleware chains that consume them were built once,
@@ -218,6 +249,17 @@ func (a *Agent) Start(ctx context.Context, in Input) *Run {
 	// Run — can still make a semantic decision about what to drop.
 	ctx = withOverflowState(ctx, &overflowState{})
 	ctx = withResults(ctx, r.results)
+	ctx = withEstimator(ctx, r.tokens)
+	ctx = withWindow(ctx, a.cfg.window)
+
+	// A retry inside the LLM chain is otherwise a call that is merely slow.
+	ctx = llm.WithRetryObserver(ctx, func(rt llm.Retry) {
+		ev := LLMRetry{Attempt: rt.Attempt, Of: rt.Of, WaitMillis: millis(rt.Wait)}
+		if rt.Err != nil {
+			ev.Error = rt.Err.Error()
+		}
+		r.emit(ev)
+	})
 
 	// Per-run state is created here, not on the Agent, so two concurrent runs
 	// of the same agent never share it.
@@ -229,6 +271,10 @@ func (a *Agent) Start(ctx context.Context, in Input) *Run {
 	// this span is opened on.
 	ctx, r.span = trace.FromContext(ctx).Start(ctx, trace.KindRun, a.cfg.name)
 	r.ctx = ctx
+
+	// The estimator's fixed part before the first measurement: the system
+	// prompt and whatever tools the run starts with.
+	r.tokens.fixedBytes = len(a.system) + specBytes(tool.Specs(a.set.Visible(ctx)))
 
 	go r.loop()
 	return r
@@ -281,6 +327,12 @@ func (r *Run) Messages() []llm.Message {
 
 // Close cancels the run and releases its goroutine. Idempotent, and safe to
 // call after a full drain.
+//
+// It releases the goroutine by consuming whatever events are still in flight
+// and discarding them, so it belongs to the consumer: call it from the
+// goroutine that calls [Run.Next], once that goroutine is done reading. Called
+// while another goroutine is still iterating, it competes with that reader for
+// the remaining events and drops the ones it wins.
 func (r *Run) Close() error {
 	r.cancel()
 	for range r.events { //nolint:revive // drain so the producer can exit
@@ -312,6 +364,77 @@ func (r *Run) finish(o Outcome, err error) {
 	r.mu.Lock()
 	r.outcome, r.err = o, err
 	r.mu.Unlock()
+
+	r.steerMu.Lock()
+	r.ended = true
+	r.undelivered = append(r.undelivered, r.steering...)
+	r.steering = nil
+	r.steerMu.Unlock()
+}
+
+// Steer adds a message from the user to a run that is still going — "use the
+// v2 API instead", typed while the agent is three tool calls into the wrong
+// one. It reports whether the run took it.
+//
+// The message is delivered at the next point the conversation can take one:
+// with the results of the tool calls in flight, before the next model call. A
+// message that arrives while the model is writing what would have been its
+// final answer does not get lost behind it either: the answer stays in the
+// transcript, the message follows as a new user turn, and the run carries on
+// to answer that too.
+//
+// A run that ends before it can deliver a message — paused, submitted, failed,
+// cancelled — keeps it in [Run.Undelivered], for the caller to send as the next
+// turn instead. A run that has already ended takes nothing and returns false.
+func (r *Run) Steer(text string) bool {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return false
+	}
+	r.steerMu.Lock()
+	defer r.steerMu.Unlock()
+	if r.ended {
+		return false
+	}
+	r.steering = append(r.steering, text)
+	return true
+}
+
+// Undelivered returns what [Run.Steer] accepted and the run ended without
+// delivering. Meaningful once [Run.Next] has returned false.
+func (r *Run) Undelivered() []string {
+	r.steerMu.Lock()
+	defer r.steerMu.Unlock()
+	return append([]string(nil), r.undelivered...)
+}
+
+// takeSteering removes and returns everything queued.
+func (r *Run) takeSteering() []string {
+	r.steerMu.Lock()
+	defer r.steerMu.Unlock()
+	out := r.steering
+	r.steering = nil
+	return out
+}
+
+// steeringBlocks renders queued messages for the transcript. Each is marked
+// as coming from the user mid-task: delivered next to tool results — and, on
+// the OpenAI wire, folded into the last of them — an unmarked sentence would
+// read as something the tool printed.
+func steeringBlocks(msgs []string) []llm.ContentBlock {
+	out := make([]llm.ContentBlock, len(msgs))
+	for i, m := range msgs {
+		out[i] = llm.Text{Text: "[a message from the user, sent while you were working]\n" + m}
+	}
+	return out
+}
+
+// deliverSteering puts queued messages into convo: onto the last turn when it
+// is the user's — tool results or the prompt — or as a new user turn after an
+// assistant one. Convo.Append does exactly that.
+func (r *Run) deliverSteering(convo Convo, msgs []string) Convo {
+	r.emit(Steered{Messages: len(msgs)})
+	return convo.Append(llm.Message{Role: llm.RoleUser, Content: steeringBlocks(msgs)})
 }
 
 // causeOr prefers the reason a governed context was cancelled over whatever
@@ -393,6 +516,12 @@ func (r *Run) loop() {
 		}
 
 		r.emit(IterStart{N: iter, Max: a.cfg.maxIters})
+		// The fourth of the four places WithMetrics promises to wire. It went
+		// uncounted for a while, and nothing said so: an iterations series that
+		// is never written is simply absent, which reads as "no data yet".
+		if m := a.cfg.metrics; m != nil {
+			m.Iteration(a.cfg.name)
+		}
 
 		next, stop := r.iterate(ctx, iter, convo)
 		if stop {
@@ -437,10 +566,40 @@ func (r *Run) iterate(parent context.Context, iter int, convo Convo) (Convo, boo
 	// skill's body; a Set that gates tools on that skill has to learn so
 	// before it reports what is visible, or this turn offers the model
 	// tools whose knowledge left the context one line ago.
-	msgs := a.cfg.strategy.Apply(View{Messages: convo, Results: r.results})
+	// What the user said while the last step ran goes in before anything
+	// looks at the transcript, so the model reads it on this very call.
+	if steer := r.takeSteering(); len(steer) > 0 {
+		convo = r.deliverSteering(convo, steer)
+		r.setConvo(convo)
+	}
+
+	// Compaction first, because it rewrites the STORED transcript: what it
+	// folds away is gone for every later call, not just this one.
+	if folded, ok := r.compact(ctx, convo); ok {
+		convo = folded
+		r.setConvo(convo)
+	}
+
+	msgs := a.cfg.strategy.Apply(View{Messages: convo, Results: r.results, Tokens: r.tokens.estimate, Window: a.cfg.window})
+	// The Strategy contract is that its output still validates, and the stored
+	// transcript is only checked once, before the first iteration. A strategy
+	// that breaks the contract — orphans a tool_result, leaves a tool_use
+	// unanswered, empties the transcript — would otherwise surface as the
+	// provider's 400, naming none of that, after a paid round trip.
+	//
+	// Only a strategy that broke a transcript that was fine going in is
+	// blamed. The stored transcript can itself fail Validate for reasons that
+	// are the model's, not the strategy's — a gateway that reuses tool_use ids
+	// across turns does — and the loop has always left those to the provider
+	// to accept or refuse. Validating the stored copy costs nothing on the
+	// common path: it only runs once the strategy's output has failed.
+	if err := Convo(msgs).Validate(); err != nil && convo.Validate() == nil {
+		return fail(fmt.Errorf("wombat: strategy %s produced a transcript that cannot be sent: %w", a.cfg.strategy, err))
+	}
 	if rec, ok := a.set.(tool.Reconciler); ok {
 		rec.Reconcile(ctx, observationsIn(msgs))
 	}
+	r.reportTrim(convo, msgs)
 
 	if a.cfg.turnNotice != nil {
 		if note := a.cfg.turnNotice(ctx, iter); note != "" {
@@ -512,7 +671,13 @@ func (r *Run) iterate(parent context.Context, iter int, convo Convo) (Convo, boo
 	}
 
 	started := time.Now()
-	resp, err := a.cfg.client.Complete(ctx, req)
+	sent := &sentRecorder{}
+	resp, err := a.cfg.client.Complete(withSent(ctx, sent), req)
+	if err == nil {
+		// Calibrate on what was actually sent, which is not msgs when the
+		// overflow ladder shrank the request on its way out.
+		r.tokens.observe(sent.or(msgs), len(req.System)+specBytes(req.Tools), resp.Usage.PromptTokens())
+	}
 	if err != nil {
 		// Keep the half-answer. The user watched it arrive; a transcript that
 		// pretends it never happened cannot be resumed from, and "stop, then
@@ -568,6 +733,7 @@ func (r *Run) iterate(parent context.Context, iter int, convo Convo) (Convo, boo
 		seenMu.Unlock()
 
 		r.emptyTurns++
+		r.emit(EmptyTurn{Attempt: r.emptyTurns, StopReason: resp.StopReason, ReasoningBytes: thought})
 		e := &EmptyTurnError{
 			Attempts:       r.emptyTurns,
 			StopReason:     resp.StopReason,
@@ -611,7 +777,20 @@ func (r *Run) iterate(parent context.Context, iter int, convo Convo) (Convo, boo
 
 	switch resp.StopReason {
 	case llm.StopEndTurn, llm.StopStopSequence:
-		return done(Answer{Text: llm.TextOf(resp.Content)})
+		// A message the user sent while this answer was being written is
+		// still owed an answer: carry on rather than end over it.
+		if steer := r.takeSteering(); len(steer) > 0 {
+			convo = r.deliverSteering(convo, steer)
+			r.setConvo(convo)
+			return convo, false
+		}
+		answer := llm.TextOf(resp.Content)
+		if feedback := r.checkCompletion(ctx, Completion{Answer: answer, Messages: convo}); feedback != "" {
+			convo = convo.PushUserText(notDoneYet(feedback))
+			r.setConvo(convo)
+			return convo, false
+		}
+		return done(Answer{Text: answer})
 
 	case llm.StopRefusal:
 		return fail(&RefusalError{Reason: llm.TextOf(resp.Content)})
@@ -622,23 +801,16 @@ func (r *Run) iterate(parent context.Context, iter int, convo Convo) (Convo, boo
 			return fail(errors.New("wombat: provider reported stop_reason=tool_use with no tool_use block"))
 		}
 
-		// Terminal and pause are properties of the tool, not of a
-		// hard-coded name: a set containing one can end or suspend, a set
-		// without one never can.
-		if tu, ok := tool.FindTerminal(a.set, uses); ok {
-			return done(Submitted{Tool: tu.Name, Payload: tu.Input})
-		}
-		if tu, ok := tool.FindPause(a.set, uses); ok {
-			return done(Paused{ToolUseID: tu.ID, Schema: ParsePauseSchema(tu.Input)})
-		}
-
 		span.Set("wombat.tool_calls", len(uses))
-		results := a.disp.Dispatch(ctx, a.set, uses)
+		results, stop := r.dispatch(ctx, convo, uses)
+		if stop != nil {
+			return done(stop)
+		}
 		for _, res := range results {
 			r.results[res.UseID] = ResultInfo{
 				Tool:  res.Name,
 				Tags:  res.Tags,
-				Bytes: len(res.Output),
+				Bytes: res.Size(),
 			}
 		}
 		convo = convo.PushToolResults(tool.Blocks(results))
@@ -650,8 +822,159 @@ func (r *Run) iterate(parent context.Context, iter int, convo Convo) (Convo, boo
 	}
 }
 
-// Progress reports the run's spend against its budget. Zero-valued when the
-// context carries no budget.
+// dispatch runs one turn's tool calls, and returns an Outcome instead when one
+// of them is allowed to end or suspend the run.
+//
+// Terminal and pause are properties of the tool, not of a hard-coded name: a
+// set containing one can end or suspend, a set without one never can. But a
+// call to one is still a CALL, and it is decided by the same chain as every
+// other. It used to short-circuit before dispatch, which put it beyond every
+// middleware: a permission policy that refused it, or a skill gate that had
+// not unlocked it and was not even offering it to the model, was never asked —
+// the call ended or suspended the run regardless, and produced no
+// ToolStart/ToolDone, no metric and no budget charge on the way.
+//
+// Visibility alone still decides nothing, exactly as for any other tool: a
+// [tool.Set] that hides a tool from Visible without middleware that refuses it
+// lets the call through. Enforcement is the middleware's job.
+//
+// So each candidate is dispatched on its own through the agent's dispatcher,
+// with its handler swapped for one that accepts without doing anything (see
+// controlSet): the handler of such a tool must never run, and everything around
+// it — gates, validation, the tape, metrics, the budget, the observer — runs as
+// it would for any call. If the chain lets it through, the run ends or pauses
+// exactly as before. If something refuses it, the refusal becomes that call's
+// tool_result and the turn carries on as an ordinary batch, so the model learns
+// why and can do something else.
+//
+// Terminal calls are considered before pause calls, each in the order the model
+// made them, so ending still beats suspending when both are allowed. Siblings
+// are never dispatched when the run ends or pauses; [AnswerPause] and [Then]
+// close them when the conversation resumes.
+//
+// A terminal call the chain lets through still has to satisfy the agent's
+// [CompletionCheck], when it has one. One the check rejects is answered with
+// the check's feedback and handled from there exactly like a refused call.
+func (r *Run) dispatch(ctx context.Context, convo Convo, uses []llm.ToolUse) ([]tool.Result, Outcome) {
+	a := r.a
+	order := controlOrder(a.set, uses)
+	if len(order) == 0 {
+		return a.disp.Dispatch(ctx, a.set, uses), nil
+	}
+
+	results := make([]tool.Result, len(uses))
+	decided := make([]bool, len(uses))
+	verdicts := controlSet{a.set}
+	for _, i := range order {
+		u := uses[i]
+		res := dispatchOne(ctx, a.disp, verdicts, u)
+		if res.Err == nil {
+			if d, _ := a.set.Find(u.Name); d.Has(tool.CapTerminal) {
+				sub := Submitted{Tool: u.Name, Payload: u.Input}
+				feedback := r.checkCompletion(ctx, Completion{Submitted: &sub, Messages: convo})
+				if feedback == "" {
+					return nil, sub
+				}
+				// Not done, says the check: the submission is answered with
+				// why, and the turn carries on like one the gate refused.
+				res = tool.Result{UseID: u.ID, Name: u.Name, Err: errNotAccepted(feedback)}
+			} else {
+				return nil, Paused{ToolUseID: u.ID, Schema: ParsePauseSchema(u.Input)}
+			}
+		}
+		results[i], decided[i] = res, true
+	}
+
+	// Nothing was allowed to stop the run, so the rest of the turn is ordinary
+	// work, dispatched as one batch exactly as it would have been.
+	var rest []llm.ToolUse
+	var at []int
+	for i, u := range uses {
+		if !decided[i] {
+			rest = append(rest, u)
+			at = append(at, i)
+		}
+	}
+	if len(rest) > 0 {
+		got := a.disp.Dispatch(ctx, a.set, rest)
+		for j, u := range rest {
+			if j < len(got) {
+				results[at[j]] = got[j]
+			} else {
+				results[at[j]] = missingResult(u)
+			}
+		}
+	}
+	return results, nil
+}
+
+// controlOrder lists the indices of the calls that would end or suspend the
+// run: terminal calls first, then pause calls, each in the order made.
+func controlOrder(set tool.Set, uses []llm.ToolUse) []int {
+	var terminal, pause []int
+	for i, u := range uses {
+		d, ok := set.Find(u.Name)
+		switch {
+		case !ok:
+		case d.Has(tool.CapTerminal):
+			terminal = append(terminal, i)
+		case d.Has(tool.CapPause):
+			pause = append(pause, i)
+		}
+	}
+	return append(terminal, pause...)
+}
+
+// dispatchOne dispatches a single call, holding a dispatcher to the
+// one-result-per-call contract rather than indexing past what it returned.
+func dispatchOne(ctx context.Context, d tool.Dispatcher, set tool.Set, u llm.ToolUse) tool.Result {
+	if rs := d.Dispatch(ctx, set, []llm.ToolUse{u}); len(rs) == 1 {
+		return rs[0]
+	}
+	return missingResult(u)
+}
+
+func missingResult(u llm.ToolUse) tool.Result {
+	return tool.Result{UseID: u.ID, Name: u.Name,
+		Err: fmt.Errorf("wombat: the dispatcher returned no result for %s", u.Name)}
+}
+
+// controlSet is a tool set whose pause and terminal tools resolve to a handler
+// that accepts the call without running anything.
+//
+// It is how such a call gets a verdict from the dispatch chain without its real
+// handler ever being reached — which [tool.CapTerminal] promises, and which the
+// builtin ask_user enforces by failing loudly. Swapping the handler in the set,
+// rather than teaching the chain's leaf about control tools, is what lets a
+// dispatcher supplied with [WithDispatcher] give the same verdict: every
+// dispatcher resolves a call through the set it is handed.
+//
+// The accepting handler's output is what ToolDone reports. It never reaches the
+// transcript: an accepted call ends or suspends the run before any
+// tool_result is written.
+type controlSet struct{ tool.Set }
+
+func (s controlSet) Find(name string) (tool.Def, bool) {
+	d, ok := s.Set.Find(name)
+	if !ok {
+		return d, false
+	}
+	switch {
+	case d.Has(tool.CapTerminal):
+		d.Fn = accept("(submitted: the run ends here)")
+	case d.Has(tool.CapPause):
+		d.Fn = accept("(paused: waiting for the user to answer)")
+	}
+	return d, true
+}
+
+func accept(note string) tool.Fn {
+	return func(context.Context, json.RawMessage) (string, error) { return note, nil }
+}
+
+// Progress reports the run's spend against its budget. A run started with no
+// budget on its context still has a tally of its own, with no limits; see
+// [governor.Ensure].
 func (r *Run) Progress() governor.Progress {
 	return governor.FromContext(r.ctx).Progress()
 }
@@ -718,12 +1041,44 @@ func observationsIn(msgs []llm.Message) map[llm.ToolUseID]bool {
 	present := make(map[llm.ToolUseID]bool)
 	for _, m := range msgs {
 		for _, b := range m.Content {
-			if tr, ok := b.(llm.ToolResult); ok {
+			// An elided result is an evicted one: its id is still there, its
+			// body is not, and a skill whose body went with it is retired.
+			if tr, ok := b.(llm.ToolResult); ok && !strings.HasPrefix(tr.Content, elidedPrefix) {
 				present[tr.ToolUseID] = true
 			}
 		}
 	}
 	return present
+}
+
+// reportTrim emits ContextTrimmed when what the strategy sends differs from
+// the stored transcript in a way it did not on the previous iteration — a new
+// cut, more results elided. A trimmed transcript stays trimmed for the rest of
+// the run, and an event every iteration would say nothing the first did not.
+func (r *Run) reportTrim(stored Convo, sent []llm.Message) {
+	elided := 0
+	for _, m := range sent {
+		for _, b := range m.Content {
+			if tr, ok := b.(llm.ToolResult); ok && strings.HasPrefix(tr.Content, elidedPrefix) {
+				elided++
+			}
+		}
+	}
+	dropped := len(stored) - len(sent)
+	if dropped <= 0 && elided == 0 {
+		r.trimmed = [2]int{}
+		return
+	}
+	if r.trimmed == [2]int{dropped, elided} {
+		return
+	}
+	r.trimmed = [2]int{dropped, elided}
+	r.emit(ContextTrimmed{
+		Strategy: r.a.cfg.strategy.String(),
+		Dropped:  dropped,
+		Elided:   elided,
+		Tokens:   r.tokens.estimate(sent),
+	})
 }
 
 func (r *Run) snapshot() Convo {

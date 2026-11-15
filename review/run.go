@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/hoobean1996/wombat-go"
+	"github.com/hoobean1996/wombat-go/internal/safeenv"
 )
 
 // Run reviews the code in cfg.Workspace and, when a Fixer is supplied, repairs
@@ -249,6 +250,7 @@ func runTests(ctx context.Context, cfg Config) map[string]string {
 
 	cmd := exec.CommandContext(tctx, "go", "test", "-run", TestPrefix, "-v", "./...")
 	cmd.Dir = cfg.Workspace
+	cmd.Env = safeenv.Environ()    // runs the agent's code: no harness credentials
 	out, _ := cmd.CombinedOutput() // a non-zero exit is the normal case here
 	text := string(out)
 

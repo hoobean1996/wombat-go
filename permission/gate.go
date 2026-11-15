@@ -87,9 +87,38 @@ func (f ApproverFunc) Approve(ctx context.Context, r Request) (bool, error) { re
 // usually wrong: a 30-second cap on view_file is about the read, not about
 // lunch. Prefer to install Gate outside the timeout and bound the wait with
 // the run's own budget.
+//
+// # A sub-agent is gated too, whether or not it was built with the gate
+//
+// A delegate call is one call to the parent and a whole agent's worth of calls
+// to the child, and [Workspace] allows it without asking on the understanding
+// that those calls are gated as well. That used to depend on whoever built the
+// child remembering to install the same gate on it; a child built without one
+// ran everything its parent would have had to ask about, silently.
+//
+// So the gate travels with the work it allowed. Every call it lets through
+// carries it on the context ([tool.Inherit]); a sub-agent started by that call
+// applies it to each of its own calls ([tool.WithInherited], which the agent's
+// default dispatch chain includes), and so does every sub-agent below that. A
+// child with a gate of its own is governed by both, its own ruling first. The
+// same gate met twice in one chain — installed on the child and inherited from
+// the parent, the usual configuration — decides once ([tool.Claim]).
+//
+// Grants travel the same way, on the context, so an approval given to the
+// parent's call is not asked for again on the child's identical call.
 func Gate(p Policy, a Approver) tool.Middleware {
-	return func(next tool.Handler) tool.Handler {
+	id := new(gateID)
+	var gate tool.Middleware
+	gate = func(next tool.Handler) tool.Handler {
 		return func(ctx context.Context, d tool.Def, use llm.ToolUse) (string, error) {
+			// One verdict per call, however many copies of this gate the call
+			// passes through...
+			if !tool.Claim(ctx, id) {
+				return next(ctx, d, use)
+			}
+			// ...and the verdict follows the call into whatever it starts.
+			ctx = tool.Inherit(ctx, id, gate)
+
 			req := Request{Tool: d, Use: use}
 			decision, reason := p.Decide(ctx, req)
 			// The rule that decided speaks to the human through the request.
@@ -123,7 +152,13 @@ func Gate(p Policy, a Approver) tool.Middleware {
 			}
 		}
 	}
+	return gate
 }
+
+// gateID is one Gate's identity, the key it claims calls and inherits itself
+// under. Not zero-sized: distinct zero-size allocations may share an address,
+// and two gates must never be mistaken for one.
+type gateID struct{ _ byte }
 
 // ask handles the Ask branch: grant memory first, then a human.
 func ask(

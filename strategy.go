@@ -1,9 +1,12 @@
 package wombat
 
 import (
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/hoobean1996/wombat-go/llm"
 )
@@ -25,6 +28,26 @@ type View struct {
 	// and a strategy must degrade to position-based trimming for those rather
 	// than assume.
 	Results map[llm.ToolUseID]ResultInfo
+
+	// Tokens estimates the input tokens of a request carrying msgs — the
+	// system prompt and tool definitions included — calibrated against what
+	// the provider counted for this run's previous calls. Use
+	// [View.EstimateTokens], which also works on a View built by hand with
+	// Tokens left nil.
+	Tokens func(msgs []llm.Message) int
+
+	// Window is the model's context window in tokens, as configured with
+	// [WithContextWindow]; 0 when nobody said.
+	Window int
+}
+
+// EstimateTokens is [View.Tokens], or a plain four-bytes-a-token estimate
+// when the View carries no estimator.
+func (v View) EstimateTokens(msgs []llm.Message) int {
+	if v.Tokens != nil {
+		return v.Tokens(msgs)
+	}
+	return (*tokenEstimator)(nil).estimate(msgs)
 }
 
 // ResultInfo is what the harness knows about one dispatched tool call.
@@ -352,30 +375,51 @@ func (d dropTagged) String() string {
 // Compacted replaces the dropped prefix with a one-turn summary once the
 // transcript reaches compactAt messages.
 //
-// The compactor is an ordinary function rather than an agent, so this package
-// stays free of recursion; callers that want a model-generated summary pass a
-// closure over their own summarizer agent.
+// Deprecated: use [WithCompaction]. A Strategy cannot do this job well: it has
+// no context, so a model-backed compactor cannot be cancelled or budgeted; it
+// cannot fail; and it runs on every call without being able to keep what it
+// produced, because the stored transcript is not a strategy's to change. It
+// used to show: the compactor ran on every model call over a prefix one turn
+// longer each time, and since every summary came out different, the cache
+// prefix — which starts with the summary — missed on every call.
+//
+// Both of those are bounded now. The cut moves in steps of compactAt-keepRecent
+// messages, the way [SlidingWindowAt]'s anchor does, and the summary of a given
+// prefix is remembered, so the compactor runs once per step and the bytes it
+// produced are reused until the next one. What remains is the missing context
+// and the missing error, which is why this is deprecated rather than fixed.
 func Compacted(compactAt, keepRecent int, compactor func([]llm.Message) string) Strategy {
-	return compacted{at: compactAt, keep: keepRecent, fn: compactor}
+	return &compacted{at: compactAt, keep: keepRecent, fn: compactor}
 }
 
 type compacted struct {
 	at   int
 	keep int
 	fn   func([]llm.Message) string
+
+	mu   sync.Mutex
+	memo map[[32]byte]string
 }
 
-func (c compacted) Apply(v View) []llm.Message {
+// compactedMemo bounds the summaries a Compacted strategy remembers. A run
+// needs one per step; the bound only matters to a strategy shared by many runs.
+const compactedMemo = 64
+
+func (c *compacted) Apply(v View) []llm.Message {
 	msgs := v.Messages
 	if c.fn == nil || c.keep <= 0 || c.at <= 0 || len(msgs) < c.at || len(msgs) <= c.keep {
 		return msgs
 	}
-	cut := SafeCut(msgs, len(msgs)-c.keep)
+	want := len(msgs) - c.keep
+	if delta := c.at - c.keep; delta > 0 {
+		want = want / delta * delta
+	}
+	cut := SafeCut(msgs, want)
 	if cut == 0 {
 		return msgs
 	}
 
-	summary := c.fn(msgs[:cut])
+	summary := c.summarize(msgs[:cut])
 	if summary == "" {
 		return msgs[cut:]
 	}
@@ -384,7 +428,30 @@ func (c compacted) Apply(v View) []llm.Message {
 	return Convo(msgs[cut:]).prepend(head)
 }
 
-func (c compacted) String() string {
+// summarize returns the remembered summary of prefix, or makes one.
+func (c *compacted) summarize(prefix []llm.Message) string {
+	raw, err := json.Marshal(prefix)
+	if err != nil {
+		return c.fn(prefix)
+	}
+	key := sha256.Sum256(raw)
+	c.mu.Lock()
+	s, ok := c.memo[key]
+	c.mu.Unlock()
+	if ok {
+		return s
+	}
+	s = c.fn(prefix)
+	c.mu.Lock()
+	if c.memo == nil || len(c.memo) >= compactedMemo {
+		c.memo = make(map[[32]byte]string)
+	}
+	c.memo[key] = s
+	c.mu.Unlock()
+	return s
+}
+
+func (c *compacted) String() string {
 	return fmt.Sprintf("compacted(at=%d, keep=%d)", c.at, c.keep)
 }
 

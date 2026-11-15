@@ -116,6 +116,60 @@ type TurnTruncated struct {
 	MaxTokens int `json:"max_tokens"`
 }
 
+// EmptyTurn reports a reply that said nothing and called nothing, which the
+// loop asks for again rather than reporting as an answer. See EmptyTurnError
+// for what it gives up on.
+type EmptyTurn struct {
+	Attempt        int            `json:"attempt"`
+	StopReason     llm.StopReason `json:"stop_reason,omitempty"`
+	ReasoningBytes int            `json:"reasoning_bytes,omitempty"`
+}
+
+// LLMRetry reports that the retry middleware is about to try a failed model
+// call again, after Wait. Without it a UI shows a call that is merely slow —
+// half a minute of nothing while a rate limit backs off.
+type LLMRetry struct {
+	Attempt    int    `json:"attempt"`
+	Of         int    `json:"of"`
+	WaitMillis int64  `json:"wait_ms"`
+	Error      string `json:"error,omitempty"`
+}
+
+// ContextTrimmed reports that the transcript strategy is now sending less than
+// the stored transcript: Dropped messages left out, Elided tool results sent
+// without their bodies. Emitted when that changes, not on every call.
+type ContextTrimmed struct {
+	Strategy string `json:"strategy"`
+	Dropped  int    `json:"dropped,omitempty"`
+	Elided   int    `json:"elided,omitempty"`
+	// Tokens is the estimated size of what is sent.
+	Tokens int `json:"tokens"`
+}
+
+// ContextOverflow reports that the provider refused a request as too long and
+// [WithOverflowRecovery] is retrying it shorter, at Level of its ladder.
+type ContextOverflow struct {
+	Level          int    `json:"level"`
+	Strategy       string `json:"strategy"`
+	MessagesBefore int    `json:"messages_before"`
+	MessagesAfter  int    `json:"messages_after"`
+}
+
+// TranscriptCompacted reports that [WithCompaction] folded the oldest Folded
+// messages of the stored transcript into a summary.
+type TranscriptCompacted struct {
+	Folded       int `json:"folded"`
+	TokensBefore int `json:"tokens_before"`
+	TokensAfter  int `json:"tokens_after"`
+	SummaryBytes int `json:"summary_bytes"`
+}
+
+// Steered reports that messages sent with [Run.Steer] have been put into the
+// conversation, ahead of the next model call.
+type Steered struct {
+	Messages int `json:"messages"`
+}
+
 // Spend is a budget snapshot, emitted once per model call.
 type Spend struct {
 	CostUSD      float64 `json:"cost_usd"`
@@ -156,6 +210,51 @@ func (ToolDone) Kind() string { return "tool_done" }
 
 // Kind implements Event.
 func (Spend) Kind() string { return "spend" }
+
+// Kind implements Event.
+func (Steered) Kind() string { return "steered" }
+
+// MarshalJSON implements json.Marshaler.
+func (e Steered) MarshalJSON() ([]byte, error) { type r Steered; return eventJSON(e.Kind(), r(e)) }
+
+// Kind implements Event.
+func (EmptyTurn) Kind() string { return "empty_turn" }
+
+// Kind implements Event.
+func (LLMRetry) Kind() string { return "llm_retry" }
+
+// Kind implements Event.
+func (ContextTrimmed) Kind() string { return "context_trimmed" }
+
+// Kind implements Event.
+func (ContextOverflow) Kind() string { return "context_overflow" }
+
+// Kind implements Event.
+func (TranscriptCompacted) Kind() string { return "transcript_compacted" }
+
+// MarshalJSON implements json.Marshaler.
+func (e EmptyTurn) MarshalJSON() ([]byte, error) { type r EmptyTurn; return eventJSON(e.Kind(), r(e)) }
+
+// MarshalJSON implements json.Marshaler.
+func (e LLMRetry) MarshalJSON() ([]byte, error) { type r LLMRetry; return eventJSON(e.Kind(), r(e)) }
+
+// MarshalJSON implements json.Marshaler.
+func (e ContextTrimmed) MarshalJSON() ([]byte, error) {
+	type r ContextTrimmed
+	return eventJSON(e.Kind(), r(e))
+}
+
+// MarshalJSON implements json.Marshaler.
+func (e ContextOverflow) MarshalJSON() ([]byte, error) {
+	type r ContextOverflow
+	return eventJSON(e.Kind(), r(e))
+}
+
+// MarshalJSON implements json.Marshaler.
+func (e TranscriptCompacted) MarshalJSON() ([]byte, error) {
+	type r TranscriptCompacted
+	return eventJSON(e.Kind(), r(e))
+}
 
 // MarshalJSON implements json.Marshaler.
 func (e IterStart) MarshalJSON() ([]byte, error) { type r IterStart; return eventJSON(e.Kind(), r(e)) }
@@ -212,7 +311,14 @@ func EventTypes() []Event {
 	return []Event{
 		IterStart{},
 		TurnTruncated{},
+		EmptyTurn{},
+		Steered{},
+		CompletionChecked{},
+		ContextTrimmed{},
+		TranscriptCompacted{},
 		LLMStart{},
+		LLMRetry{},
+		ContextOverflow{},
 		ReasoningDelta{},
 		ToolArgsDelta{},
 		TextDelta{},

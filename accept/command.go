@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+
+	"github.com/hoobean1996/wombat-go/internal/safeenv"
 )
 
 // A verifier item can be settled by a COMMAND as well as by a test.
@@ -38,6 +40,7 @@ func runCommand(ctx context.Context, cfg Config, line string) (bool, string) {
 	// a person would type them, pipes and all.
 	cmd := exec.CommandContext(tctx, "sh", "-c", line)
 	cmd.Dir = cfg.Workspace
+	cmd.Env = safeenv.Environ() // runs the agent's code: no harness credentials
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		return true, ""

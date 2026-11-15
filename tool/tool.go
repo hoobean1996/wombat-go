@@ -176,6 +176,15 @@ type Reconciler interface {
 	Reconcile(ctx context.Context, present map[llm.ToolUseID]bool)
 }
 
+// RunChecker is an optional interface a [Set] may implement to say whether a
+// run's context carries what the set needs — the skill set's activation
+// state, say. The agent asks once, when it is built, with the context its runs
+// would get, and warns on an error: wiring that would otherwise only show up
+// as tools that never appear.
+type RunChecker interface {
+	CheckRun(ctx context.Context) error
+}
+
 type staticSet struct {
 	defs  []Def
 	index map[string]int
@@ -253,15 +262,57 @@ func Annotate(ctx context.Context, tags ...string) {
 
 type annotateKey struct{}
 
+// Attach adds media to the result of the call ctx belongs to: a screenshot, a
+// rendered page, a PDF. The model receives it together with the call's text
+// output, which should still say what was attached — a model that cannot see
+// it, and a person reading a text log, have only the words.
+//
+// A tool.Fn returns a string, and that stays the whole signature; media rides
+// on the call's context the way [Annotate]'s tags do, so a tool that never
+// attaches anything is unchanged, and so is every middleware that only looks at
+// the string. Media attached by a call that then fails is dropped with its
+// output: an error result is text.
+//
+// A no-op outside a dispatcher.
+func Attach(ctx context.Context, media ...llm.Media) {
+	if a, ok := ctx.Value(annotateKey{}).(*annotations); ok && a != nil {
+		a.mu.Lock()
+		a.media = append(a.media, media...)
+		a.mu.Unlock()
+	}
+}
+
+// Attached returns the media attached to the call ctx belongs to so far. It is
+// for middleware that records a call and has to give the media back when it
+// replays one — the tape.
+func Attached(ctx context.Context) []llm.Media {
+	if a, ok := ctx.Value(annotateKey{}).(*annotations); ok && a != nil {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		return append([]llm.Media(nil), a.media...)
+	}
+	return nil
+}
+
+// annotations is the per-call scratch the dispatcher hangs on each call's
+// context: the tags of [Annotate], the media of [Attach], and the keys of
+// [Claim]. One per dispatched call, which is what scopes all three to exactly
+// that call.
 type annotations struct {
-	mu   sync.Mutex
-	tags []string
+	mu      sync.Mutex
+	tags    []string
+	media   []llm.Media
+	claimed map[any]struct{}
 }
 
 // FindPause returns the first tool_use naming a CapPause tool.
 //
 // Pause is a property of the tool, not of a hard-coded name: any set that
 // includes a CapPause tool can suspend, and a set without one never can.
+//
+// It finds a candidate and decides nothing. [Set.Find] is unfiltered, so the
+// tool may be hidden this turn or refused by policy; the agent loop dispatches
+// such a call through the middleware chain for a verdict before it suspends.
 func FindPause(set Set, uses []llm.ToolUse) (llm.ToolUse, bool) {
 	for _, u := range uses {
 		if d, ok := set.Find(u.Name); ok && d.Has(CapPause) {
@@ -271,7 +322,8 @@ func FindPause(set Set, uses []llm.ToolUse) (llm.ToolUse, bool) {
 	return llm.ToolUse{}, false
 }
 
-// FindTerminal returns the first tool_use naming a CapTerminal tool.
+// FindTerminal returns the first tool_use naming a CapTerminal tool. Like
+// [FindPause], it finds a candidate and decides nothing.
 func FindTerminal(set Set, uses []llm.ToolUse) (llm.ToolUse, bool) {
 	for _, u := range uses {
 		if d, ok := set.Find(u.Name); ok && d.Has(CapTerminal) {

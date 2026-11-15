@@ -130,6 +130,12 @@ func (r *Registry) loadTool() tool.Def {
 				name), nil
 		}
 
+		// Inside a dispatch a missing State is a wiring mistake, and the
+		// throwaway StateFrom would hand back makes this call lie about it.
+		// See ErrNoState. A direct call outside a dispatch has no UseID.
+		if _, ok := stateOn(ctx); !ok && tool.InfoFrom(ctx).UseID != "" {
+			return "", ErrNoState
+		}
 		st := StateFrom(ctx)
 
 		if st.IsActive(name) {

@@ -164,16 +164,31 @@ func (b *Buffered) Err() error { return b.run.Err() }
 // Messages returns a snapshot of the transcript so far. Safe at any time.
 func (b *Buffered) Messages() []llm.Message { return b.run.Messages() }
 
+// Steer passes a message to the run in progress; see [Run.Steer].
+func (b *Buffered) Steer(text string) bool { return b.run.Steer(text) }
+
+// Undelivered returns what Steer accepted and the run ended without
+// delivering; see [Run.Undelivered].
+func (b *Buffered) Undelivered() []string { return b.run.Undelivered() }
+
 // Close cancels the run and waits for the draining goroutine to exit.
 // Idempotent, and safe to call after the run has finished on its own.
 //
 // It waits rather than just signalling so that a caller dropping the last
 // reference — a session registry evicting an entry, say — knows the goroutine
 // and the run's context are gone by the time Close returns.
+//
+// It cancels and does NOT drain. The drain goroutine is the run's one consumer
+// and has to stay the only one: [Run.Close] empties the event channel itself,
+// so calling it here raced drain for every event still in flight and threw away
+// whichever ones it won. With [WithEventBuffer] those included events the run
+// had produced BEFORE the cancel, already sitting in the channel — a tail that
+// a follower reading to the end would never see. Cancelling is enough to end
+// the run; drain then reads the channel to its close and appends all of it.
 func (b *Buffered) Close() error {
-	err := b.run.Close()
+	b.run.cancel()
 	<-b.done
-	return err
+	return nil
 }
 
 // drain is the goroutine that keeps the run moving with no consumer attached.

@@ -49,6 +49,7 @@ import (
 	"github.com/hoobean1996/wombat-go/llm"
 	"github.com/hoobean1996/wombat-go/llm/anthropic"
 	"github.com/hoobean1996/wombat-go/llm/openai"
+	"github.com/hoobean1996/wombat-go/mcp"
 	"github.com/hoobean1996/wombat-go/metric"
 	"github.com/hoobean1996/wombat-go/permission"
 	"github.com/hoobean1996/wombat-go/review"
@@ -104,8 +105,20 @@ type options struct {
 	wall          time.Duration
 	parallel      int
 	readOnly      bool
+	confine       bool
+	confineNet    string
+	media         bool
+	window        int
+	compactAt     float64
+	check         string
+	checkAttempts int
+	mcpConfig     string
 	verbose       bool
 	logLevel      string
+
+	// mcpConns is not a flag: run connects to the -mcp servers once, and
+	// every agent build makes — the reviewer and the fixer too — shares them.
+	mcpConns *mcp.Connections
 }
 
 func run() int {
@@ -202,8 +215,37 @@ func run() int {
 	flag.IntVar(&o.maxTokens, "max-tokens", wombat.DefaultMaxTokens, "reply token cap")
 	flag.Float64Var(&o.budgetUSD, "budget", 0, "cost cap in USD (0 = uncapped)")
 	flag.DurationVar(&o.wall, "wall", 0, "wall-clock cap (0 = uncapped)")
-	flag.IntVar(&o.parallel, "tool-parallelism", 1, "concurrent tool calls per batch")
+	flag.IntVar(&o.parallel, "tool-parallelism", wombat.DefaultToolParallelism,
+		"read-only tool calls of one batch run at once; anything that writes or executes always runs alone, in order")
 	flag.BoolVar(&o.readOnly, "read-only", false, "hide mutating and exec tools")
+	flag.BoolVar(&o.confine, "confine", false,
+		"run every command the tools spawn inside the platform sandbox (sandbox-exec on macOS,\n"+
+			"bwrap on Linux): writes only under -working-dir and the temp directory, credential\n"+
+			"directories unreadable, network per -confine-network. Fails at start if the sandbox\n"+
+			"cannot be applied rather than running unconfined.")
+	flag.StringVar(&o.confineNet, "confine-network", "loopback",
+		"loopback | none | full — what a -confine'd command may reach")
+	flag.IntVar(&o.window, "context-window", 0,
+		"the model's context window in tokens. With it set, the transcript is kept under 70% of it\n"+
+			"by eliding old tool results (wombat.TokenWindow), instead of being sent whole until the\n"+
+			"provider refuses it. 0 leaves the transcript alone.")
+	flag.Float64Var(&o.compactAt, "compact-at", 0,
+		"with -context-window: summarize the oldest part of the conversation into the transcript once\n"+
+			"the whole conversation reaches this fraction of the window (e.g. 0.85), keeping the newest\n"+
+			"quarter of a window verbatim.\n"+
+			"Costs one model call per compaction. 0 disables.")
+	flag.StringVar(&o.check, "check", "",
+		"a shell command that says whether the work is done — e.g. 'go test ./...'. It runs in\n"+
+			"-working-dir, through the same runner as the agent's own commands (so -confine applies),\n"+
+			"whenever the model ends the run; a non-zero exit sends the model back with its output.")
+	flag.IntVar(&o.checkAttempts, "check-attempts", 3, "how many times -check may send the model back")
+	flag.BoolVar(&o.media, "media", false,
+		"offer view_media, which shows the model an image or a PDF from disk. Off by default:\n"+
+			"a model that cannot read images answers a request carrying one with a 400.")
+	flag.StringVar(&o.mcpConfig, "mcp", "",
+		"JSON file of MCP servers to offer the tools of, in the usual {\"mcpServers\": {...}} format.\n"+
+			"Each server's tools are named <server>__<tool>; a stdio server gets a filtered environment\n"+
+			"plus the env its entry names (\"${VAR}\" passes one of this process's variables through).")
 	flag.BoolVar(&o.verbose, "v", false, "debug logging on stderr (same as -log debug)")
 	flag.StringVar(&o.logLevel, "log", "info", "stderr log level: debug | info | warn | error")
 	flag.Parse()
@@ -281,6 +323,16 @@ func run() int {
 		reg := metric.NewRegistry()
 		m = metric.New(reg)
 		defer dumpMetrics(reg, o.metricsFile)
+	}
+
+	if o.mcpConfig != "" {
+		conns, err := connectMCP(o.mcpConfig, logger)
+		if err != nil {
+			out.emit(failed{Type: "failed", Reason: err.Error()})
+			return exitFail
+		}
+		defer conns.Close()
+		o.mcpConns = conns
 	}
 
 	a, err := build(o, logger, tp, tracer, m)
@@ -744,7 +796,10 @@ func build(
 	// The gate goes in `shared`, so the sub-agent is governed by the same
 	// policy as its parent. A child that could run what its parent had to ask
 	// about would make the whole thing decorative — the same argument that
-	// puts the skill registry on both.
+	// puts the skill registry on both. permission.Gate also follows the
+	// delegate call into the child by itself, so this is belt and braces; the
+	// copy the child carries and the copy it inherits are one gate, and decide
+	// each call once.
 	//
 	// Position in the chain is load-bearing twice over, and both are satisfied
 	// by WithToolMiddleware rather than by anything written here: every
@@ -781,12 +836,23 @@ func build(
 		measure = append(measure, wombat.WithMetrics(m, metric.WithErrorClass(outcomeClass)))
 	}
 
+	runner, err := newRunner(o, workdir)
+	if err != nil {
+		return nil, err
+	}
+	fsys := builtin.OSFS(o.fsRoot)
 	tools := builtin.Default(builtin.Deps{
-		FS:   builtin.OSFS(o.fsRoot),
-		Exec: builtin.OSRunner(workdir),
+		FS:   fsys,
+		Exec: runner,
 		HTTP: &http.Client{Timeout: 30 * time.Second},
 		Now:  time.Now,
 	})
+	if o.media {
+		tools = append(tools, builtin.ViewMedia(fsys))
+	}
+	// Before the read-only filter and the delegate's, so a server's tools are
+	// held to the same capability rules as the built-in ones.
+	tools = append(tools, o.mcpConns.Tools()...)
 	if o.readOnly {
 		tools = tool.Filter(tools, tool.OnlyCaps(tool.CapReadOnly|tool.CapNetwork|tool.CapPause))
 	}
@@ -854,6 +920,18 @@ func build(
 	}, shared...)
 	opts = append(opts, gateOptions(reg, tools)...)
 	opts = append(opts, measure...)
+	if o.check != "" {
+		opts = append(opts, wombat.WithCompletionCheck(o.checkAttempts, wombat.CommandCheck(runner, o.check, 0)))
+	}
+	if o.window > 0 {
+		// Elide below the compaction threshold, so a compaction is the rare
+		// event and elision the everyday one.
+		opts = append(opts, wombat.WithContextWindow(o.window), wombat.WithStrategy(wombat.TokenWindow(0.7, 0.5)))
+		if o.compactAt > 0 && o.compactAt < 1 {
+			opts = append(opts, wombat.WithCompaction(int(o.compactAt*float64(o.window)), o.window/4,
+				wombat.Summarize(client, o.model)))
+		}
+	}
 
 	// Grants are installed on the PARENT only. A sub-agent runs on a context
 	// derived from its parent's, so it inherits this set and an approval given
@@ -876,6 +954,11 @@ func build(
 		opts = append(opts, wombat.WithSystemPrompt(o.system))
 	}
 
+	if notes := o.mcpConns.Instructions(); notes != "" {
+		opts = append(opts, wombat.WithEnvBlock("mcp_servers",
+			"What the MCP servers say about their tools, which are named <server>__<tool>:\n\n"+notes))
+	}
+
 	// Say what the directory is FOR, not just what it is. A bare path in the
 	// system prompt does not connect to the bash tool's exec_dir parameter in
 	// the model's head; naming the parameter does.
@@ -895,20 +978,11 @@ func gateOptions(reg *skill.Registry, tools []tool.Def) []wombat.Option {
 	if reg == nil {
 		return []wombat.Option{wombat.WithTools(tools...)}
 	}
-	g := reg.Bind(tools)
-	return []wombat.Option{
-		wombat.WithToolSet(g.Set),
-		wombat.WithToolMiddleware(g.Middleware),
-		// Installed skills come FIRST, ahead of the loadable catalogue. They
-		// are method rather than reference: what to do before the first
-		// decision, which is no use read after it. Ordering is fixed because
-		// both blocks are part of the prompt-cache prefix.
-		wombat.WithSystemBlock("installed_skills", g.Installed),
-		wombat.WithSystemBlock("available_skills", g.Index),
-		wombat.WithRunContext(func(ctx context.Context) context.Context {
-			return skill.WithState(ctx, skill.NewState())
-		}),
-	}
+	// Install is the set, the middleware that enforces it, the two system
+	// blocks — installed skills first, as method before reference — and the
+	// per-run activation state, as one option, so none of them can be left
+	// out.
+	return []wombat.Option{reg.Bind(tools).Install()}
 }
 
 // permissionGate turns -permission into tool middleware, or nil for "off".
@@ -1009,6 +1083,42 @@ func renderTrace(in, out string) error {
 	}
 	defer f.Close()
 	return trace.WriteHTML(f, spans)
+}
+
+// newRunner is the Runner every exec-flavoured tool spawns through: confined
+// when -confine asks for it, and otherwise the plain one, which still filters
+// the environment so the provider key this process holds stays here.
+// connectMCP starts or reaches every server in the -mcp file. The handshake
+// and the tool listing get a minute between them; a server that needs longer
+// than that to start is not one to wait on silently.
+func connectMCP(path string, logger *slog.Logger) (*mcp.Connections, error) {
+	servers, err := mcp.LoadConfig(path)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	conns, err := mcp.ConnectAll(ctx, servers)
+	if err != nil {
+		return nil, err
+	}
+	logger.Info("mcp servers connected", "servers", len(servers), "tools", len(conns.Tools()))
+	return conns, nil
+}
+
+func newRunner(o options, workdir string) (builtin.Runner, error) {
+	if !o.confine {
+		return builtin.OSRunner(workdir), nil
+	}
+	network, err := builtin.ParseNetwork(o.confineNet)
+	if err != nil {
+		return nil, err
+	}
+	r, err := builtin.SandboxRunner(workdir, builtin.Sandbox{Network: network})
+	if err != nil {
+		return nil, fmt.Errorf("-confine: %w", err)
+	}
+	return r, nil
 }
 
 func envOr(key, fallback string) string {
@@ -1221,10 +1331,17 @@ func classOf(err error) string {
 // A mutex rather than "just write from one goroutine", because tool
 // observations can be emitted from a parallel batch. One interleaved write
 // corrupts a line, and the reader on the other side is a line reader.
+//
+// There is no flush and no fsync, and neither is missing. Writes to an
+// *os.File are not buffered in this process, so each Encode is one write(2)
+// and the line is in the reader's pipe the moment it returns. fsync is about
+// surviving a power cut, not about being seen; it used to follow every line,
+// and with stdout redirected to a file that was a disk flush per streamed
+// delta — hundreds a turn. What has to survive a crash is the transcript, and
+// -session writes that with an fsync of its own.
 type emitter struct {
 	mu  sync.Mutex
 	enc *json.Encoder
-	f   *os.File
 }
 
 func newEmitter(f *os.File) *emitter {
@@ -1232,7 +1349,7 @@ func newEmitter(f *os.File) *emitter {
 	// Model output routinely contains <, > and &. HTML escaping would corrupt
 	// it for every consumer that is not a browser.
 	enc.SetEscapeHTML(false)
-	return &emitter{enc: enc, f: f}
+	return &emitter{enc: enc}
 }
 
 func (e *emitter) emit(v any) {
@@ -1240,9 +1357,7 @@ func (e *emitter) emit(v any) {
 	defer e.mu.Unlock()
 	if err := e.enc.Encode(v); err != nil {
 		fmt.Fprintf(os.Stderr, "wombat-jsonl: encode: %v\n", err)
-		return
 	}
-	_ = e.f.Sync()
 }
 
 type sessionStarted struct {

@@ -19,6 +19,7 @@
 //	GET    /api/sessions/{id}/events              SSE, Last-Event-ID resume
 //	GET    /api/sessions/{id}/messages            the transcript
 //	POST   /api/sessions/{id}/messages            continue the conversation
+//	POST   /api/sessions/{id}/steer               a message for the turn in progress
 //	GET    /api/sessions/{id}/approvals           what is waiting on a human
 //	POST   /api/sessions/{id}/approvals/{use_id}  {"allow": true|false}
 //	GET    /metrics                               with [WithMetrics]
@@ -51,6 +52,12 @@ var (
 	// than queued behind something whose outcome may change what the user
 	// wanted to say.
 	ErrBusy = errors.New("httpapi: a turn is already running")
+
+	// ErrNotRunning reports a steering message sent to a session with no turn
+	// in progress — or one that ended while the message was on its way. It is
+	// the converse of ErrBusy: a message for a session at rest is a new turn,
+	// and goes to POST .../messages.
+	ErrNotRunning = errors.New("httpapi: no turn is running")
 
 	// ErrNoSuchSession reports that the id names nothing. Indistinguishable
 	// from "expired", on purpose: a reaped session and one that never existed

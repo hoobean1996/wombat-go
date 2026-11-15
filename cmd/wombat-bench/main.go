@@ -45,6 +45,7 @@ import (
 	wombat "github.com/hoobean1996/wombat-go"
 	"github.com/hoobean1996/wombat-go/benchmarks"
 	"github.com/hoobean1996/wombat-go/governor"
+	"github.com/hoobean1996/wombat-go/internal/fspath"
 	"github.com/hoobean1996/wombat-go/llm"
 	"github.com/hoobean1996/wombat-go/llm/anthropic"
 	"github.com/hoobean1996/wombat-go/llm/openai"
@@ -79,6 +80,7 @@ type options struct {
 	keep      bool
 	list      bool
 	logLevel  string
+	confine   bool
 }
 
 // run is the whole command, factored out of main so that deferred cleanup runs
@@ -115,6 +117,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs.Float64Var(&o.budgetUSD, "budget", 0.50, "per-EPISODE cost cap in USD (0 = uncapped)")
 	fs.DurationVar(&o.wall, "wall", 10*time.Minute, "per-EPISODE wall-clock cap (0 = uncapped)")
 
+	fs.BoolVar(&o.confine, "confine", false,
+		"run every command an episode's tools spawn inside the platform sandbox, with the\n"+
+			"network closed (loopback stays open for tests). The suite is hermetic, so nothing a\n"+
+			"task needs is lost, and an agent that writes outside its workspace fails instead of\n"+
+			"quietly reaching a sibling episode's files.")
 	fs.Float64Var(&o.threshold, "threshold", rl.DefaultSuccessThreshold,
 		"reward at or above which an episode counts as a success.\n"+
 			"Every task's verifier weights sum to 1.0, so the default means \"everything verified\".")
@@ -293,9 +300,17 @@ func rolloutOpts(o options, p *printer) []rl.Option {
 // is part of a task's definition — see [benchmarks.Task.Tools].
 func agentFunc(o options, client llm.Client, logger *slog.Logger, task benchmarks.Task) rl.AgentFunc {
 	return func(t rl.Task) (*wombat.Agent, error) {
+		runner := builtin.OSRunner(t.Workspace)
+		if o.confine {
+			r, err := builtin.SandboxRunner(t.Workspace, builtin.Sandbox{})
+			if err != nil {
+				return nil, fmt.Errorf("-confine: %w", err)
+			}
+			runner = r
+		}
 		tools := builtin.Default(builtin.Deps{
 			FS:   builtin.OSFS(t.Workspace),
-			Exec: builtin.OSRunner(t.Workspace),
+			Exec: runner,
 			Now:  time.Now,
 		})
 
@@ -636,5 +651,5 @@ func parseLevel(s string) slog.Level {
 // /tmp/runs-workspaces, which is exactly the pair the default layout produces.
 // The separator is what makes the test a path test rather than a string test.
 func contains(parent, dir string) bool {
-	return parent == dir || strings.HasPrefix(dir, parent+string(filepath.Separator))
+	return fspath.Within(parent, dir)
 }
