@@ -113,6 +113,81 @@ var safeCases = []safeCase{
 	{"a cyrillic o in go", "g\u043e test ./...", inRoot(), Undecided},
 	{"an ideographic space", "go\u3000test ./...", inRoot(), Undecided},
 
+	// ===== a flag that runs a program, in every spelling =====
+	// Matched by NAME. The check used to compare the literal token, so the =
+	// form walked straight past it and -toolexec was not on the list at all.
+	{"go test -exec=", "go test -exec=./evil.sh ./...", inRoot(), Undecided},
+	{"go test -exec", "go test -exec ./evil.sh ./...", inRoot(), Undecided},
+	{"go test --exec=", "go test --exec=./evil.sh ./...", inRoot(), Undecided},
+	{"go test -toolexec=", "go test -toolexec=./evil.sh ./...", inRoot(), Undecided},
+	{"go test -toolexec", "go test -toolexec ./evil.sh ./...", inRoot(), Undecided},
+	{"go build -toolexec=", "go build -toolexec=./evil.sh ./...", inRoot(), Undecided},
+	{"go list -toolexec", "go list -toolexec ./evil ./...", inRoot(), Undecided},
+	{"go vet -vettool=", "go vet -vettool=./evil ./...", inRoot(), Undecided},
+	{"find -exec=", "find . -exec=rm", inRoot(), Undecided},
+	{"find -fprint0", "find . -fprint0 out", inRoot(), Undecided},
+
+	// ===== global configuration =====
+	// go env -w rewrites the user's go env file: outside every workspace,
+	// persistent, and applied to every later go command.
+	{"go env -w", "go env -w GOPATH=evil", inRoot(), Undecided},
+	{"go env -w=", "go env -w=GOPATH=evil", inRoot(), Undecided},
+	{"go env --w", "go env --w GOFLAGS=-x", inRoot(), Undecided},
+	{"go env -u", "go env -u GOFLAGS", inRoot(), Undecided},
+	{"go env reading", "go env GOPATH GOFLAGS", inRoot(), Allow},
+	{"go env -json", "go env -json", inRoot(), Allow},
+
+	// ===== destroying work through a command listed for reading =====
+	{"git branch -D", "git branch -D main", inRoot(), Undecided},
+	{"git branch -d", "git branch -d feature", inRoot(), Undecided},
+	{"git branch bundled -dr", "git branch -dr origin/x", inRoot(), Undecided},
+	{"git branch --delete", "git branch --delete feature", inRoot(), Undecided},
+	{"git branch abbreviated --del", "git branch --del feature", inRoot(), Undecided},
+	{"git branch -m", "git branch -m old new", inRoot(), Undecided},
+	{"git branch -f", "git branch -f main HEAD", inRoot(), Undecided},
+	{"git branch --force", "git branch --force main HEAD", inRoot(), Undecided},
+	{"git branch -vv", "git branch -vv", inRoot(), Allow},
+	{"git branch -a sorted", "git branch -a --sort=-committerdate", inRoot(), Allow},
+	{"git log --output", "git log --output=" + inRoot("main.go"), inRoot(), Undecided},
+	{"git show abbreviated --out", "git show --out=x HEAD", inRoot(), Undecided},
+	{"git diff --ext-diff", "git diff --ext-diff", inRoot(), Undecided},
+	{"git diff --no-ext-diff", "git diff --no-ext-diff", inRoot(), Allow},
+	{"git log --oneline", "git log --oneline -n 5", inRoot(), Allow},
+
+	// ===== quoting: the shell's word, not the raw characters =====
+	// Every check reads the argument the program will receive. Reading raw
+	// tokens let the first two through as an unprompted `find -exec`.
+	{"a flag split by double quotes", `find . -e"x"ec rm {} +`, inRoot(), Undecided},
+	{"a flag split by a backslash", `find . -e\xec rm {} +`, inRoot(), Undecided},
+	{"a quoted flag", `go test '-toolexec=./x' ./...`, inRoot(), Undecided},
+	{"dotdot spelled with quotes", `cat '.'"."/secret`, inRoot(), Undecided},
+	{"dotdot spelled with a backslash", `cat .\./secret`, inRoot(), Undecided},
+	{"an absolute path behind a backslash", `cat \/etc/passwd`, inRoot(), Undecided},
+	{"an unterminated quote", `cat "main.go`, inRoot(), Undecided},
+	{"a trailing backslash", `cat main.go\`, inRoot(), Undecided},
+	{"an escaped space makes one word", `go\ test ./...`, inRoot(), Undecided},
+	{"a quoted program name is still the program", `"go" test ./...`, inRoot(), Allow},
+	{"a quoted pattern", `grep -rn "func.*Handler" .`, inRoot(), Allow},
+
+	// ===== expansions that can produce a path =====
+	// /bin/sh on macOS is bash: .* still matches .. there, and braces expand.
+	{"a glob that matches dotdot", "cat .*/secret", inRoot(), Undecided},
+	{"a single-character glob that matches dotdot", "cat .?/secret", inRoot(), Undecided},
+	{"brace expansion to dotdot", "cat {..,x}/secret", inRoot(), Undecided},
+	{"a brace sequence", "cat {a..c}", inRoot(), Undecided},
+	{"a quoted dot glob is literal", `grep -rn ".*foo" .`, inRoot(), Allow},
+	{"a glob under a dot directory", "ls .git/*", inRoot(), Allow},
+	{"a brace with nothing to expand", "git log @{u}", inRoot(), Allow},
+
+	// ===== a short option with its value attached =====
+	{"an attached absolute path", "grep -f/etc/passwd .", inRoot(), Undecided},
+	{"an attached climb", "grep -f../secret .", inRoot(), Undecided},
+
+	// ===== a letter that is dangerous to another program is fine here =====
+	{"grep -w", "grep -w foo .", inRoot(), Allow},
+	{"wc -w", "wc -w main.go", inRoot(), Allow},
+	{"go doc -u", "go doc -u fmt", inRoot(), Allow},
+
 	// ===== not on the list at all =====
 	{"rm", "rm -rf " + inRoot("build"), inRoot(), Undecided},
 	{"mv", "mv a b", inRoot(), Undecided},
@@ -221,6 +296,25 @@ func TestSafeCommandsExtra(t *testing.T) {
 // TestSafeCommandsReasonNamesTheEntry matters because the reason is what ends
 // up in the audit log and in the Decided event: "allowed" with no explanation
 // is not reviewable.
+// An extra entry that extends a flagged one inherits its flags: "go env -json"
+// is still go env, and -w still rewrites the user's environment beneath it.
+func TestSafeCommandsExtraEntryKeepsTheFlagsOfWhatItExtends(t *testing.T) {
+	rule := SafeCommands(root, "go env -json", "git branch --list")
+	for _, tc := range []struct {
+		cmd  string
+		want Decision
+	}{
+		{"go env -json", Allow},
+		{"go env -json -w GOPATH=evil", Undecided},
+		{"git branch --list", Allow},
+		{"git branch --list -D main", Undecided},
+	} {
+		if got, why := rule(t.Context(), Request{Tool: bash(nil), Use: useOf("u1", args("command", tc.cmd))}); got != tc.want {
+			t.Errorf("%q = %v (%q), want %v", tc.cmd, got, why, tc.want)
+		}
+	}
+}
+
 func TestSafeCommandsReasonNamesTheEntry(t *testing.T) {
 	rule := SafeCommands(root)
 	got, why := rule(t.Context(), Request{
@@ -379,4 +473,61 @@ func TestPipelineChecksEveryStageFully(t *testing.T) {
 			t.Errorf("Decide(bash %q) = %v (%q), want %v", tc.cmd, got, why, tc.want)
 		}
 	}
+}
+
+// TestLex pins the shell's reading of a stage, which every other check in the
+// rule is built on: a check is only as good as its picture of the arguments.
+func TestLex(t *testing.T) {
+	tests := []struct {
+		in    string
+		texts []string
+		ok    bool
+	}{
+		{"go test ./...", []string{"go", "test", "./..."}, true},
+		{"  go\t test  ", []string{"go", "test"}, true},
+		{`-e"x"ec`, []string{"-exec"}, true},
+		{`-e\xec`, []string{"-exec"}, true},
+		{`'-exec'`, []string{"-exec"}, true},
+		{`a'b c'd`, []string{"ab cd"}, true},
+		{`"a\"b"`, []string{`a"b`}, true},
+		{`"a\\b"`, []string{`a\b`}, true},
+		{`"a\qb"`, []string{`a\qb`}, true}, // inside double quotes \q stays two bytes
+		{`'a\qb'`, []string{`a\qb`}, true}, // inside single quotes nothing is special
+		{`go\ test`, []string{"go test"}, true},
+		{`''`, []string{""}, true}, // an empty argument is still an argument
+		{`x '' y`, []string{"x", "", "y"}, true},
+		{`"unterminated`, nil, false},
+		{`'unterminated`, nil, false},
+		{`trailing\`, nil, false},
+		{"", nil, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.in, func(t *testing.T) {
+			words, ok := lex(tc.in)
+			if ok != tc.ok {
+				t.Fatalf("lex(%q) ok = %v, want %v", tc.in, ok, tc.ok)
+			}
+			var texts []string
+			for _, w := range words {
+				texts = append(texts, w.text)
+				if len(w.mask) != len(w.text) {
+					t.Errorf("word %q: mask is %d bytes and text %d; expandsUnseen indexes one by the other",
+						w.text, len(w.mask), len(w.text))
+				}
+			}
+			if strings.Join(texts, "|") != strings.Join(tc.texts, "|") || len(texts) != len(tc.texts) {
+				t.Errorf("lex(%q) = %q, want %q", tc.in, texts, tc.texts)
+			}
+		})
+	}
+
+	t.Run("the mask keeps only what the shell may still expand", func(t *testing.T) {
+		words, _ := lex(`*.go '*.go' \*.go "a*"b*`)
+		want := []string{"*.go", "\x00\x00\x00\x00", "\x00.go", "\x00\x00b*"}
+		for i, w := range words {
+			if w.mask != want[i] {
+				t.Errorf("word %d (%q): mask = %q, want %q", i, w.text, w.mask, want[i])
+			}
+		}
+	})
 }

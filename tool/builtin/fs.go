@@ -7,9 +7,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"strings"
 	"syscall"
 
+	"github.com/hoobean1996/wombat-go/internal/fspath"
 	"github.com/hoobean1996/wombat-go/tool"
 )
 
@@ -134,7 +134,7 @@ func (f osFS) resolve(path string) (string, error) {
 	if f.root == "" {
 		return clean, nil
 	}
-	if clean != f.root && !strings.HasPrefix(clean, f.root+string(filepath.Separator)) {
+	if !fspath.Within(f.root, clean) {
 		return "", fmt.Errorf("%w: %q is outside %q", ErrOutsideRoot, path, f.root)
 	}
 	return clean, nil

@@ -31,7 +31,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -41,6 +40,7 @@ import (
 	"time"
 
 	"github.com/hoobean1996/wombat-go/llm"
+	"github.com/hoobean1996/wombat-go/llm/internal/httpcall"
 )
 
 // Defaults applied by [New] when the corresponding [Config] field is zero.
@@ -58,11 +58,6 @@ const (
 	// a request that does not override it produces the same body either way.
 	DefaultMaxTokens = 8192
 )
-
-// maxErrorBody bounds how much of a failure body we keep. llm.APIError
-// documents Message as "truncated by the caller", and gateways love to answer
-// a 502 with a megabyte of HTML.
-const maxErrorBody = 64 << 10
 
 // Config constructs a Client. The zero value is usable if $OPENAI_API_KEY is
 // set; every field is an override.
@@ -159,6 +154,10 @@ type Client struct {
 	// and the field never reaches the wire.
 	temperature *float64
 	topP        *float64
+	// idle, total and maxBody are the httpcall defaults — the call budget
+	// every provider client shares; fields only so a test can shorten them.
+	idle, total time.Duration
+	maxBody     int
 }
 
 // newTransport returns a fresh transport with this package's timeouts.
@@ -282,6 +281,9 @@ func New(cfg Config) (*Client, error) {
 		extra:       extra,
 		temperature: cfg.Temperature,
 		topP:        cfg.TopP,
+		idle:        httpcall.StreamIdleTimeout,
+		total:       httpcall.RequestTimeout,
+		maxBody:     httpcall.MaxResponseBody,
 	}, nil
 }
 
@@ -462,6 +464,16 @@ func (c *Client) Complete(ctx context.Context, req llm.Request) (llm.Response, e
 		return llm.Response{}, err
 	}
 
+	// The shared call budget: our own total cap only when the caller set no
+	// deadline, and for a stream a watchdog that cancels on silence.
+	ctx, cancel := httpcall.Bound(ctx, c.total)
+	defer cancel()
+	var watch *httpcall.Watchdog
+	if stream {
+		ctx, watch = httpcall.Watch(ctx, c.idle)
+		defer watch.Stop()
+	}
+
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
 	if err != nil {
 		return llm.Response{}, fmt.Errorf("openai: build request: %w", err)
@@ -481,50 +493,24 @@ func (c *Client) Complete(ctx context.Context, req llm.Request) (llm.Response, e
 
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
-		// A cancelled context is the caller's decision, not a provider
-		// failure: returning it unclassified keeps retry middleware from
-		// treating it as a transient blip worth another attempt.
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return llm.Response{}, fmt.Errorf("openai: %w", ctxErr)
-		}
-		return llm.Response{}, llm.ClassifyTransport(fmt.Errorf("openai: post %s: %w", c.endpoint, err))
+		return llm.Response{}, httpcall.Abort(ctx, "openai", fmt.Errorf("openai: post %s: %w", c.endpoint, err))
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return llm.Response{}, statusError(resp)
+		return llm.Response{}, httpcall.StatusError(resp)
 	}
 
+	var out llm.Response
 	if stream {
-		return decodeStream(resp.Body, req.OnDelta, model)
+		out, err = decodeStream(watch.Body(resp.Body), req.OnDelta, model)
+	} else {
+		out, err = decodeResponse(resp.Body, model, c.maxBody)
 	}
-	return decodeResponse(resp.Body, model)
-}
-
-// statusError turns a non-2xx reply into a classified *llm.APIError.
-func statusError(resp *http.Response) error {
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
-	return llm.ClassifyStatus(resp.StatusCode, strings.TrimSpace(string(body)), retryAfter(resp.Header))
-}
-
-// retryAfter reads the provider's backoff hint. Both RFC forms are accepted
-// because gateways disagree: OpenAI sends seconds, some CDNs in front of them
-// send an HTTP date.
-func retryAfter(h http.Header) time.Duration {
-	v := strings.TrimSpace(h.Get("Retry-After"))
-	if v == "" {
-		return 0
+	// A body read cut off by the context is the context's doing, and only the
+	// cause says whether that was a stall or the caller stopping the run.
+	if err = httpcall.Settle(ctx, "openai", err); err != nil {
+		return llm.Response{}, err
 	}
-	if secs, err := strconv.Atoi(v); err == nil {
-		if secs < 0 {
-			return 0
-		}
-		return time.Duration(secs) * time.Second
-	}
-	if t, err := http.ParseTime(v); err == nil {
-		if d := time.Until(t); d > 0 {
-			return d
-		}
-	}
-	return 0
+	return out, nil
 }

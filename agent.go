@@ -36,6 +36,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
@@ -50,12 +51,17 @@ const (
 	DefaultMaxIters           = 30
 	DefaultMaxTokens          = 8192
 	DefaultForceTerminalLastN = 2
-	DefaultToolRetryAttempts  = 3
-	DefaultBreakerThreshold   = 5
-	DefaultBreakerCooldown    = 60 * time.Second
-	DefaultDedupThreshold     = 3
-	DefaultToolOutputLimit    = 64 * 1024
-	DefaultSystemPrompt       = "You are a helpful assistant. Use the available tools when they help; answer directly when they do not."
+	// DefaultToolParallelism is how many read-only calls of one batch run at
+	// once. A model routinely asks for several reads in one turn — four greps
+	// and a view_file — and running them one after another is latency the
+	// user waits through for nothing.
+	DefaultToolParallelism   = 4
+	DefaultToolRetryAttempts = 3
+	DefaultBreakerThreshold  = 5
+	DefaultBreakerCooldown   = 60 * time.Second
+	DefaultDedupThreshold    = 3
+	DefaultToolOutputLimit   = 64 * 1024
+	DefaultSystemPrompt      = "You are a helpful assistant. Use the available tools when they help; answer directly when they do not."
 
 	// DefaultToolTimeoutFallback caps a tool that declares no Timeout.
 	DefaultToolTimeoutFallback = 120 * time.Second
@@ -82,6 +88,9 @@ type config struct {
 	envBlocks    []block
 
 	strategy   Strategy
+	window     int
+	compaction *compaction
+	check      *completionCheck
 	maxIters   int
 	model      string
 	maxTokens  int
@@ -89,6 +98,7 @@ type config struct {
 	terminal   string
 	forceLastN int
 
+	llmMW       []llm.Middleware
 	runCtx      []func(context.Context) context.Context
 	turnNotice  func(context.Context, int) string
 	tracer      *trace.Tracer
@@ -106,6 +116,29 @@ type config struct {
 // a struct literal cannot distinguish "leave it alone" from "set it to zero".
 // With options, WithForceTerminalLastN(0) genuinely means off.
 type Option func(*config)
+
+// Options combines several options into one, applied in order. It is how a
+// feature that needs more than one piece of wiring hands them over as a unit —
+// skill.Gated.Install, tape.Tape.Install — so a caller cannot take the tool
+// set and forget the middleware that enforces it.
+func Options(opts ...Option) Option {
+	return func(c *config) {
+		for _, o := range opts {
+			if o != nil {
+				o(c)
+			}
+		}
+	}
+}
+
+// WithLLMMiddleware wraps the agent's client in mw when the agent is built,
+// outside whatever the client already carries — retry, cost tracking — and
+// inside the metrics and tracing layers [New] adds, so a call they observe is
+// one logical call whatever happened inside. Later entries are outermost, as
+// with llm.Chain.
+func WithLLMMiddleware(mw ...llm.Middleware) Option {
+	return func(c *config) { c.llmMW = append(c.llmMW, mw...) }
+}
 
 // WithName tags the agent in logs, traces and events.
 func WithName(s string) Option { return func(c *config) { c.name = s } }
@@ -153,8 +186,12 @@ func WithToolMiddleware(mw ...tool.Middleware) Option {
 // is scheduled.
 func WithDispatcher(d tool.Dispatcher) Option { return func(c *config) { c.dispatcher = d } }
 
-// WithToolParallelism runs up to n calls of one batch concurrently. Default 1.
-// See [tool.WithParallelism] for why the default is not higher.
+// WithToolParallelism runs up to n of one batch's read-only calls concurrently.
+// Default [DefaultToolParallelism]; 1 runs every call in order.
+//
+// Only calls to [tool.CapReadOnly] tools ever overlap: anything that writes,
+// executes or declares nothing runs alone, in the order the model wrote it.
+// That is what makes a default above one safe — see [tool.WithParallelism].
 func WithToolParallelism(n int) Option { return func(c *config) { c.parallel = n } }
 
 // WithToolTimeoutFallback caps any tool that declares no Timeout of its own.
@@ -188,6 +225,14 @@ func WithEnvBlock(tag, body string) Option {
 // WithStrategy sets how the transcript is materialized per call. Default [Flat].
 func WithStrategy(s Strategy) Option { return func(c *config) { c.strategy = s } }
 
+// WithContextWindow tells the agent how many input tokens its model accepts.
+//
+// Nothing can ask a provider for this, and the number differs by model and by
+// deployment, so it is configuration. Strategies read it as [View.Window]:
+// [TokenWindow] is a fraction of it, and does nothing without it. 0, the
+// default, means unknown.
+func WithContextWindow(tokens int) Option { return func(c *config) { c.window = tokens } }
+
 // WithMaxIters caps ReAct iterations. Default [DefaultMaxIters].
 func WithMaxIters(n int) Option { return func(c *config) { c.maxIters = n } }
 
@@ -205,6 +250,10 @@ func WithPurpose(p llm.Purpose) Option { return func(c *config) { c.purpose = p 
 
 // WithTerminalTool ends the run when the model calls name. The tool's handler
 // is never invoked; its arguments become [Submitted].Payload.
+//
+// The call is still dispatched through the tool middleware for a verdict, so a
+// permission policy or a skill gate can refuse it. A refused call is answered
+// with the refusal, like any other refused call, and the run continues.
 //
 // The named tool must be in the set and carry [tool.CapTerminal]; [New]
 // rejects the agent otherwise.
@@ -330,6 +379,14 @@ func WithLogger(l *slog.Logger) Option { return func(c *config) { c.logger = l }
 type Agent struct {
 	cfg config
 
+	// base is the configuration exactly as the options left it, before New
+	// layered the metrics and tracing middleware onto the client, the tool
+	// chain and the run context. [Agent.With] derives from this and never from
+	// cfg: cfg already carries those layers, and handing it back to New would
+	// install them a second time — every model call, token and tool call then
+	// counted twice, and every span recorded twice, on every derived agent.
+	base config
+
 	// system is rendered once, here, and reused by every call. That is what
 	// makes the prompt-cache prefix byte-stable across a run: it cannot drift,
 	// because there is no code path that rebuilds it.
@@ -349,7 +406,7 @@ func New(opts ...Option) (*Agent, error) {
 		maxTokens:    DefaultMaxTokens,
 		purpose:      llm.PurposeOther,
 		forceLastN:   DefaultForceTerminalLastN,
-		parallel:     1,
+		parallel:     DefaultToolParallelism,
 		name:         "agent",
 		pricing:      llm.DefaultPricing,
 	}
@@ -365,6 +422,17 @@ func New(opts ...Option) (*Agent, error) {
 	}
 	if c.logger == nil {
 		c.logger = slog.Default()
+	}
+
+	// Kept before anything below is derived from it; see Agent.base. The
+	// slices are clipped so that the appends below always copy rather than
+	// writing into a backing array base still shares.
+	base := c
+	c.toolMW = slices.Clip(c.toolMW)
+	c.runCtx = slices.Clip(c.runCtx)
+
+	if len(c.llmMW) > 0 {
+		c.client = llm.Chain(c.client, c.llmMW...)
 	}
 
 	// Applied last so it wraps whatever client and middleware the options
@@ -398,13 +466,40 @@ func New(opts ...Option) (*Agent, error) {
 		}
 	}
 
-	a := &Agent{cfg: c, system: renderSystem(c), set: set, log: c.logger}
+	a := &Agent{cfg: c, base: base, system: renderSystem(c), set: set, log: c.logger}
+	a.checkWiring()
 
 	a.disp = c.dispatcher
 	if a.disp == nil {
 		a.disp = tool.NewDispatcher(a.defaultToolChain(), tool.WithParallelism(c.parallel))
 	}
 	return a, nil
+}
+
+// checkWiring asks a tool set that needs per-run state whether a run of this
+// agent will have it, by building the context a run would get — the agent's
+// own WithRunContext decorators over an empty one — and handing it to the set's
+// tool.RunChecker.
+//
+// It warns rather than fails. An agent used only as a sub-agent may rightly
+// rely on inheriting the state from its parent's run, and New cannot tell such
+// an agent from one that will be run on its own and break. The warning is for
+// the second; the first can ignore it, and nothing that mattered is lost —
+// the set refuses loudly at run time either way.
+func (a *Agent) checkWiring() {
+	rc, ok := a.set.(tool.RunChecker)
+	if !ok {
+		return
+	}
+	ctx := context.Background()
+	for _, dec := range a.cfg.runCtx {
+		ctx = dec(ctx)
+	}
+	if err := rc.CheckRun(ctx); err != nil {
+		a.log.Warn("wombat: the tool set needs per-run state the agent does not install; "+
+			"fine for a sub-agent that inherits its parent's, a mistake for an agent run on its own",
+			slog.String("agent", a.cfg.name), slog.Any("err", err))
+	}
 }
 
 // toolFallback resolves the per-call timeout applied to tools with no Timeout
@@ -425,6 +520,10 @@ func (a *Agent) toolFallback() time.Duration {
 //     not attempts;
 //   - dedup sits outside both so it observes the final verdict, which is the
 //     only thing that tells the model it is stuck;
+//   - inherited middleware — a parent run's permission gate, carried into this
+//     run by the delegate call it allowed — sits just inside the caller's own
+//     middleware, so this agent's own gate rules first (see
+//     [tool.WithInherited]);
 //   - observation is outermost so one logical call produces exactly one
 //     Start/Done pair, with retries already collapsed.
 //
@@ -440,6 +539,7 @@ func (a *Agent) defaultToolChain() tool.Handler {
 		tool.WithCircuitBreaker(DefaultBreakerThreshold, DefaultBreakerCooldown),
 		tool.WithDedupRepeats(DefaultDedupThreshold),
 		tool.WithTruncation(DefaultToolOutputLimit),
+		tool.WithInherited,
 	}
 	mw = append(mw, a.cfg.toolMW...)
 	mw = append(mw,
@@ -454,13 +554,18 @@ func (a *Agent) defaultToolChain() tool.Handler {
 // configuration. The receiver is unchanged.
 //
 //	fast, err := a.With(wombat.WithModel("claude-haiku-4-5"), wombat.WithMaxIters(8))
+//
+// The derived agent is built from the options this one was given, not from
+// what New made of them, so the observation that [WithMetrics] and
+// [WithTracing] install is installed once, and an opts entry that replaces the
+// client or the tracer is wrapped exactly like the original was.
 func (a *Agent) With(opts ...Option) (*Agent, error) {
-	base := a.cfg
-	base.systemBlocks = append([]block(nil), a.cfg.systemBlocks...)
-	base.envBlocks = append([]block(nil), a.cfg.envBlocks...)
-	base.tools = append([]tool.Def(nil), a.cfg.tools...)
-	base.toolMW = append([]tool.Middleware(nil), a.cfg.toolMW...)
-	base.runCtx = append([]func(context.Context) context.Context(nil), a.cfg.runCtx...)
+	base := a.base
+	base.systemBlocks = append([]block(nil), a.base.systemBlocks...)
+	base.envBlocks = append([]block(nil), a.base.envBlocks...)
+	base.tools = append([]tool.Def(nil), a.base.tools...)
+	base.toolMW = append([]tool.Middleware(nil), a.base.toolMW...)
+	base.runCtx = append([]func(context.Context) context.Context(nil), a.base.runCtx...)
 
 	all := make([]Option, 0, len(opts)+1)
 	all = append(all, func(c *config) { *c = base })

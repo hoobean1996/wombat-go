@@ -494,3 +494,45 @@ func TestStreamErrorClassification(t *testing.T) {
 		t.Errorf("streamError(nil): got %v, want an ErrServer", err)
 	}
 }
+
+func TestEncodeMedia(t *testing.T) {
+	png := []byte("\x89PNG\r\n\x1a\n")
+	body := encodeFor(t, Config{}, llm.Request{Messages: []llm.Message{
+		{Role: llm.RoleUser, Content: []llm.ContentBlock{
+			llm.Text{Text: "look"},
+			llm.Media{MediaType: "image/png", Data: png},
+		}},
+		{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.ToolUse{ID: "u1", Name: "view_media", Input: json.RawMessage(`{}`)}}},
+		{Role: llm.RoleUser, Content: []llm.ContentBlock{
+			llm.ToolResult{ToolUseID: "u1", Content: "Attached spec.pdf", Media: []llm.Media{{MediaType: "application/pdf", Data: []byte("%PDF"), Name: "spec.pdf"}}},
+		}},
+	}})
+	s := string(body)
+	for _, want := range []string{
+		`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo="}}`,
+		`"content":[{"type":"text","text":"Attached spec.pdf"},{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBERg=="},"title":"spec.pdf"`,
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("body is missing %s:\n%s", want, s)
+		}
+	}
+	// The moving cache breakpoint lands on the last block, which here is a
+	// tool_result carrying media.
+	if !strings.Contains(s, `"title":"spec.pdf"}],"cache_control":{"type":"ephemeral"}`) {
+		t.Errorf("the last block carries no cache breakpoint:\n%s", s)
+	}
+}
+
+func TestEncodeMediaRefusesAnUnsupportedType(t *testing.T) {
+	clearEnv(t)
+	c, err := New(Config{APIKey: "k"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.encode(llm.Request{Messages: []llm.Message{{Role: llm.RoleUser, Content: []llm.ContentBlock{
+		llm.Media{MediaType: "video/mp4", Data: []byte{0}},
+	}}}}, "m", 10, false)
+	if !errors.Is(err, llm.ErrBadRequest) {
+		t.Errorf("err = %v, want ErrBadRequest naming the type", err)
+	}
+}

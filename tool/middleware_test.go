@@ -589,6 +589,42 @@ func TestWithCircuitBreaker(t *testing.T) {
 			t.Error("the breaker was left open by cancellations, want it closed")
 		}
 	})
+
+	// A regression test. Under a parallel batch, a slow call that started
+	// before the breaker tripped and then succeeded used to reset it — closing
+	// the breaker its siblings' failures had just opened, so the very next call
+	// went back to the tool the breaker exists to protect.
+	t.Run("a success that predates the trip does not close it", func(t *testing.T) {
+		started, release := make(chan struct{}), make(chan struct{})
+		h := WithCircuitBreaker(1, time.Minute)(func(_ context.Context, _ Def, u llm.ToolUse) (string, error) {
+			if u.ID == "slow" {
+				close(started)
+				<-release
+				return "ok", nil
+			}
+			return "", errors.New("dependency down")
+		})
+		d := Def{Name: "search"}
+
+		slowDone := make(chan error, 1)
+		go func() {
+			_, err := h(context.Background(), d, use("slow", "search", `{}`))
+			slowDone <- err
+		}()
+		<-started
+
+		if _, err := h(context.Background(), d, use("fail", "search", `{}`)); errors.Is(err, ErrCircuitOpen) {
+			t.Fatal("the tripping call was itself refused")
+		}
+		close(release) // the slow call now succeeds, after the trip
+		if err := <-slowDone; err != nil {
+			t.Fatalf("slow call: %v, want its own success", err)
+		}
+
+		if _, err := h(context.Background(), d, use("next", "search", `{}`)); !errors.Is(err, ErrCircuitOpen) {
+			t.Errorf("err = %v, want ErrCircuitOpen — a success from before the trip closed the breaker", err)
+		}
+	})
 }
 
 // ===== WithDedupRepeats =====

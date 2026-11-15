@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/hoobean1996/wombat-go/internal/fspath"
 	"github.com/hoobean1996/wombat-go/tool"
 )
 
@@ -194,9 +195,10 @@ func resolve(root, p string) string {
 }
 
 // contains reports whether clean is root or lives under it. Textual; see the
-// warning on [FSRoot].
+// warning on [FSRoot]. A root of "/" contains every absolute path, which a
+// plain root+"/" prefix test got wrong; see [fspath.Within].
 func contains(root, clean string) bool {
-	return clean == root || strings.HasPrefix(clean, root+string(filepath.Separator))
+	return fspath.Within(root, clean)
 }
 
 // AllowHosts permits network calls to the named hosts and denies the rest.

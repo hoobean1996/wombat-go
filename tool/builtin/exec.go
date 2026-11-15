@@ -58,9 +58,33 @@ const waitDelay = 2 * time.Second
 // loop, no select over pipes, no manual kill — because the tool's Def.Timeout
 // is enforced by cancelling the context and the standard library already
 // propagates that all the way to the process.
-func OSRunner(dir string) Runner { return osRunner{dir: dir} }
+//
+// # The environment is filtered
+//
+// A child sees only an allowlisted part of the harness's environment — what a
+// build, a test or git needs, and none of the harness's credentials. It used to
+// inherit all of it, and every process the model can start runs code the model
+// chose: one `go test` over a test file the model wrote was enough to print
+// the provider key, with no permission prompt anywhere on the way. See
+// [WithEnvAllow], [WithEnv] and [WithInheritedEnv] for the ways to change it.
+//
+// The filter is applied to the environment as it is when each command starts,
+// not when the Runner is built, so a variable the process sets later — the way
+// benchmarks.ApplyGoEnv pins the Go toolchain — still reaches the commands that
+// follow.
+//
+// None of this confines what a command can touch. [SandboxRunner] does.
+func OSRunner(dir string, opts ...RunnerOption) Runner {
+	return osRunner{dir: dir, env: newEnvConfig(opts)}
+}
 
-type osRunner struct{ dir string }
+type osRunner struct {
+	dir string
+	env envConfig
+	// wrap rewrites a command into the one actually spawned — the sandbox
+	// launcher with the original argv as its tail. nil spawns it as is.
+	wrap func(name string, args []string) (string, []string)
+}
 
 func (r osRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
 	out, errOut, err := r.capture(ctx, name, args...)
@@ -97,8 +121,12 @@ func (r osRunner) capture(ctx context.Context, name string, args ...string) (str
 	stdout := &limitBuf{max: maxCapture}
 	stderr := &limitBuf{max: maxCapture}
 
+	if r.wrap != nil {
+		name, args = r.wrap(name, args)
+	}
 	c := exec.CommandContext(ctx, name, args...)
 	c.Dir = r.dir
+	c.Env = r.env.environ()
 	c.Stdout = stdout
 	c.Stderr = stderr
 	c.WaitDelay = waitDelay

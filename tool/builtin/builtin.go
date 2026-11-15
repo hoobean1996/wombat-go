@@ -92,7 +92,7 @@ const maxToolOutput = 8000
 // per-call middleware still cannot hang a run on a stalled socket.
 const defaultHTTPTimeout = 15 * time.Second
 
-// Deps are the four things the built-in tools reach the world through.
+// Deps are what the built-in tools reach the world through.
 // A nil field is filled in by [Default] with an OS-backed implementation.
 type Deps struct {
 	// FS backs view_file, write_file, str_replace and save_tool_result.
@@ -100,7 +100,8 @@ type Deps struct {
 	FS FS
 
 	// Exec backs bash, grep_search, git_log and git_show.
-	// Default: OSRunner("") — the process working directory.
+	// Default: OSRunner("") — the process working directory, unconfined, with
+	// the environment filtered. SandboxRunner confines it.
 	Exec Runner
 
 	// HTTP backs http_get. Default: a client with a 15s timeout. Note that
@@ -111,6 +112,11 @@ type Deps struct {
 	// Now backs current_time. Default: time.Now. Injected rather than called
 	// directly so a replayed or recorded run can pin the clock.
 	Now func() time.Time
+
+	// Spill keeps the complete output of a bash command too long to return.
+	// Default: NewSpill("", 0), under the system temp directory. A deployment
+	// whose agent cannot read the temp directory points it somewhere it can.
+	Spill *Spill
 }
 
 // Default builds every built-in tool, in the order the OCaml registry used.
@@ -130,11 +136,14 @@ func Default(d Deps) []tool.Def {
 	if d.Now == nil {
 		d.Now = time.Now
 	}
+	if d.Spill == nil {
+		d.Spill = NewSpill("", 0)
+	}
 	return []tool.Def{
 		Calculator(),
 		HTTPGet(d.HTTP),
 		CurrentTime(d.Now),
-		Bash(d.Exec),
+		Bash(d.Exec, WithSpill(d.Spill)),
 		ViewFile(d.FS),
 		GrepSearch(d.Exec),
 		GitLog(d.Exec),

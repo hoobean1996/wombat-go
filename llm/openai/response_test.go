@@ -7,11 +7,12 @@ import (
 	"testing"
 
 	"github.com/hoobean1996/wombat-go/llm"
+	"github.com/hoobean1996/wombat-go/llm/internal/httpcall"
 )
 
 func decodeJSON(t *testing.T, body string) (llm.Response, error) {
 	t.Helper()
-	return decodeResponse(strings.NewReader(body), "requested-model")
+	return decodeResponse(strings.NewReader(body), "requested-model", httpcall.MaxResponseBody)
 }
 
 func TestFinishReasonMapping(t *testing.T) {
@@ -344,7 +345,7 @@ func (r *failingReader) Read(p []byte) (int, error) {
 }
 
 func TestDecodeResponseReadErrorIsTransport(t *testing.T) {
-	_, err := decodeResponse(&failingReader{head: `{"choices":[`}, "m")
+	_, err := decodeResponse(&failingReader{head: `{"choices":[`}, "m", httpcall.MaxResponseBody)
 	if !errors.Is(err, llm.ErrTransport) {
 		t.Errorf("errors.Is(err, llm.ErrTransport): got false, want true (err=%v)", err)
 	}

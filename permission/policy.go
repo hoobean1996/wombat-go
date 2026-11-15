@@ -143,9 +143,14 @@ func (p Policy) Decide(ctx context.Context, r Request) (Decision, string) {
 // filesystem and reach the network is an exfiltration primitive whatever its
 // individual halves are called. A tool that declares no capability at all is
 // refused too: undeclared is not the same as harmless.
+//
+// Pause and terminal tools are allowed: their handler never runs, so they have
+// no effect to restrict, and a read-only agent that cannot ask its user a
+// question or hand in its result is a broken agent rather than a safe one.
 func ReadOnly() Policy {
 	return Policy{
 		Rules: []Rule{
+			controlFlow(),
 			func(_ context.Context, r Request) (Decision, string) {
 				if r.Tool.Caps == tool.CapReadOnly {
 					return Allow, "the tool only reads"
@@ -160,16 +165,23 @@ func ReadOnly() Policy {
 // Workspace confines a run to root: reads and writes inside it are free,
 // everything else goes in front of a person.
 //
-// Precisely: CapMeta allows, a self-contained read-only tool allows, an
-// obviously harmless shell command allows, any other CapExec asks, paths
-// inside root allow, and anything left over asks.
+// Precisely: pause and terminal tools allow, CapMeta allows, a self-contained
+// read-only tool allows, an obviously harmless shell command allows, any other
+// CapExec asks, paths inside root allow, and anything left over asks.
 //
 // # The order, and why it is this order
 //
-//  1. CapMeta first. delegate and load_skill spawn a sub-agent or paste text
-//     into the transcript; the sub-agent's own calls are gated by its own
-//     chain. Asking about the orchestration itself trains the human to click
-//     yes, which is the only real failure mode of an approval prompt.
+//  0. Pause and terminal tools first. Their handler never runs: a pause asks
+//     the person a question and a terminal call hands in the result, and
+//     asking that person for permission to ask them something is the purest
+//     form of the approval fatigue step 1 is about.
+//
+//  1. CapMeta next. delegate and load_skill spawn a sub-agent or paste text
+//     into the transcript, and the sub-agent's calls are gated too — by this
+//     same policy, which [Gate] carries into the sub-agent with the delegate
+//     call, and by any gate of its own. Asking about the orchestration itself
+//     trains the human to click yes, which is the only real failure mode of an
+//     approval prompt.
 //
 //  2. Then the tools that touch nothing — a calculator, a clock. They cannot
 //     be "inside" or "outside" a directory, and without this they would fall
@@ -194,8 +206,8 @@ func ReadOnly() Policy {
 //     than a refusal. That is the difference between this policy and
 //     [FSRoot] used alone — a workspace is a default, not a wall.
 //
-//  6. Default Ask. Network calls, pause tools, anything a rule did not
-//     recognise: the human decides.
+//  6. Default Ask. Network calls, anything a rule did not recognise: the
+//     human decides.
 //
 // Note that a read OUTSIDE root asks rather than being free. Reading
 // ~/.aws/credentials is a read, and the whole point of a workspace is that it
@@ -206,6 +218,7 @@ func ReadOnly() Policy {
 func Workspace(root string) Policy {
 	return Policy{
 		Rules: []Rule{
+			controlFlow(),
 			allowCaps(tool.CapMeta, "orchestration, not an effect on the world"),
 			selfContained(),
 			SafeCommands(root),
@@ -231,6 +244,23 @@ func allowCaps(caps tool.Cap, why string) Rule {
 	return func(_ context.Context, r Request) (Decision, string) {
 		if r.Tool.Caps&caps != 0 {
 			return Allow, why
+		}
+		return Undecided, ""
+	}
+}
+
+// controlFlow allows pause and terminal tools.
+//
+// They reach a policy at all only because the agent loop sends them through
+// the dispatch chain for a verdict before it ends or suspends a run — and their
+// handler never runs, whatever the verdict, so there is no effect on the world
+// to judge. Any capability bit beside the control one is moot for the same
+// reason. A policy that wants to forbid asking the user, say for a headless
+// run nobody can answer, says so by name with [DenyTools] ahead of these.
+func controlFlow() Rule {
+	return func(_ context.Context, r Request) (Decision, string) {
+		if r.Tool.Caps&(tool.CapPause|tool.CapTerminal) != 0 {
+			return Allow, "the tool only suspends or ends the run, and its handler never runs"
 		}
 		return Undecided, ""
 	}

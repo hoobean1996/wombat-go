@@ -39,6 +39,7 @@ import (
 	"github.com/hoobean1996/wombat-go/llm"
 	"github.com/hoobean1996/wombat-go/llm/anthropic"
 	"github.com/hoobean1996/wombat-go/llm/openai"
+	"github.com/hoobean1996/wombat-go/mcp"
 	"github.com/hoobean1996/wombat-go/metric"
 	"github.com/hoobean1996/wombat-go/permission"
 	"github.com/hoobean1996/wombat-go/tool"
@@ -79,7 +80,31 @@ func main() {
 			"Empty (the default) sends no CORS headers, which is correct when the bundled UI is\n"+
 			"served from this same origin. There is no authentication here, so * lets any page the\n"+
 			"operator visits drive this agent with the operator's network access.")
+	sessionsDir := flag.String("sessions-dir", "",
+		"keep sessions in this directory, one JSON file each, so a restart picks the conversations\n"+
+			"back up — including a question the model was waiting on. Empty keeps them in memory only.")
+	confine := flag.Bool("confine", false,
+		"run every command the tools spawn inside the platform sandbox (sandbox-exec on macOS,\n"+
+			"bwrap on Linux): writes only under the session's workspace and the temp directory,\n"+
+			"credential directories unreadable, network per -confine-network. The server refuses\n"+
+			"to start if the sandbox cannot be applied rather than serving unconfined.")
+	confineNet := flag.String("confine-network", "loopback",
+		"loopback | none | full — what a -confine'd command may reach")
+	mcpConfig := flag.String("mcp", "",
+		"JSON file of MCP servers whose tools every session is offered, in the usual\n"+
+			"{\"mcpServers\": {...}} format. The servers are started once and shared by every session;\n"+
+			"their tools are held to the same -permission policy as the built-in ones.")
 	flag.Parse()
+
+	var sandbox *builtin.Network
+	if *confine {
+		n, err := builtin.ParseNetwork(*confineNet)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "wombat-serve:", err)
+			os.Exit(2)
+		}
+		sandbox = &n
+	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	// permission.Gate audits every verdict through slog.Default, so the
@@ -88,7 +113,7 @@ func main() {
 	slog.SetDefault(logger)
 
 	if err := run(*addr, *provider, *model, *workdir, *perm, *cors,
-		*budget, *maxIters, *metrics, logger); err != nil {
+		*budget, *maxIters, *metrics, sandbox, *sessionsDir, *mcpConfig, logger); err != nil {
 		logger.Error("wombat-serve", "err", err)
 		os.Exit(1)
 	}
@@ -99,6 +124,8 @@ func run(
 	budget float64,
 	maxIters int,
 	metrics bool,
+	sandbox *builtin.Network,
+	sessionsDir, mcpConfig string,
 	logger *slog.Logger,
 ) error {
 	root, err := filepath.Abs(workdir)
@@ -124,6 +151,24 @@ func run(
 		m = metric.New(reg)
 	}
 
+	// Connected before the manager is built, and closed after it is closed
+	// (defers run last-first): a restored session's first turn may call one.
+	var conns *mcp.Connections
+	if mcpConfig != "" {
+		servers, err := mcp.LoadConfig(mcpConfig)
+		if err != nil {
+			return err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		conns, err = mcp.ConnectAll(ctx, servers)
+		cancel()
+		if err != nil {
+			return err
+		}
+		defer conns.Close()
+		logger.Info("mcp servers connected", "servers", len(servers), "tools", len(conns.Tools()))
+	}
+
 	factory := &factory{
 		client:   client,
 		root:     root,
@@ -132,6 +177,8 @@ func run(
 		maxIters: maxIters,
 		logger:   logger,
 		metrics:  m,
+		sandbox:  sandbox,
+		mcp:      conns,
 	}
 
 	// Built once at startup for two reasons: it fails a misconfiguration here
@@ -143,7 +190,15 @@ func run(
 		return fmt.Errorf("building the reference agent: %w", err)
 	}
 
+	var store httpapi.Store
+	if sessionsDir != "" {
+		if store, err = httpapi.DirStore(sessionsDir); err != nil {
+			return err
+		}
+	}
+
 	mgr, err := httpapi.NewManager(httpapi.ManagerConfig{
+		Store: store,
 		Build: factory.build,
 		Limits: governor.Limits{
 			CostUSD: budget,
@@ -231,6 +286,11 @@ type factory struct {
 	maxIters int
 	logger   *slog.Logger
 	metrics  *metric.Metrics
+	// sandbox is the network mode of a confined runner; nil runs commands
+	// unconfined, with the environment still filtered.
+	sandbox *builtin.Network
+	// mcp is the -mcp servers, shared by every session; nil without the flag.
+	mcp *mcp.Connections
 }
 
 func (f *factory) build(opts httpapi.SessionOptions) (*wombat.Agent, error) {
@@ -254,12 +314,19 @@ func (f *factory) build(opts httpapi.SessionOptions) (*wombat.Agent, error) {
 		iters = opts.MaxIters
 	}
 
+	runner := builtin.OSRunner(workspace)
+	if f.sandbox != nil {
+		if runner, err = builtin.SandboxRunner(workspace, builtin.Sandbox{Network: *f.sandbox}); err != nil {
+			return nil, fmt.Errorf("-confine: %w", err)
+		}
+	}
 	tools := builtin.Default(builtin.Deps{
 		FS:   builtin.OSFS(""),
-		Exec: builtin.OSRunner(workspace),
+		Exec: runner,
 		HTTP: &http.Client{Timeout: 30 * time.Second},
 		Now:  time.Now,
 	})
+	tools = append(tools, f.mcp.Tools()...)
 
 	// ask_user suspends the run, and this front end has somewhere to put the
 	// answer — a paused turn leaves the session Waiting and the next prompt is
@@ -283,6 +350,10 @@ func (f *factory) build(opts httpapi.SessionOptions) (*wombat.Agent, error) {
 		wombat.WithLogger(f.logger),
 		wombat.WithEnvBlock("working_directory", workspace+
 			"\n\nPass this as exec_dir to shell tools and as the base for relative paths."),
+	}
+	if notes := f.mcp.Instructions(); notes != "" {
+		agentOpts = append(agentOpts, wombat.WithEnvBlock("mcp_servers",
+			"What the MCP servers say about their tools, which are named <server>__<tool>:\n\n"+notes))
 	}
 	if gate != nil {
 		agentOpts = append(agentOpts, wombat.WithToolMiddleware(gate))

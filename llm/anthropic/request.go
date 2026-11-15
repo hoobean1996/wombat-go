@@ -1,6 +1,7 @@
 package anthropic
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 
@@ -40,9 +41,9 @@ type requestBody struct {
 
 type messageJSON struct {
 	Role string `json:"role"`
-	// Content holds *textBlock, *toolUseBlock, *toolResultBlock or
-	// *thinkingBlock. Pointers, so the cache breakpoint can be stamped on the
-	// last one after the slice is built.
+	// Content holds *textBlock, *toolUseBlock, *toolResultBlock,
+	// *thinkingBlock, *imageBlock or *documentBlock. Pointers, so the cache
+	// breakpoint can be stamped on the last one after the slice is built.
 	Content []any `json:"content"`
 }
 
@@ -74,11 +75,36 @@ type toolUseBlock struct {
 	CacheControl *cacheControl   `json:"cache_control,omitempty"`
 }
 
+// toolResultBlock's Content is the result's text as a plain string, or — when
+// the tool attached media — a list of text, image and document blocks, which
+// is the other form the API accepts. The string form is kept whenever it
+// suffices so that a text-only transcript encodes byte for byte as it always
+// did, and its cache entries still match.
 type toolResultBlock struct {
 	Type         string        `json:"type"`
 	ToolUseID    string        `json:"tool_use_id"`
-	Content      string        `json:"content"`
+	Content      any           `json:"content"`
 	IsError      bool          `json:"is_error,omitempty"`
+	CacheControl *cacheControl `json:"cache_control,omitempty"`
+}
+
+// mediaSource is the inline, base64 form of an image or a document.
+type mediaSource struct {
+	Type      string `json:"type"`
+	MediaType string `json:"media_type"`
+	Data      string `json:"data"`
+}
+
+type imageBlock struct {
+	Type         string        `json:"type"`
+	Source       mediaSource   `json:"source"`
+	CacheControl *cacheControl `json:"cache_control,omitempty"`
+}
+
+type documentBlock struct {
+	Type         string        `json:"type"`
+	Source       mediaSource   `json:"source"`
+	Title        string        `json:"title,omitempty"`
 	CacheControl *cacheControl `json:"cache_control,omitempty"`
 }
 
@@ -236,19 +262,52 @@ func encodeBlock(b llm.ContentBlock) (any, error) {
 		}
 		return &toolUseBlock{Type: "tool_use", ID: string(v.ID), Name: v.Name, Input: in}, nil
 	case llm.ToolResult:
+		var content any = v.Content
+		if len(v.Media) > 0 {
+			parts := make([]any, 0, len(v.Media)+1)
+			if v.Content != "" {
+				parts = append(parts, &textBlock{Type: "text", Text: v.Content})
+			}
+			for _, m := range v.Media {
+				enc, err := encodeMedia(m)
+				if err != nil {
+					return nil, err
+				}
+				parts = append(parts, enc)
+			}
+			content = parts
+		}
 		return &toolResultBlock{
 			Type:      "tool_result",
 			ToolUseID: string(v.ToolUseID),
-			Content:   v.Content,
+			Content:   content,
 			IsError:   v.IsError,
 		}, nil
 	case llm.Thinking:
 		return &thinkingBlock{Type: "thinking", Thinking: v.Text, Signature: v.Signature}, nil
+	case llm.Media:
+		return encodeMedia(v)
 	default:
 		// llm.ContentBlock is a closed set, so this is unreachable today; it
 		// stays an error rather than a panic so that adding a variant upstream
 		// degrades into a failed call instead of a crashed agent.
 		return nil, fmt.Errorf("anthropic: cannot encode content block %T: %w", b, llm.ErrBadRequest)
+	}
+}
+
+// encodeMedia renders an image as an image block and a PDF as a document
+// block, both inline as base64. Anything else is refused here, where the error
+// can name the type, rather than by the provider.
+func encodeMedia(m llm.Media) (any, error) {
+	src := mediaSource{Type: "base64", MediaType: m.MediaType, Data: base64.StdEncoding.EncodeToString(m.Data)}
+	switch {
+	case m.IsImage():
+		return &imageBlock{Type: "image", Source: src}, nil
+	case m.MediaType == "application/pdf":
+		return &documentBlock{Type: "document", Source: src, Title: m.Name}, nil
+	default:
+		return nil, fmt.Errorf("anthropic: cannot send media of type %q (want an image or application/pdf): %w",
+			m.MediaType, llm.ErrBadRequest)
 	}
 }
 
@@ -280,6 +339,10 @@ func markLastCacheable(msgs []messageJSON) {
 	case *toolUseBlock:
 		v.CacheControl = ephemeral
 	case *toolResultBlock:
+		v.CacheControl = ephemeral
+	case *imageBlock:
+		v.CacheControl = ephemeral
+	case *documentBlock:
 		v.CacheControl = ephemeral
 	}
 }

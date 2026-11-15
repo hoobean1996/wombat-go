@@ -30,9 +30,10 @@ var (
 	ErrDanglingToolUse = errors.New("wombat: conversation ends with unanswered tool_use")
 	ErrOrphanResult    = errors.New("wombat: tool_result has no matching tool_use")
 
-	// ErrBlockInWrongRole is a tool_use in a user turn or a tool_result in an
-	// assistant turn. The block types are not interchangeable: one is the model
-	// asking and the other is the harness answering.
+	// ErrBlockInWrongRole is a tool_use in a user turn, or a tool_result or a
+	// media block in an assistant turn. The block types are not
+	// interchangeable: one is the model asking, the others are the harness
+	// and the user answering.
 	ErrBlockInWrongRole = errors.New("wombat: content block is in the wrong role")
 
 	// ErrLateResult is a second tool_result for a call that was already
@@ -175,7 +176,8 @@ func (c Convo) Lookup(id llm.ToolUseID) (string, error) {
 //  1. Not empty.
 //  2. Opens with a user turn.
 //  3. Roles alternate.
-//  4. A tool_use rides in an assistant turn, a tool_result in a user turn.
+//  4. A tool_use rides in an assistant turn, a tool_result or media in a
+//     user turn.
 //  5. A tool_result answers a tool_use from the IMMEDIATELY preceding turn.
 //  6. No tool_use is left unanswered, and no id is reused or answered twice.
 //
@@ -232,6 +234,12 @@ func (c Convo) Validate() error {
 					return fmt.Errorf("%w: %s, again at turn %d", ErrLateResult, v.ToolUseID, i)
 				}
 				delete(open, v.ToolUseID)
+
+			case llm.Media:
+				if m.Role != llm.RoleUser {
+					return fmt.Errorf("%w: a %s media block is in a %s turn (turn %d); media is something the model reads, not something it sends",
+						ErrBlockInWrongRole, v.MediaType, m.Role, i)
+				}
 			}
 		}
 

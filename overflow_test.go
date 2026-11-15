@@ -2,6 +2,7 @@ package wombat
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -230,6 +231,91 @@ func TestApplyLevel(t *testing.T) {
 				t.Errorf("got %d messages, want %d", got, tc.want)
 			}
 		})
+	}
+}
+
+// A ladder's rungs compose: level 2 is rung 2 applied to rung 1's output, not
+// rung 2 applied to the original.
+func TestApplyLevelComposesTheRungs(t *testing.T) {
+	ctx := withResults(context.Background(), map[llm.ToolUseID]ResultInfo{"s1": {Tool: "loader", Tags: []string{"skill"}}})
+	msgs := append(longTranscript(13),
+		assistantUse("s1", "loader"),
+		userResult("s1", "BODY"),
+		assistantText("noted"),
+		userMsg("go on"),
+	)
+	ladder := []Strategy{DropTagged(0, 0, "skill"), SlidingWindow(6)}
+
+	got := applyLevel(ctx, ladder, 2, msgs)
+	if strings.Contains(allText(got), "BODY") {
+		t.Errorf("level 2 still carries the skill body rung 1 dropped: %d messages", len(got))
+	}
+	if want := ladder[1].Apply(View{Messages: ladder[0].Apply(View{Messages: msgs, Results: resultsFrom(ctx)})}); len(got) != len(want) {
+		t.Errorf("level 2 = %d messages, want %d (rung 2 applied to rung 1's output)", len(got), len(want))
+	}
+	if err := Convo(got).Validate(); err != nil {
+		t.Errorf("level 2 is not a valid transcript: %v", err)
+	}
+}
+
+// bodyAverseClient rejects a request carrying more than limit messages, or any
+// tool_result that still holds the skill body. It first asks for the skill to be
+// loaded, then answers.
+type bodyAverseClient struct {
+	limit int
+
+	mu       sync.Mutex
+	accepted []llm.Request
+}
+
+func (c *bodyAverseClient) Complete(_ context.Context, req llm.Request) (llm.Response, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(req.Messages) > c.limit || strings.Contains(allText(req.Messages), "SKILL-BODY") {
+		return llm.Response{}, &llm.APIError{Class: llm.ErrContextWindow, Status: 400, Message: "prompt is too long"}
+	}
+	c.accepted = append(c.accepted, req)
+	if len(c.accepted) == 1 {
+		return toolTurn("s1", "loader", `{}`), nil
+	}
+	return textTurn("done"), nil
+}
+
+// TestOverflowLadderKeepsASemanticRungWhenItWindows is a regression test.
+//
+// The ladder is the one the WithOverflowRecovery doc recommends: drop skill
+// bodies first, then window. The first call already overflows, and with no
+// skill loaded yet the first rung is a no-op, so the level goes straight to the
+// window and stays there. Then the model loads a skill. Its body sits inside
+// the window, so the window alone no longer fits, and dropping the body alone
+// would not fit either — only both together do.
+//
+// When each level applied only its own rung, level 2 was the bare window and
+// brought the body straight back, the ladder ran out, and the run died with the
+// provider's 400.
+func TestOverflowLadderKeepsASemanticRungWhenItWindows(t *testing.T) {
+	cl := &bodyAverseClient{limit: 10}
+	loader := tool.Def{
+		Name: "loader", Description: "loads a skill", InputSchema: json.RawMessage(objSchema),
+		Fn: func(ctx context.Context, _ json.RawMessage) (string, error) {
+			tool.Annotate(ctx, "skill")
+			return "SKILL-BODY " + strings.Repeat("x", 64), nil
+		},
+	}
+	a := newAgent(t, llm.Chain(cl, WithOverflowRecovery(DropTagged(0, 0, "skill"), SlidingWindow(8))),
+		[]tool.Def{loader})
+
+	out, err := a.Run(context.Background(), Continue(longTranscript(13)))
+	if err != nil {
+		t.Fatalf("Run: %v — the window rung brought back the skill body the first rung had dropped", err)
+	}
+	if ans, ok := out.(Answer); !ok || ans.Text != "done" {
+		t.Fatalf("Outcome = %#v, want the answer", out)
+	}
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+	if len(cl.accepted) != 2 {
+		t.Fatalf("accepted %d requests, want 2", len(cl.accepted))
 	}
 }
 

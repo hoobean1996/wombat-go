@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -498,6 +499,11 @@ func TestKeyDistinguishesRequests(t *testing.T) {
 		"schema_order": func(r *llm.Request) {
 			r.Tools = []llm.ToolSpec{{Name: "t", InputSchema: json.RawMessage(`{"b":1,"a":2}`)}}
 		},
+		// Sampling changes what the provider returns. These were once left
+		// out, and a recording at one temperature replayed for another.
+		"temperature":      func(r *llm.Request) { r.Temperature = ptr(0.7) },
+		"temperature zero": func(r *llm.Request) { r.Temperature = ptr(0) },
+		"top_p":            func(r *llm.Request) { r.TopP = ptr(0.9) },
 	}
 	for name, f := range mut {
 		t.Run(name, func(t *testing.T) {
@@ -511,6 +517,15 @@ func TestKeyDistinguishesRequests(t *testing.T) {
 				t.Errorf("changing %s did not change the key: got %s for both", name, got)
 			}
 		})
+	}
+
+	// Two different temperatures are two different questions.
+	hot, cold := base, base
+	hot.Temperature, cold.Temperature = ptr(1), ptr(0)
+	_, hotKey, _ := canonLLM(hot)
+	_, coldKey, _ := canonLLM(cold)
+	if hotKey == coldKey {
+		t.Error("temperature 1 and temperature 0 share a key")
 	}
 
 	// A zero ToolChoice and an explicit ChoiceAuto are the same request on the
@@ -853,6 +868,26 @@ func TestRecordAfterCloseLatchesErrClosed(t *testing.T) {
 }
 
 // ===== wire shape =====
+
+// TestKeyWithoutSamplingIsUnchanged pins the key of a request that sets no
+// sampling control to the value it had before Temperature and TopP joined the
+// key. They are omitted when nil precisely so this holds: every tape recorded
+// before the change must still replay.
+func TestKeyWithoutSamplingIsUnchanged(t *testing.T) {
+	canon, key, err := canonLLM(askReq("q"))
+	if err != nil {
+		t.Fatalf("canonLLM: %v", err)
+	}
+	const want = "1e5631e6f8c109df9e461eb63e3d1f90e134f411298698dea18aae469798c0fa"
+	if key != want {
+		t.Errorf("key = %s, want %s — the canonical form of an unsampled request changed:\n%s", key, want, canon)
+	}
+	if strings.Contains(string(canon), "temperature") || strings.Contains(string(canon), "top_p") {
+		t.Errorf("an unset sampling control reached the canonical bytes: %s", canon)
+	}
+}
+
+func ptr(f float64) *float64 { return &f }
 
 func TestWireFieldOrder(t *testing.T) {
 	path := tapePath(t)
@@ -1384,5 +1419,71 @@ func TestAutoResumesToolSideEffects(t *testing.T) {
 	}
 	if lines := readLines(t, path); len(lines) != 2 {
 		t.Errorf("lines: got %d, want 2", len(lines))
+	}
+}
+
+// TestControlToolsAreNotTaped: the agent loop sends pause and terminal calls
+// through the tool middleware for a verdict, and their handler never runs, so
+// there is nothing to protect by taping them. Taping them would also turn every
+// pause in a tape recorded before they went through the chain into a Replay
+// miss.
+func TestControlToolsAreNotTaped(t *testing.T) {
+	// An empty file in Replay mode: anything the middleware looked up would miss.
+	path := tapePath(t)
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rp := openTape(t, path, Replay)
+
+	for _, caps := range []tool.Cap{tool.CapPause, tool.CapTerminal} {
+		d := tool.Def{Name: "control", Caps: caps}
+		reached := false
+		out, err := rp.Tools()(func(context.Context, tool.Def, llm.ToolUse) (string, error) {
+			reached = true
+			return "accepted", nil
+		})(context.Background(), d, llm.ToolUse{ID: "u1", Name: "control", Input: json.RawMessage(`{}`)})
+		if err != nil || out != "accepted" || !reached {
+			t.Errorf("caps %v: got (%q, %v, reached=%v), want the call passed straight through", caps, out, err, reached)
+		}
+	}
+	if s := rp.Stats(); s.Hits+s.Misses+s.Recorded != 0 {
+		t.Errorf("Stats = %+v, want the tape untouched by control calls", s)
+	}
+}
+
+// A tool's attached media is recorded with its output and attached again on
+// replay; a replayed run that lost the screenshot would show the model a
+// different conversation.
+func TestToolMediaIsRecordedAndReplayed(t *testing.T) {
+	path := tapePath(t)
+	img := llm.Media{MediaType: "image/png", Data: []byte{9, 8, 7}, Name: "s.png"}
+	d := tool.Def{Name: "shot"}
+	u := llm.ToolUse{ID: "u1", Name: "shot", Input: json.RawMessage(`{"page":1}`)}
+
+	set := func(tp *Tape, fn tool.Fn) []tool.Result {
+		d := d
+		d.Fn = fn
+		return tool.NewDispatcher(tool.Chain(tool.Direct, tp.Tools())).Dispatch(context.Background(), tool.NewSet(d), []llm.ToolUse{u})
+	}
+
+	rec := openTape(t, path, Record)
+	got := set(rec, func(ctx context.Context, _ json.RawMessage) (string, error) {
+		tool.Attach(ctx, img)
+		return "Attached s.png", nil
+	})
+	if len(got[0].Media) != 1 {
+		t.Fatalf("recording: Media = %v", got[0].Media)
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rp := openTape(t, path, Replay)
+	got = set(rp, func(context.Context, json.RawMessage) (string, error) {
+		t.Error("the tool ran on replay")
+		return "", nil
+	})
+	if got[0].Output != "Attached s.png" || len(got[0].Media) != 1 || !reflect.DeepEqual(got[0].Media[0], img) {
+		t.Errorf("replay = %q %v, want the recorded output and image", got[0].Output, got[0].Media)
 	}
 }

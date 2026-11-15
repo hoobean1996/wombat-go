@@ -403,6 +403,13 @@ func TestEncodeIsDeterministic(t *testing.T) {
 // U+FFFD when it writes a string, so mis-encoded tool output cannot produce a
 // body the provider rejects. Unlike llm/anthropic there is no scrubbing pass
 // here, and this is why one is not needed.
+//
+// The assertions are about meaning, not spelling. Which bytes encoding/json
+// uses for the replacement is its own business and has changed between Go
+// releases: older ones wrote the six-byte escape \ufffd, current ones write
+// the rune's raw UTF-8 (ef bf bd), and both are the same JSON string. What
+// this package depends on is that the body is valid, that no raw invalid byte
+// survives, and that the provider decodes U+FFFD where the bad bytes were.
 func TestInvalidUTF8SurvivesEncoding(t *testing.T) {
 	raw, err := encodeRequest(llm.Request{
 		Messages: []llm.Message{{Role: llm.RoleUser, Content: []llm.ContentBlock{
@@ -415,12 +422,91 @@ func TestInvalidUTF8SurvivesEncoding(t *testing.T) {
 	if !json.Valid(raw) {
 		t.Fatalf("body is not valid JSON: %s", raw)
 	}
-	if strings.ContainsRune(string(raw), 0xff) {
-		t.Errorf("body still carries the invalid byte: %q", raw)
+	// A byte search, deliberately. strings.ContainsRune(s, 0xff) looks for the
+	// rune U+00FF (the two bytes c3 bf) and would pass with the raw 0xff
+	// still sitting in the body.
+	for _, b := range []byte{0xff, 0xfe} {
+		if strings.IndexByte(string(raw), b) >= 0 {
+			t.Errorf("body still carries the invalid byte %#x: %q", b, raw)
+		}
 	}
-	// encoding/json writes the replacement rune as a \ufffd escape sequence.
-	escaped := strings.Repeat("\\u"+"fffd", 2)
-	if !strings.Contains(string(raw), escaped) {
-		t.Errorf("body: got %s, want it to contain %s (the invalid bytes replaced with U+FFFD)", raw, escaped)
+
+	var body struct {
+		Messages []struct {
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if len(body.Messages) != 1 {
+		t.Fatalf("body has %d messages, want 1: %s", len(body.Messages), raw)
+	}
+	if got, want := body.Messages[0].Content, "bytes: \ufffd\ufffd"; got != want {
+		t.Errorf("decoded content = %q, want %q (each invalid byte replaced with U+FFFD)", got, want)
+	}
+}
+
+func TestEncodeMedia(t *testing.T) {
+	png := []byte("\x89PNG\r\n\x1a\n")
+	raw, err := encodeRequest(llm.Request{Messages: []llm.Message{
+		{Role: llm.RoleUser, Content: []llm.ContentBlock{
+			llm.Text{Text: "look"},
+			llm.Media{MediaType: "image/png", Data: png},
+		}},
+		{Role: llm.RoleAssistant, Content: []llm.ContentBlock{
+			llm.ToolUse{ID: "u1", Name: "view_media", Input: json.RawMessage(`{}`)},
+			llm.ToolUse{ID: "u2", Name: "grep", Input: json.RawMessage(`{}`)},
+		}},
+		{Role: llm.RoleUser, Content: []llm.ContentBlock{
+			llm.ToolResult{ToolUseID: "u1", Content: "Attached spec.pdf", Media: []llm.Media{{MediaType: "application/pdf", Data: []byte("%PDF"), Name: "spec.pdf"}}},
+			llm.ToolResult{ToolUseID: "u2", Content: "no match"},
+		}},
+	}}, "m", 100, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body struct {
+		Messages []struct {
+			Role       string          `json:"role"`
+			Content    json.RawMessage `json:"content"`
+			ToolCallID string          `json:"tool_call_id"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatal(err)
+	}
+	var roles []string
+	for _, m := range body.Messages {
+		roles = append(roles, m.Role)
+	}
+	// The tool messages stay contiguous after the assistant turn; the media
+	// that rode on a result follows all of them.
+	if want := []string{"user", "assistant", "tool", "tool", "user"}; strings.Join(roles, ",") != strings.Join(want, ",") {
+		t.Fatalf("roles = %v, want %v\n%s", roles, want, raw)
+	}
+	if got := string(body.Messages[0].Content); got != `[{"type":"text","text":"look"},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}]` {
+		t.Errorf("user media message = %s", got)
+	}
+	if got := string(body.Messages[2].Content); got != `"Attached spec.pdf"` {
+		t.Errorf("a tool message must stay text: %s", got)
+	}
+	trailing := string(body.Messages[4].Content)
+	for _, want := range []string{`Attached to the result of tool call u1:`, `{"type":"file","file":{"filename":"spec.pdf","file_data":"data:application/pdf;base64,JVBERg=="}}`} {
+		if !strings.Contains(trailing, want) {
+			t.Errorf("trailing media message is missing %s:\n%s", want, trailing)
+		}
+	}
+}
+
+// A text-only conversation encodes exactly as before media existed: plain
+// string content, which is what every text-only gateway accepts.
+func TestEncodeTextOnlyKeepsStringContent(t *testing.T) {
+	raw, err := encodeRequest(llm.Request{Messages: []llm.Message{llm.UserText("hi")}}, "m", 100, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"messages":[{"role":"user","content":"hi"}]`) {
+		t.Errorf("body = %s", raw)
 	}
 }

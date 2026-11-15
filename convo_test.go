@@ -498,3 +498,17 @@ func TestCloseDanglingStillValidates(t *testing.T) {
 		t.Errorf("Validate() after CloseDangling = %v, want nil", err)
 	}
 }
+
+func TestValidateRejectsMediaFromTheModel(t *testing.T) {
+	c := Convo{
+		llm.UserText("draw me something"),
+		{Role: llm.RoleAssistant, Content: []llm.ContentBlock{llm.Media{MediaType: "image/png", Data: []byte{1}}}},
+	}
+	if err := c.Validate(); !errors.Is(err, ErrBlockInWrongRole) {
+		t.Errorf("Validate = %v, want ErrBlockInWrongRole for media in an assistant turn", err)
+	}
+	ok := Convo{{Role: llm.RoleUser, Content: []llm.ContentBlock{llm.Text{Text: "look"}, llm.Media{MediaType: "image/png", Data: []byte{1}}}}}
+	if err := ok.Validate(); err != nil {
+		t.Errorf("Validate = %v, want media in a user turn accepted", err)
+	}
+}

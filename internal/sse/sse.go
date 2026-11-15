@@ -1,7 +1,8 @@
 // Package sse reads a text/event-stream body.
 //
-// Both provider clients need the same framing, and neither needs anything the
-// standard library does not already give: a bufio.Scanner over the response
+// Both provider clients and the MCP client's HTTP transport need the same
+// framing, and none of them needs anything the standard library does not
+// already give: a bufio.Scanner over the response
 // body, with the caller's context handling cancellation and idle timeouts
 // handled by the http.Client. There is no hand-rolled select loop here
 // because there is nothing left for one to do.
@@ -37,7 +38,12 @@ type Reader struct {
 const maxLine = 8 << 20
 
 // NewReader wraps an event-stream body.
-func NewReader(r io.Reader) *Reader {
+func NewReader(r io.Reader) *Reader { return NewReaderSize(r, maxLine) }
+
+// NewReaderSize is NewReader with a different bound on one line. An MCP
+// server's event can carry a whole base64 document, which is more than a
+// provider's deltas ever do.
+func NewReaderSize(r io.Reader, maxLine int) *Reader {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64<<10), maxLine)
 	return &Reader{sc: sc}

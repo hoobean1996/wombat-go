@@ -158,3 +158,18 @@ func TestScoreWithNoVerifiers(t *testing.T) {
 		t.Fatalf("got %v/%v/%v, want 0 and an empty breakdown", total, breakdown, err)
 	}
 }
+
+// A shell verifier runs code the agent wrote — `go test` over the agent's own
+// test files — so it must not see the harness's credentials any more than the
+// agent's commands do.
+func TestShellVerifierDoesNotSeeTheHarnessCredentials(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "sk-leak")
+	t.Setenv("GOFLAGS", "-mod=mod")
+	ep := episodeIn(t.TempDir())
+	if _, score := Shell("no-key", `test -z "${OPENAI_API_KEY:-}"`, 1)(t.Context(), ep); score != 1 {
+		t.Error("the verifier's command could read OPENAI_API_KEY")
+	}
+	if _, score := Shell("go-env", `test "$GOFLAGS" = "-mod=mod"`, 1)(t.Context(), ep); score != 1 {
+		t.Error("the verifier's command lost the Go toolchain's settings")
+	}
+}

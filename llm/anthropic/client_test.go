@@ -488,44 +488,6 @@ func TestClassifyStatusMapping(t *testing.T) {
 	}
 }
 
-func TestRetryAfterParsing(t *testing.T) {
-	tests := []struct {
-		name string
-		hdr  string
-		want time.Duration
-		// approx marks a value derived from wall clock, checked as a range.
-		approx bool
-	}{
-		{name: "absent", hdr: "", want: 0},
-		{name: "integer seconds", hdr: "12", want: 12 * time.Second},
-		{name: "fractional seconds", hdr: "1.5", want: 1500 * time.Millisecond},
-		{name: "zero", hdr: "0", want: 0},
-		{name: "negative is ignored", hdr: "-5", want: 0},
-		{name: "garbage is ignored", hdr: "soon", want: 0},
-		{name: "past HTTP date is ignored", hdr: "Mon, 02 Jan 2006 15:04:05 GMT", want: 0},
-		{name: "future HTTP date", hdr: "", approx: true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			h := http.Header{}
-			if tt.approx {
-				h.Set("Retry-After", time.Now().Add(90*time.Second).UTC().Format(http.TimeFormat))
-				got := retryAfter(h)
-				if got < 80*time.Second || got > 91*time.Second {
-					t.Errorf("retryAfter(future date): got %v, want roughly 90s", got)
-				}
-				return
-			}
-			if tt.hdr != "" {
-				h.Set("Retry-After", tt.hdr)
-			}
-			if got := retryAfter(h); got != tt.want {
-				t.Errorf("retryAfter(%q): got %v, want %v", tt.hdr, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestCompleteWithoutModel(t *testing.T) {
 	clearEnv(t)
 	srv, cap := newServer(t, okJSON(minimalMessage))
@@ -566,50 +528,6 @@ func TestRequestModelAndMaxTokensOverride(t *testing.T) {
 	if body.MaxTokens != 4242 {
 		t.Errorf("max_tokens: got %d, want %d", body.MaxTokens, 4242)
 	}
-}
-
-// ===== abortError =====
-
-// TestAbortErrorClassification pins the retry-vs-stop distinction: a stall is
-// transport (retryable), a deliberate cancellation keeps its cause so
-// errors.Is(err, governor.ErrBudgetExhausted) still answers upstream.
-func TestAbortErrorClassification(t *testing.T) {
-	sentinel := errors.New("budget exhausted")
-
-	t.Run("live context is transport", func(t *testing.T) {
-		err := abortError(context.Background(), errors.New("dial tcp: refused"))
-		if !errors.Is(err, llm.ErrTransport) {
-			t.Errorf("errors.Is(err, llm.ErrTransport): got false, want true (err=%v)", err)
-		}
-	})
-	t.Run("idle stream is transport", func(t *testing.T) {
-		ctx, cancel := context.WithCancelCause(context.Background())
-		cancel(errStreamIdle)
-		err := abortError(ctx, errors.New("body closed"))
-		if !errors.Is(err, llm.ErrTransport) {
-			t.Errorf("errors.Is(err, llm.ErrTransport): got false, want true (err=%v)", err)
-		}
-	})
-	t.Run("deadline is transport", func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
-		defer cancel()
-		<-ctx.Done()
-		err := abortError(ctx, errors.New("body closed"))
-		if !errors.Is(err, llm.ErrTransport) {
-			t.Errorf("errors.Is(err, llm.ErrTransport): got false, want true (err=%v)", err)
-		}
-	})
-	t.Run("deliberate cancellation keeps its cause and is NOT transport", func(t *testing.T) {
-		ctx, cancel := context.WithCancelCause(context.Background())
-		cancel(sentinel)
-		err := abortError(ctx, errors.New("body closed"))
-		if !errors.Is(err, sentinel) {
-			t.Errorf("errors.Is(err, sentinel): got false, want true (err=%v)", err)
-		}
-		if errors.Is(err, llm.ErrTransport) {
-			t.Errorf("errors.Is(err, llm.ErrTransport): got true, want false — a governor abort must not look retryable (err=%v)", err)
-		}
-	})
 }
 
 // ===== ConfigFromEnv =====
@@ -688,17 +606,6 @@ func TestParseStreamMode(t *testing.T) {
 		if got := parseStreamMode(tt.in); got != tt.want {
 			t.Errorf("parseStreamMode(%q): got %v, want %v", tt.in, got, tt.want)
 		}
-	}
-}
-
-func TestTruncateStopsOnARuneBoundary(t *testing.T) {
-	// "中文" is two 3-byte runes; cutting at 4 must fall back to 3.
-	got := truncate("中文", 4)
-	if !strings.HasPrefix(got, "中") || strings.Contains(got, "\ufffd") {
-		t.Errorf("truncate: got %q, want a clean cut after 中", got)
-	}
-	if got := truncate("short", 100); got != "short" {
-		t.Errorf("truncate(short): got %q, want %q", got, "short")
 	}
 }
 

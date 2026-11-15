@@ -45,7 +45,9 @@ type bashIn struct {
 // The seam for fixing it is [Runner]. Everything about how a command reaches
 // the world goes through that interface, so a Runner that wraps the argv in
 // sandbox-exec, bwrap, a container or an ssh hop confines the shell for real —
-// without this file knowing. What must NOT be attempted is confinement by
+// without this file knowing. [SandboxRunner] is that Runner for macOS and
+// Linux; a container or a remote host is the same seam with a different
+// Runner behind it. What must NOT be attempted is confinement by
 // inspecting the command string: a shell has $(), backticks, eval, aliases and
 // a hundred ways to spell a path, and a filter over it is a filter an
 // adversary — or a prompt-injected model behaving like one — walks straight
@@ -54,8 +56,19 @@ type bashIn struct {
 // Short of that, [permission.Policy] is the available control, and it is a
 // real one: it decides per call, with the command in hand, and can hold the
 // call until a human answers.
-func Bash(r Runner) tool.Def {
+//
+// # Long output
+//
+// A result is clipped to its first and last few kilobytes. Give Bash a [Spill]
+// and the complete output of a clipped command is saved to a file the result
+// names, so the model can grep the middle instead of re-running the command.
+// [Default] gives it one.
+func Bash(r Runner, opts ...BashOption) tool.Def {
 	mustNotBeNil(r != nil, "Bash requires a non-nil Runner")
+	var cfg bashConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
 
 	return tool.Typed(tool.Def{
 		Name: "bash",
@@ -66,7 +79,8 @@ func Bash(r Runner) tool.Def {
 		// for the project. Telling the model where to look is the caller's
 		// job — see the working_directory block the CLI sets.
 		Description: "Execute a shell command and return its combined stdout+stderr. " +
-			"60s timeout. Output truncated to ~8000 chars. " +
+			"60s timeout. Output truncated to ~8000 chars; when it is, the result names a file " +
+			"holding the complete output. " +
 			"REQUIRES exec_dir, an ABSOLUTE path — the command runs there, so " +
 			"relative paths in your command resolve against it. If the system " +
 			"prompt names a working directory, use that.",
@@ -136,7 +150,7 @@ func Bash(r Runner) tool.Def {
 		// prints the failing assertion after every passing test name, a stack
 		// trace ends at the throw. Keeping only the head of a 200 KB failing
 		// test run hands the model eight kilobytes of test names that PASSED.
-		out = tool.Clip(out, maxToolOutput)
+		out = clipAndSpill(cfg.spill, "bash", out, maxToolOutput, tool.Clip)
 		if out == "" {
 			out = "(no output)"
 		}
@@ -174,6 +188,16 @@ func Bash(r Runner) tool.Def {
 		return out, nil
 	})
 }
+
+// BashOption configures [Bash].
+type BashOption func(*bashConfig)
+
+type bashConfig struct {
+	spill *Spill
+}
+
+// WithSpill saves the complete output of a clipped command; see [Spill].
+func WithSpill(s *Spill) BashOption { return func(c *bashConfig) { c.spill = s } }
 
 // retryExec classifies a subprocess failure.
 //

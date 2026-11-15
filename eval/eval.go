@@ -136,6 +136,9 @@ type Probe struct {
 	// Expect is what has to be true.
 	Expect []Expect
 
+	// MaxIters caps every arm's iterations, applied on top of whatever the
+	// arm built so the arms stay identical in it; 0 leaves each agent's own
+	// cap. Limits is the run's budget, the same for every sample.
 	MaxIters int
 	Limits   governor.Limits
 

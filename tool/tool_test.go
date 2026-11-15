@@ -552,3 +552,39 @@ func TestWithObserverBracketsOnePairPerLogicalCall(t *testing.T) {
 		t.Errorf("observed output = %q, want %q", doneOut, "recovered")
 	}
 }
+
+func TestAttachReachesTheResultBlock(t *testing.T) {
+	img := llm.Media{MediaType: "image/png", Data: []byte{1, 2, 3}}
+	shot := def(t, "shot", func(ctx context.Context, _ json.RawMessage) (string, error) {
+		Attach(ctx, img)
+		if got := Attached(ctx); len(got) != 1 {
+			t.Errorf("Attached = %v, want the one image", got)
+		}
+		return "Attached a screenshot.", nil
+	})
+	broken := def(t, "broken", func(ctx context.Context, _ json.RawMessage) (string, error) {
+		Attach(ctx, img)
+		return "", errors.New("render failed")
+	})
+
+	got := NewDispatcher(Direct).Dispatch(context.Background(), NewSet(shot, broken), []llm.ToolUse{
+		use("1", "shot", `{}`), use("2", "broken", `{}`),
+	})
+	tr := got[0].Block().(llm.ToolResult)
+	if len(tr.Media) != 1 || tr.Content != "Attached a screenshot." {
+		t.Errorf("Block() = %#v, want the text and the image", tr)
+	}
+	if got[0].Size() != len("Attached a screenshot.")+3 {
+		t.Errorf("Size() = %d, want the text and the image counted", got[0].Size())
+	}
+	// An error result is text: whatever the failing call attached is dropped.
+	if tr := got[1].Block().(llm.ToolResult); !tr.IsError || len(tr.Media) != 0 {
+		t.Errorf("failed call Block() = %#v, want an error with no media", tr)
+	}
+
+	// Outside a dispatcher both are no-ops.
+	Attach(context.Background(), img)
+	if Attached(context.Background()) != nil {
+		t.Error("Attached outside a dispatcher returned something")
+	}
+}

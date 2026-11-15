@@ -88,6 +88,12 @@ type ManagerConfig struct {
 
 	// Logger receives lifecycle lines. Default: a handler that discards.
 	Logger *slog.Logger
+
+	// Store, when set, keeps every session across restarts: each is saved
+	// when it is created and at the start and end of every turn, and
+	// [NewManager] restores whatever the store holds. nil keeps sessions in
+	// memory only. See [Store] for what a restart does and does not keep.
+	Store Store
 }
 
 // Manager owns sessions.
@@ -143,8 +149,70 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 		swept:    make(chan struct{}),
 		sessions: map[string]*Session{},
 	}
+	if cfg.Store != nil {
+		m.restore()
+	}
 	go m.sweep()
 	return m, nil
+}
+
+// restore brings back what the store holds. A session that has expired is
+// forgotten; one whose agent cannot be built any more — its workspace is gone,
+// its options are no longer allowed — is skipped and kept, so a fixed
+// configuration can still restore it.
+func (m *Manager) restore() {
+	recs, err := m.cfg.Store.Load()
+	if err != nil {
+		m.cfg.Logger.Warn("session store: some sessions could not be read", "err", err)
+	}
+	slices.SortFunc(recs, func(a, b SessionRecord) int { return a.Created.Compare(b.Created) })
+	for _, rec := range recs {
+		if time.Since(rec.Updated) >= m.cfg.TTL {
+			_ = m.cfg.Store.Delete(rec.ID)
+			continue
+		}
+		if len(m.sessions) >= m.cfg.Max {
+			m.cfg.Logger.Warn("session store: more saved sessions than -max allows; the rest stay on disk", "max", m.cfg.Max)
+			break
+		}
+		agent, err := m.cfg.Build(rec.Options)
+		if err != nil {
+			m.cfg.Logger.Warn("session store: cannot rebuild a saved session's agent", "session", rec.ID, "err", err)
+			continue
+		}
+		s := m.newSession(rec.ID, agent, rec.Options, rec.Created)
+		s.updated = rec.Updated
+		s.turns, s.state, s.msgs, s.spend = rec.Turns, rec.State, rec.Messages, rec.Spend
+		s.outcome, s.answer, s.errText, s.errKind, s.pauseID = rec.Outcome, rec.Answer, rec.Error, rec.ErrorKind, rec.PauseID
+		s.base = rec.Events
+		if s.state == Running || s.state == Approving {
+			// The turn died with the process that ran it. Its transcript is
+			// the one it started from, so the next prompt carries on from
+			// there — Then closes the tool call it may have left open.
+			s.state, s.outcome, s.answer = Failed, "", ""
+			s.errText, s.errKind = "the server restarted while this turn was running", KindInterrupted
+		}
+		m.sessions[s.id] = s
+		m.order = append(m.order, s.id)
+	}
+	if n := len(m.sessions); n > 0 {
+		m.cfg.Logger.Info("sessions restored", "count", n)
+	}
+}
+
+func (m *Manager) newSession(id string, agent *wombat.Agent, opts SessionOptions, created time.Time) *Session {
+	return &Session{
+		id:        id,
+		m:         m,
+		agent:     agent,
+		opts:      opts,
+		created:   created,
+		updated:   created,
+		bufCap:    m.cfg.BufferSize,
+		approvals: newApprovals(),
+		state:     Idle,
+		changed:   make(chan struct{}),
+	}
 }
 
 // Create makes a session. It does NOT start a turn — [Session.Send] does — so
@@ -155,31 +223,26 @@ func (m *Manager) Create(opts SessionOptions) (*Session, error) {
 		return nil, fmt.Errorf("httpapi: building the agent for this session: %w", err)
 	}
 
-	now := time.Now()
-	s := &Session{
-		id:        newID(),
-		m:         m,
-		agent:     agent,
-		opts:      opts,
-		created:   now,
-		updated:   now,
-		bufCap:    m.cfg.BufferSize,
-		approvals: newApprovals(),
-		state:     Idle,
-		changed:   make(chan struct{}),
-	}
+	s := m.newSession(newID(), agent, opts, time.Now())
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.closed {
+		m.mu.Unlock()
 		return nil, ErrClosed
 	}
 	if len(m.sessions) >= m.cfg.Max {
+		m.mu.Unlock()
 		return nil, fmt.Errorf("%w (%d live)", ErrTooManySessions, m.cfg.Max)
 	}
 	m.sessions[s.id] = s
 	m.order = append(m.order, s.id)
+	m.mu.Unlock()
+
 	m.cfg.Logger.Info("session created", "session", s.id, "title", opts.Title)
+	s.mu.Lock()
+	rec, seq := s.recordLocked(nil)
+	s.mu.Unlock()
+	s.persist(rec, seq)
 	return s, nil
 }
 
@@ -233,7 +296,7 @@ func (m *Manager) Delete(id string) bool {
 	}
 	// Outside the lock: close waits for a goroutine, and holding the registry
 	// while doing that would block every other request.
-	s.close()
+	s.drop()
 	m.cfg.Logger.Info("session dropped", "session", id)
 	return true
 }
@@ -303,7 +366,7 @@ func (m *Manager) reap(now time.Time) {
 	m.mu.Unlock()
 
 	for _, s := range dead {
-		s.close()
+		s.drop()
 		m.cfg.Logger.Info("session expired", "session", s.id, "events", s.Info().Events)
 	}
 }

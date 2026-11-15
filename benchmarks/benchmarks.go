@@ -87,6 +87,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/hoobean1996/wombat-go/internal/safeenv"
 	"github.com/hoobean1996/wombat-go/rl"
 	"github.com/hoobean1996/wombat-go/tool"
 )
@@ -502,6 +503,7 @@ func GoProbe(name, rel, body, testName string, weight float64) rl.Verifier {
 
 		cmd := exec.CommandContext(ctx, "go", "test", "-run", "^"+testName+"$", "-count=1", "-v", ".")
 		cmd.Dir = work
+		cmd.Env = safeenv.Environ() // runs the agent's code: no harness credentials
 		out, err := cmd.CombinedOutput()
 		if err == nil && strings.Contains(string(out), "--- PASS: "+testName) {
 			return name, weight
@@ -555,10 +557,13 @@ func GoEnv() []string {
 
 // ApplyGoEnv sets [GoEnv] on the current process.
 //
-// The process and not a per-command environment, because the agent reaches the
-// shell through builtin.OSRunner, which inherits os.Environ() and offers no
-// seam to add to it. Setting it here is the only place that covers BOTH the
-// agent's `go test` and the verifier's.
+// The process and not a per-command environment, because it has to reach
+// BOTH the agent's `go test` and the verifier's, and the two are spawned by
+// different code. It reaches both because neither inherits the whole
+// environment any more but both read it when a command starts and pass the Go
+// toolchain's variables through: builtin.OSRunner for the agent, the
+// verifiers' own filtered environment for the probe. A per-runner setting —
+// builtin.WithEnv — would cover only the first.
 func ApplyGoEnv() error {
 	for _, kv := range GoEnv() {
 		k, v, _ := strings.Cut(kv, "=")

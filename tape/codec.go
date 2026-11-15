@@ -68,13 +68,28 @@ func digest(b []byte) string {
 //
 // Tool choice is a pointer so that a zero llm.ToolChoice and an explicit
 // ChoiceAuto hash the same — the API omits the field in both cases.
+//
+// Temperature and TopP are pointers for the reason they are pointers on
+// llm.Request: unset and zero are different requests, and 0 is the temperature
+// that pins a run. They were missing at first, so two requests that differed
+// only in sampling shared an entry — a recording at temperature 1 replayed for
+// the run that asked for 0. They sit at the tail and are omitted when nil, so
+// a request that sets neither encodes byte for byte as it always did and every
+// key on an existing tape still matches.
+//
+// Only what the REQUEST says is keyed. A default a client fills in from its
+// own config (anthropic.Config.Temperature, say) is applied below this
+// middleware and is invisible to it; two tapes recorded through clients with
+// different defaults are not told apart.
 type llmRequest struct {
-	Model     string        `json:"model,omitempty"`
-	System    string        `json:"system,omitempty"`
-	Messages  []llm.Message `json:"messages"`
-	Tools     []toolSpec    `json:"tools,omitempty"`
-	Choice    *toolChoice   `json:"tool_choice,omitempty"`
-	MaxTokens int           `json:"max_tokens,omitempty"`
+	Model       string        `json:"model,omitempty"`
+	System      string        `json:"system,omitempty"`
+	Messages    []llm.Message `json:"messages"`
+	Tools       []toolSpec    `json:"tools,omitempty"`
+	Choice      *toolChoice   `json:"tool_choice,omitempty"`
+	MaxTokens   int           `json:"max_tokens,omitempty"`
+	Temperature *float64      `json:"temperature,omitempty"`
+	TopP        *float64      `json:"top_p,omitempty"`
 }
 
 type toolSpec struct {
@@ -143,12 +158,14 @@ func canonLLM(req llm.Request) ([]byte, string, error) {
 	}
 
 	b, err := canonical(llmRequest{
-		Model:     req.Model,
-		System:    req.System,
-		Messages:  msgs,
-		Tools:     specs,
-		Choice:    choice,
-		MaxTokens: req.MaxTokens,
+		Model:       req.Model,
+		System:      req.System,
+		Messages:    msgs,
+		Tools:       specs,
+		Choice:      choice,
+		MaxTokens:   req.MaxTokens,
+		Temperature: req.Temperature,
+		TopP:        req.TopP,
 	})
 	if err != nil {
 		return nil, "", err
@@ -199,10 +216,14 @@ type toolRequest struct {
 // because a tool may legitimately fail with an empty message and a replay that
 // turned that into success would be wrong in the worst possible direction:
 // silently.
+// toolResponse is a recorded tool call. Media is what the tool attached with
+// tool.Attach; omitted when there was none, so every entry recorded before it
+// existed decodes unchanged.
 type toolResponse struct {
-	OK     bool   `json:"ok"`
-	Output string `json:"output,omitempty"`
-	Error  string `json:"error,omitempty"`
+	OK     bool        `json:"ok"`
+	Output string      `json:"output,omitempty"`
+	Error  string      `json:"error,omitempty"`
+	Media  []llm.Media `json:"media,omitempty"`
 }
 
 func canonTool(name string, input json.RawMessage) ([]byte, string, error) {
@@ -213,10 +234,12 @@ func canonTool(name string, input json.RawMessage) ([]byte, string, error) {
 	return b, digest(b), nil
 }
 
-func encodeToolResponse(out string, err error) ([]byte, error) {
+func encodeToolResponse(out string, err error, media []llm.Media) ([]byte, error) {
 	tr := toolResponse{OK: err == nil, Output: out}
 	if err != nil {
 		tr.Error = err.Error()
+	} else {
+		tr.Media = media
 	}
 	return canonical(tr)
 }

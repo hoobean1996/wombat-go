@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/hoobean1996/wombat-go/llm"
+	"github.com/hoobean1996/wombat-go/llm/internal/httpcall"
 )
 
 // chatResponse is the non-streaming reply. Only the first choice is read: the
@@ -231,10 +232,12 @@ func toolInput(args string) json.RawMessage {
 
 // decodeResponse parses a non-streaming reply. model is the requested id, used
 // when the server does not echo one back.
-func decodeResponse(r io.Reader, model string) (llm.Response, error) {
-	raw, err := io.ReadAll(r)
+//
+// The body is read whole, up to limit bytes; see httpcall.ReadBody.
+func decodeResponse(r io.Reader, model string, limit int) (llm.Response, error) {
+	raw, err := httpcall.ReadBody(r, "openai", limit)
 	if err != nil {
-		return llm.Response{}, llm.ClassifyTransport(fmt.Errorf("openai: read response: %w", err))
+		return llm.Response{}, err
 	}
 	var body chatResponse
 	if err := json.Unmarshal(raw, &body); err != nil {
@@ -287,11 +290,5 @@ func decodeResponse(r io.Reader, model string) (llm.Response, error) {
 	}, nil
 }
 
-// truncate bounds a body quoted into an error message.
-func truncate(s string) string {
-	const limit = 2 << 10
-	if len(s) <= limit {
-		return s
-	}
-	return s[:limit] + "…"
-}
+// truncate bounds a body quoted into an error message, on a rune boundary.
+func truncate(s string) string { return httpcall.Truncate(s, httpcall.MaxErrorMessage) }

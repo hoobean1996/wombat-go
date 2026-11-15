@@ -27,6 +27,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/hoobean1996/wombat-go/internal/safeenv"
 )
 
 // Check is one deterministic verdict.
@@ -276,6 +278,7 @@ func run(ctx context.Context, cfg Config, args ...string) result {
 
 	cmd := exec.CommandContext(tctx, "go", args...)
 	cmd.Dir = cfg.Workspace
+	cmd.Env = safeenv.Environ() // runs the agent's code: no harness credentials
 	out, err := cmd.CombinedOutput()
 	cfg.log("acceptance: go %s -> %v", strings.Join(args, " "), err == nil)
 	return result{ok: err == nil, output: string(out)}

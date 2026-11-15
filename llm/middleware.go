@@ -142,12 +142,42 @@ func WithRetry(p RetryPolicy) Middleware {
 				if ctx.Err() != nil {
 					return resp, context.Cause(ctx)
 				}
-				if err := sleepCtx(ctx, p.delay(attempt, RetryAfter(err))); err != nil {
+				wait := p.delay(attempt, RetryAfter(err))
+				if obs, ok := ctx.Value(retryObserverKey{}).(func(Retry)); ok && obs != nil {
+					obs(Retry{Attempt: attempt + 2, Of: p.MaxAttempts, Wait: wait, Err: err})
+				}
+				if err := sleepCtx(ctx, wait); err != nil {
 					return resp, err
 				}
 			}
 		})
 	}
+}
+
+// Retry describes an attempt [WithRetry] is about to make, after the one
+// before it failed.
+type Retry struct {
+	// Attempt is the number of the attempt about to be made, from 2; Of is
+	// the policy's cap.
+	Attempt, Of int
+	// Wait is how long the middleware sleeps first.
+	Wait time.Duration
+	// Err is why the previous attempt failed.
+	Err error
+}
+
+type retryObserverKey struct{}
+
+// WithRetryObserver attaches fn to ctx; [WithRetry] calls it before every
+// retry it makes under that context.
+//
+// A retry is otherwise invisible from outside the chain: a front end sees a
+// call that is simply slow — thirty seconds of nothing while a 529 backs off —
+// and a log line is not something a UI can render. The agent loop installs one
+// that turns each retry into an event on the run's stream. Per context and not
+// per middleware, because the chain is built once and shared by every run.
+func WithRetryObserver(ctx context.Context, fn func(Retry)) context.Context {
+	return context.WithValue(ctx, retryObserverKey{}, fn)
 }
 
 // sleepCtx waits for d, or returns the cause of the context ending first.

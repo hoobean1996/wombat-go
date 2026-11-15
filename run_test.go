@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -205,6 +206,180 @@ func TestRunTerminalBeatsPause(t *testing.T) {
 	}
 	if _, ok := out.(Submitted); !ok {
 		t.Fatalf("Outcome = %T, want Submitted", out)
+	}
+}
+
+// ===== pause and terminal calls go through the dispatch chain =====
+
+// gateCounter is dispatch middleware that counts the calls it sees and, when
+// refuse is set, refuses every one of them the way a permission gate would.
+func gateCounter(n *atomic.Int64, refuse bool) tool.Middleware {
+	return func(next tool.Handler) tool.Handler {
+		return func(ctx context.Context, d tool.Def, use llm.ToolUse) (string, error) {
+			n.Add(1)
+			if refuse {
+				return "", fmt.Errorf("%s is refused by policy", d.Name)
+			}
+			return next(ctx, d, use)
+		}
+	}
+}
+
+// resultFor finds the tool_result answering id in a transcript.
+func resultFor(msgs []llm.Message, id llm.ToolUseID) (llm.ToolResult, bool) {
+	for _, m := range msgs {
+		for _, b := range m.Content {
+			if tr, ok := b.(llm.ToolResult); ok && tr.ToolUseID == id {
+				return tr, true
+			}
+		}
+	}
+	return llm.ToolResult{}, false
+}
+
+// TestControlCallsAreDecidedByTheDispatchChain is a regression test.
+//
+// A call to a pause or terminal tool used to end or suspend the run before
+// dispatch, which put it beyond every middleware: a permission policy that
+// refused it, or a skill gate that had not unlocked it, was never consulted,
+// and the call produced no ToolStart/ToolDone, no metric and no budget charge.
+// It is now dispatched for a verdict like any other call, with its handler
+// swapped out so that it still never runs.
+func TestControlCallsAreDecidedByTheDispatchChain(t *testing.T) {
+	cases := []struct {
+		name  string
+		def   tool.Def
+		input string
+		want  func(Outcome) bool
+	}{
+		{"pause", pauseTool("ask_user"), `{"question":"which env?"}`,
+			func(o Outcome) bool { _, ok := o.(Paused); return ok }},
+		{"terminal", terminalTool("submit"), `{"summary":"done"}`,
+			func(o Outcome) bool { _, ok := o.(Submitted); return ok }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name+" refused by middleware does not stop the run", func(t *testing.T) {
+			var seen atomic.Int64
+			cl := scripted(toolTurn("c1", tc.def.Name, tc.input), textTurn("carried on"))
+			a := newAgent(t, cl, []tool.Def{tc.def}, WithToolMiddleware(gateCounter(&seen, true)))
+
+			run := a.Start(context.Background(), Ask("go"))
+			kinds, evs := drain(t, run)
+			_ = run.Close()
+			if err := run.Err(); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if ans, ok := run.Outcome().(Answer); !ok || ans.Text != "carried on" {
+				t.Fatalf("Outcome = %#v, want the run to carry on to an Answer — the refused %s call "+
+					"ended it anyway", run.Outcome(), tc.name)
+			}
+			if got := seen.Load(); got != 1 {
+				t.Errorf("middleware saw %d calls, want 1 — the call bypassed the dispatch chain", got)
+			}
+			if !contains(kinds, "tool_start") || !contains(kinds, "tool_done") {
+				t.Errorf("events = %v, want the refused call to be observed like any other", kinds)
+			}
+			for _, ev := range evs {
+				if d, ok := ev.(ToolDone); ok && d.OK {
+					t.Errorf("ToolDone for %s reports OK, want the refusal", d.Name)
+				}
+			}
+			tr, ok := resultFor(cl.request(t, 1).Messages, "c1")
+			if !ok || !tr.IsError || !strings.Contains(tr.Content, "refused by policy") {
+				t.Errorf("tool_result for the refused call = %+v (found %v), want the refusal as an error", tr, ok)
+			}
+		})
+
+		t.Run(tc.name+" allowed still stops the run without running the handler", func(t *testing.T) {
+			var seen atomic.Int64
+			cl := scripted(toolTurn("c1", tc.def.Name, tc.input))
+			a := newAgent(t, cl, []tool.Def{tc.def}, WithToolMiddleware(gateCounter(&seen, false)))
+
+			ctx, cancel := governor.WithBudget(context.Background(), governor.Limits{ToolCalls: 100})
+			defer cancel()
+			run := a.Start(ctx, Ask("go"))
+			kinds, evs := drain(t, run)
+			_ = run.Close()
+			if err := run.Err(); err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			// The fixture's handler returns an error if it is ever invoked, so a
+			// run that stopped proves the handler was not reached.
+			if !tc.want(run.Outcome()) {
+				t.Fatalf("Outcome = %#v, want the %s outcome", run.Outcome(), tc.name)
+			}
+			if got := seen.Load(); got != 1 {
+				t.Errorf("middleware saw %d calls, want 1", got)
+			}
+			if !contains(kinds, "tool_start") || !contains(kinds, "tool_done") {
+				t.Errorf("events = %v, want ToolStart and ToolDone for the %s call", kinds, tc.name)
+			}
+			for _, ev := range evs {
+				if d, ok := ev.(ToolDone); ok && !d.OK {
+					t.Errorf("ToolDone = %+v, want OK", d)
+				}
+			}
+			if got := run.Progress().ToolCalls; got != 1 {
+				t.Errorf("budget ToolCalls = %d, want 1 — the call was not charged", got)
+			}
+			if got := cl.calls(); got != 1 {
+				t.Errorf("llm calls = %d, want 1", got)
+			}
+		})
+	}
+}
+
+// When the terminal call is refused, a pause in the same turn is still
+// considered, and its siblings are still left undispatched.
+func TestRefusedTerminalFallsBackToAnAllowedPause(t *testing.T) {
+	var ran atomic.Int64
+	sibling := echoTool("calc", "14")
+	sibling.Fn = func(context.Context, json.RawMessage) (string, error) { ran.Add(1); return "14", nil }
+
+	denySubmit := func(next tool.Handler) tool.Handler {
+		return func(ctx context.Context, d tool.Def, use llm.ToolUse) (string, error) {
+			if d.Name == "submit" {
+				return "", errors.New("not yet")
+			}
+			return next(ctx, d, use)
+		}
+	}
+	cl := scripted(llm.Response{
+		Content: []llm.ContentBlock{
+			llm.ToolUse{ID: "s", Name: "submit", Input: json.RawMessage(`{}`)},
+			llm.ToolUse{ID: "c", Name: "calc", Input: json.RawMessage(`{}`)},
+			llm.ToolUse{ID: "p", Name: "ask_user", Input: json.RawMessage(`{"question":"?"}`)},
+		},
+		StopReason: llm.StopToolUse,
+	})
+	a := newAgent(t, cl, []tool.Def{terminalTool("submit"), sibling, pauseTool("ask_user")},
+		WithToolMiddleware(denySubmit))
+
+	out, err := a.Run(context.Background(), Ask("go"))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if p, ok := out.(Paused); !ok || p.ToolUseID != "p" {
+		t.Fatalf("Outcome = %#v, want Paused on p", out)
+	}
+	if ran.Load() != 0 {
+		t.Error("a sibling of the pause was dispatched; a paused turn runs nothing else")
+	}
+}
+
+// A dispatcher supplied with WithDispatcher gives the same verdict, because the
+// handler is swapped in the set every dispatcher resolves calls through.
+func TestControlVerdictWorksWithACustomDispatcher(t *testing.T) {
+	cl := scripted(toolTurn("c1", "ask_user", `{"question":"?"}`))
+	a := newAgent(t, cl, []tool.Def{pauseTool("ask_user")},
+		WithDispatcher(tool.NewDispatcher(tool.Chain(tool.Direct, tool.WithRecovery))))
+
+	out, err := a.Run(context.Background(), Ask("go"))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if _, ok := out.(Paused); !ok {
+		t.Fatalf("Outcome = %#v, want Paused — the custom chain reached the real handler", out)
 	}
 }
 
@@ -514,6 +689,65 @@ func TestLoopPanicIsContained(t *testing.T) {
 	// The operator, unlike the model, does need the stack.
 	if !strings.Contains(err.Error(), "goroutine") {
 		t.Errorf("error = %q, want it to carry a stack for the operator", err)
+	}
+}
+
+// orphaningStrategy drops every assistant turn, which leaves the tool_results
+// after it pointing at calls that are no longer there.
+type orphaningStrategy struct{}
+
+func (orphaningStrategy) Apply(v View) []llm.Message {
+	var out []llm.Message
+	for _, m := range v.Messages {
+		if m.Role == llm.RoleUser {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+func (orphaningStrategy) String() string { return "orphaning" }
+
+// A strategy that breaks its contract is reported as what it is, before any
+// request is sent, rather than as a provider 400 that names nothing.
+func TestAStrategyThatBreaksTheTranscriptIsCaughtBeforeTheCall(t *testing.T) {
+	cl := scripted(textTurn("never reached"))
+	a := newAgent(t, cl, nil, WithStrategy(orphaningStrategy{}))
+
+	_, err := a.Run(context.Background(), Continue([]llm.Message{
+		userMsg("go"),
+		assistantUse("u1", "calc"),
+		userResult("u1", "14"),
+	}))
+	if !errors.Is(err, ErrNotAlternating) && !errors.Is(err, ErrOrphanResult) {
+		t.Fatalf("error = %v, want the validation failure", err)
+	}
+	if !strings.Contains(err.Error(), "orphaning") {
+		t.Errorf("error = %q, want it to name the strategy", err)
+	}
+	if cl.calls() != 0 {
+		t.Errorf("llm calls = %d, want 0 — an unsendable transcript was sent", cl.calls())
+	}
+}
+
+// A model that reuses a tool_use id across turns — some OpenAI-compatible
+// gateways number their calls call_0, call_1 per response — leaves a stored
+// transcript that Validate rejects. That is the model's doing and not the
+// strategy's, and the loop has always left it to the provider to accept or
+// refuse; checking strategies must not change that.
+func TestAReusedToolUseIDIsNotBlamedOnTheStrategy(t *testing.T) {
+	cl := scripted(
+		toolTurn("call_0", "echo", `{}`),
+		toolTurn("call_0", "echo", `{}`),
+		textTurn("done"),
+	)
+	a := newAgent(t, cl, []tool.Def{echoTool("echo", "ok")})
+
+	out, err := a.Run(context.Background(), Ask("go"))
+	if err != nil {
+		t.Fatalf("Run: %v — the run was stopped for an id the model reused", err)
+	}
+	if ans, ok := out.(Answer); !ok || ans.Text != "done" {
+		t.Errorf("Outcome = %#v, want the answer", out)
 	}
 }
 
@@ -917,6 +1151,72 @@ func TestRunProgressWithNoBudgetIsZero(t *testing.T) {
 
 	if p := run.Progress(); p.Calls != 0 || p.CostUSD != 0 {
 		t.Errorf("Progress = %+v, want the zero value with no budget on ctx", p)
+	}
+}
+
+// TestRunsWithoutABudgetKeepSeparateTallies is a regression test.
+//
+// With no budget on the context, governor.FromContext used to hand back one
+// process-wide budget, and everything ungoverned charged it: TrackCost, the
+// loop's step counter, the delegate tools' depth accounting. Each run's
+// Progress and Spend events therefore reported the running total of every
+// ungoverned run in the process — the third run of an agent claimed three
+// calls for its one. Every run now gets a tally of its own.
+func TestRunsWithoutABudgetKeepSeparateTallies(t *testing.T) {
+	reply := llm.Response{
+		Content:    []llm.ContentBlock{llm.Text{Text: "hi"}},
+		StopReason: llm.StopEndTurn,
+		Usage:      llm.Usage{InputTokens: 100, OutputTokens: 10},
+	}
+	for i := range 3 {
+		a := newAgent(t, llm.Chain(scripted(reply), TrackCost(llm.DefaultPricing)), nil)
+		run := a.Start(context.Background(), Ask("hi"))
+		_, evs := drain(t, run)
+		_ = run.Close()
+
+		p := run.Progress()
+		if p.Calls != 1 || p.Steps != 1 || p.Tokens.In != 100 {
+			t.Errorf("run %d: Progress = calls %d, steps %d, input tokens %d; want 1, 1, 100 — "+
+				"the tally includes other runs", i, p.Calls, p.Steps, p.Tokens.In)
+		}
+		for _, ev := range evs {
+			if s, ok := ev.(Spend); ok && s.Calls != 1 {
+				t.Errorf("run %d: Spend.Calls = %d, want 1", i, s.Calls)
+			}
+		}
+	}
+}
+
+// Without a budget on the context, a sub-agent must still charge its parent's
+// tally: the per-run budget is created once, by the outermost run, and
+// inherited like any other.
+func TestSubagentChargesTheParentRunsTally(t *testing.T) {
+	reply := func(s string) llm.Response {
+		return llm.Response{
+			Content:    []llm.ContentBlock{llm.Text{Text: s}},
+			StopReason: llm.StopEndTurn,
+			Usage:      llm.Usage{InputTokens: 100, OutputTokens: 10},
+		}
+	}
+	child := newAgent(t, llm.Chain(scripted(reply("child answer")), TrackCost(llm.DefaultPricing)), nil,
+		WithName("kid"))
+	parentCl := llm.Chain(scripted(
+		toolTurn("d1", "delegate", `{"task":"do a thing"}`),
+		reply("done"),
+	), TrackCost(llm.DefaultPricing))
+	parent := newAgent(t, parentCl, []tool.Def{DelegateTool(child)})
+
+	run := parent.Start(context.Background(), Ask("go"))
+	drain(t, run)
+	_ = run.Close()
+	if err := run.Err(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := run.Progress().Calls; got != 3 {
+		t.Errorf("parent Progress.Calls = %d, want 3 (two of its own and the child's one)", got)
+	}
+	if got := run.Progress().Depth; got != 0 {
+		t.Errorf("Depth after the delegation = %d, want 0 — the nesting level did not unwind", got)
 	}
 }
 

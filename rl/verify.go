@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/hoobean1996/wombat-go/internal/safeenv"
 )
 
 // DefaultShellTimeout caps a [Shell] verifier that would otherwise hang.
@@ -40,8 +42,12 @@ type Verifier func(ctx context.Context, ep *Episode) (name string, score float64
 //
 //	rl.Shell("test", "go test ./... 2>&1", 1.0)
 //
-// The command inherits the process environment with the workspace as its
-// working directory, and is capped at [DefaultShellTimeout]. A non-zero exit
+// The command runs with the workspace as its working directory and the same
+// filtered environment the agent's own commands get — the process basics, the
+// toolchains' settings, and none of the harness's credentials, since what it
+// runs is code the agent wrote. It is capped at [DefaultShellTimeout]. A
+// verifier that needs a variable the filter drops is a [Verifier] func of its
+// own, which can set its command's environment however it likes. A non-zero exit
 // logs the command's combined output at warn level, truncated to
 // [VerifierOutputLimit] — the breakdown can only hold a number, and "test: 0"
 // on its own is a result nobody can act on. The workspace is kept when the
@@ -59,6 +65,9 @@ func Shell(name, cmd string, weight float64) Verifier {
 
 		c := exec.CommandContext(ctx, "/bin/sh", "-c", cmd)
 		c.Dir = ep.Task.Workspace
+		// The command runs what the agent wrote, so it gets the filtered
+		// environment the agent's own commands get, not the harness's keys.
+		c.Env = safeenv.Environ()
 		out, err := c.CombinedOutput()
 		if err == nil {
 			return name, weight

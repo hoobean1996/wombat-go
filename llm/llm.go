@@ -16,6 +16,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // ToolUseID identifies one tool invocation. It is minted by the provider and
@@ -74,6 +75,12 @@ type Usage struct {
 	CacheReadTokens  int `json:"cache_read_input_tokens,omitempty"`
 }
 
+// PromptTokens is the size of the request the provider read: input tokens
+// charged in full, plus those served from or written to the prompt cache. Both
+// providers report it in these three parts; OpenAI's prompt_tokens, which
+// counts cached tokens inside itself, is normalised to the same shape.
+func (u Usage) PromptTokens() int { return u.InputTokens + u.CacheReadTokens + u.CacheWriteTokens }
+
 // Add accumulates u2 into u.
 func (u *Usage) Add(u2 Usage) {
 	u.InputTokens += u2.InputTokens
@@ -87,7 +94,7 @@ func (u *Usage) Add(u2 Usage) {
 // ContentBlock is one piece of a message. The set is closed: the unexported
 // method means only this package can add variants.
 //
-//	Text | ToolUse | ToolResult | Thinking
+//	Text | ToolUse | ToolResult | Thinking | Media
 type ContentBlock interface {
 	blockKind() string
 }
@@ -105,10 +112,17 @@ type ToolUse struct {
 }
 
 // ToolResult answers a ToolUse. It always rides in a RoleUser message.
+//
+// Media carries what a tool returned that is not text — a screenshot, a page
+// of a PDF — alongside Content, which stays the text the model reads first.
+// A provider that can put media inside a tool result does; one that cannot
+// delivers it in a user message right after the results, labelled with the
+// call it belongs to.
 type ToolResult struct {
 	ToolUseID ToolUseID
 	Content   string
 	IsError   bool
+	Media     []Media
 }
 
 // Thinking is an extended-thinking block. Carried through verbatim: the
@@ -118,10 +132,38 @@ type Thinking struct {
 	Signature string
 }
 
+// Media is binary content the model reads: an image or a PDF document.
+//
+// It belongs in user turns — the user attaching a screenshot — and in
+// [ToolResult.Media]; the model never sends media back, and
+// wombat.Convo.Validate rejects it anywhere else. Data is the raw bytes; the
+// providers base64-encode them on the wire, and the JSON form of a [Message]
+// does too.
+//
+// Not every model reads media, and one that does not answers a request
+// carrying it with a 400. Nothing here can tell which kind a model is, so
+// offering a tool that returns media is the caller's decision.
+type Media struct {
+	// MediaType is the IANA type: image/png, image/jpeg, image/gif,
+	// image/webp, or application/pdf.
+	MediaType string `json:"media_type"`
+	Data      []byte `json:"data"`
+	// Name is a file name or a title, for a provider that shows one and for
+	// a person reading the transcript. Optional.
+	Name string `json:"name,omitempty"`
+}
+
+// IsImage reports whether m is a picture rather than a document.
+func (m Media) IsImage() bool { return strings.HasPrefix(m.MediaType, "image/") }
+
+// MediaTypes are the media types both providers accept.
+var MediaTypes = []string{"image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"}
+
 func (Text) blockKind() string       { return "text" }
 func (ToolUse) blockKind() string    { return "tool_use" }
 func (ToolResult) blockKind() string { return "tool_result" }
 func (Thinking) blockKind() string   { return "thinking" }
+func (Media) blockKind() string      { return "media" }
 
 // Message is one conversational turn.
 type Message struct {
@@ -179,6 +221,11 @@ type blockEnvelope struct {
 	Content   string          `json:"content,omitempty"`
 	IsError   bool            `json:"is_error,omitempty"`
 	Signature string          `json:"signature,omitempty"`
+
+	// A media block's fields, and a tool result's attached media.
+	MediaType string  `json:"media_type,omitempty"`
+	Data      []byte  `json:"data,omitempty"`
+	Media     []Media `json:"media,omitempty"`
 }
 
 // MarshalJSON implements json.Marshaler for Message.
@@ -193,8 +240,11 @@ func (m Message) MarshalJSON() ([]byte, error) {
 			e.ID, e.Name, e.Input = v.ID, v.Name, v.Input
 		case ToolResult:
 			e.ToolUseID, e.Content, e.IsError = v.ToolUseID, v.Content, v.IsError
+			e.Media = v.Media
 		case Thinking:
 			e.Text, e.Signature = v.Text, v.Signature
+		case Media:
+			e.MediaType, e.Data, e.Name = v.MediaType, v.Data, v.Name
 		default:
 			return nil, fmt.Errorf("llm: unknown content block %T", b)
 		}
@@ -242,9 +292,12 @@ func (m *Message) UnmarshalJSON(b []byte) error {
 		case "tool_use":
 			m.Content = append(m.Content, ToolUse{ID: e.ID, Name: e.Name, Input: e.Input})
 		case "tool_result":
-			m.Content = append(m.Content, ToolResult{ToolUseID: e.ToolUseID, Content: e.Content, IsError: e.IsError})
+			m.Content = append(m.Content, ToolResult{ToolUseID: e.ToolUseID, Content: e.Content, IsError: e.IsError,
+				Media: e.Media})
 		case "thinking":
 			m.Content = append(m.Content, Thinking{Text: e.Text, Signature: e.Signature})
+		case "media":
+			m.Content = append(m.Content, Media{MediaType: e.MediaType, Data: e.Data, Name: e.Name})
 		default:
 			return fmt.Errorf("llm: unknown content block type %q", e.Type)
 		}

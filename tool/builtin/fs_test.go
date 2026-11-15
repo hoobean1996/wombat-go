@@ -147,6 +147,27 @@ func TestOSFSRootContainment(t *testing.T) {
 			t.Errorf("err = %v, want nil: %q should clean to the root", err, root+"/sub/..")
 		}
 	})
+
+	// A regression test. The containment check was root+"/" as a prefix, which
+	// for a root of "/" is "//" — so OSFS("/") refused every path but "/"
+	// itself, reporting /etc/hosts as outside "/".
+	t.Run("a root of / contains every absolute path", func(t *testing.T) {
+		slash := OSFS(string(filepath.Separator))
+		target := filepath.Join(root, "sub", "in.txt")
+		got, err := slash.ReadFile(ctx, target)
+		if err != nil {
+			t.Fatalf("OSFS(/).ReadFile(%s) = %v, want the file", target, err)
+		}
+		if string(got) != "inside" {
+			t.Errorf("ReadFile = %q, want %q", got, "inside")
+		}
+		if k, err := slash.Stat(ctx, root); err != nil || k != KindDir {
+			t.Errorf("OSFS(/).Stat(%s) = %v, %v; want dir, nil", root, k, err)
+		}
+		if err := slash.WriteFile(ctx, filepath.Join(root, "new.txt"), []byte("x")); err != nil {
+			t.Errorf("OSFS(/).WriteFile = %v, want nil", err)
+		}
+	})
 }
 
 // ===== atomic write =====

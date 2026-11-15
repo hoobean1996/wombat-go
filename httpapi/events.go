@@ -55,6 +55,18 @@ type TurnEnded struct {
 
 	// Spend is what THIS turn cost.
 	Spend Spend `json:"spend"`
+
+	// Undelivered is what was sent with POST .../steer during this turn and
+	// never reached the model, because the turn ended first.
+	Undelivered []string `json:"undelivered,omitempty"`
+}
+
+// SteerSent echoes a message sent to the turn in progress, the way
+// TurnStarted echoes a prompt. The run reports when it delivers it, with a
+// wombat.Steered event.
+type SteerSent struct {
+	Turn   int    `json:"turn"`
+	Prompt string `json:"prompt"`
 }
 
 // Kind implements [wombat.Event].
@@ -62,6 +74,15 @@ func (TurnStarted) Kind() string { return "turn_started" }
 
 // Kind implements [wombat.Event].
 func (TurnEnded) Kind() string { return "turn_ended" }
+
+// Kind implements [wombat.Event].
+func (SteerSent) Kind() string { return "steer_sent" }
+
+// MarshalJSON implements [json.Marshaler].
+func (e SteerSent) MarshalJSON() ([]byte, error) {
+	type r SteerSent
+	return eventJSON(e.Kind(), r(e))
+}
 
 // MarshalJSON implements [json.Marshaler].
 func (e TurnStarted) MarshalJSON() ([]byte, error) {
@@ -83,7 +104,7 @@ func (e TurnEnded) MarshalJSON() ([]byte, error) {
 // registry alongside the others, or these two frames reach the front end as
 // types tsc has never heard of.
 func EventTypes() []wombat.Event {
-	return []wombat.Event{TurnStarted{}, TurnEnded{}}
+	return []wombat.Event{TurnStarted{}, TurnEnded{}, SteerSent{}}
 }
 
 // eventJSON marshals v as an object with "type" spliced in as the first key.
