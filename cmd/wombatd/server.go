@@ -16,6 +16,7 @@ import (
 
 	"wombat/pkg/core"
 	"wombat/pkg/httpapi"
+	"wombat/ui"
 )
 
 // shutdownGrace is how long an in-flight request has to finish once a signal
@@ -41,7 +42,28 @@ func handlerOptions(cfg config, f *factory, probe *core.Agent, logger *slog.Logg
 	if len(cfg.Server.CORS) > 0 {
 		opts = append(opts, httpapi.WithCORS(cfg.Server.CORS...))
 	}
+	// The web UI is the same port, at /. Built or not, it is mounted: a binary
+	// without it answers / with a page saying how to build it, rather than 404.
+	opts = append(opts, httpapi.WithUI(ui.FS()))
+	if ui.Built() {
+		logger.Info("web UI", "url", "http://"+browsable(cfg.Server.Addr)+"/")
+	} else {
+		logger.Info("web UI not built into this binary: run make ui, then make bin")
+	}
 	return append(opts, access(cfg.Server.Addr, cfg.Server.Token, logger)...)
+}
+
+// browsable is addr as a browser on this machine would open it: ":8080" and
+// "0.0.0.0:8080" listen on every interface, and localhost is one of them.
+func browsable(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "localhost"
+	}
+	return net.JoinHostPort(host, port)
 }
 
 // access decides who may call. The token, when there is one, from anywhere;

@@ -1,0 +1,32 @@
+:root {
+  --tsubaki: #9a6440; /* the brand colour; the name is from the UI this was forked from */
+  --tsubaki-soft: #f5ece5;
+  --sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", "Microsoft YaHei", "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+
+  --a-text: #1f1f23;
+  --a-muted: #6b6b76;
+  --a-faint: #9b9ba5;
+  --a-line: #ececea;
+  --a-side: #f9f9f8;
+  --a-hover: #f2f2f0;
+  --ok: #22a559;
+  --warn: #e08a12;
+  --off: #c4c4cc;
+
+  color-scheme: light;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; }
+body { margin: 0; background: #fff; color: var(--a-text); font: 14px/1.6 var(--sans); }
+a { color: inherit; }
+input, textarea, select, button { font: inherit; }
+
+.sw { width: 32px; height: 18px; border-radius: 999px; background: #d6d3cc; position: relative; transition: background .2s; flex: none; display: inline-block; cursor: pointer; border: 0; padding: 0; }
+.sw::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0, 0, 0, .2); transition: transform .2s; }
+.sw.on { background: var(--ok); }
+.sw.on::after { transform: translateX(14px); }
+.sw:disabled { opacity: .6; cursor: not-allowed; }

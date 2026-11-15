@@ -35,8 +35,40 @@ bin:
 	$(GO) build -o $(BIN)/ ./cmd/...
 
 .PHONY: serve
-serve: bin ## the agent, configured by $(CONFIG): make serve CONFIG=other.yaml
+serve: ui-auto bin ## the agent and its web UI, configured by $(CONFIG): make serve CONFIG=other.yaml
 	$(BIN)/wombatd -config $(CONFIG)
+
+# ── the web UI ─────────────────────────────────────────────────────────
+#
+# ui/ is a Vite + React app. Its build, ui/dist, is embedded into wombatd
+# (ui/embed.go) and served at / on the API's port, so `make ui` has to run
+# before `make bin` for the binary to carry it. A wombatd built without it
+# serves a page saying so; the API is unaffected.
+
+NPM     ?= npm
+UI_DEPS := ui/node_modules/.package-lock.json
+
+$(UI_DEPS): ui/package.json ui/package-lock.json
+	cd ui && $(NPM) ci --no-audit --no-fund
+	@touch $@
+
+.PHONY: ui
+ui: $(UI_DEPS) ## build the web UI into ui/dist, for wombatd to embed (needs npm)
+	cd ui && $(NPM) run build
+
+# serve builds the UI when it can, and carries on without it when it cannot.
+.PHONY: ui-auto
+ui-auto:
+	@if command -v $(NPM) >/dev/null 2>&1; then $(MAKE) --no-print-directory ui; \
+	else echo "npm not found: building wombatd without its web UI (the API works the same)"; fi
+
+.PHONY: ui-dev
+ui-dev: $(UI_DEPS) ## the UI with hot reload on :5173, against a wombatd on :8080 (WOMBATD_URL=...)
+	cd ui && $(NPM) run dev
+
+.PHONY: ui-check
+ui-check: $(UI_DEPS) ## typecheck and lint the UI
+	cd ui && npx tsc -b && npx oxlint src
 
 # ── Postgres, in podman ─────────────────────────────────────────────────
 #

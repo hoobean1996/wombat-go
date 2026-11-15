@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"mime"
 	"net"
@@ -121,6 +122,7 @@ type apiConfig struct {
 	caps    Capabilities
 	token   string
 	hosts   []string
+	ui      fs.FS
 }
 
 // WithBearerToken requires token on every request to the API and to
@@ -188,6 +190,16 @@ func WithCORS(origins ...string) Option {
 // process in a deployment already answers. Typically metric.Registry.Handler.
 func WithMetrics(h http.Handler) Option {
 	return func(c *apiConfig) { c.metrics = h }
+}
+
+// WithUI serves a browser front end from fsys at every path outside /api/ and
+// /metrics. See [uiHandler] for what it serves where.
+//
+// The UI's files are served without the bearer token — they are the same for
+// everyone and hold no data — and the page asks for the token before it calls
+// the API. [WithAllowedHosts] still applies to them.
+func WithUI(fsys fs.FS) Option {
+	return func(c *apiConfig) { c.ui = fsys }
 }
 
 // WithVersion sets the build identifier reported by GET /api/health and GET
@@ -378,7 +390,11 @@ func New(m *daemon.Manager, opts ...Option) http.Handler {
 	if a.cfg.metrics != nil {
 		mux.Handle("GET /metrics", a.cfg.metrics)
 	}
-	mux.HandleFunc("/", a.notFound)
+	if a.cfg.ui != nil {
+		mux.Handle("/", a.uiHandler(a.cfg.ui))
+	} else {
+		mux.HandleFunc("/", a.notFound)
+	}
 
 	// Outermost last: a misdirected request is refused before anything,
 	// a preflight is answered before the token is asked for.

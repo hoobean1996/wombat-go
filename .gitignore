@@ -9,3 +9,9 @@
 /wombatd.yaml
 /eval/benchmarks/runs/
 /todos.db
+
+# The web UI: dependencies, and its build, which wombatd embeds. dist/.gitkeep
+# stays, so ui/embed.go compiles before anyone has run `make ui`.
+/ui/node_modules/
+/ui/dist/*
+!/ui/dist/.gitkeep

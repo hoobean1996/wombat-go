@@ -86,6 +86,7 @@ the model, a tool or the filesystem can each be swapped for a fake in a test.
 | **Always on** | Sessions run on events from a durable inbox, one turn at a time; timers wake them later; failed turns are tried again; what they say goes to an outbox, which a client polls or a webhook receives |
 | **Memory or Postgres** | One store interface, two implementations that pass the same conformance suite; a restart carries on where it stopped |
 | **HTTP API** | Sessions, a resumable SSE stream per session, the inbox, the outbox and timers, with bearer-token auth |
+| **Web UI** | A browser front end embedded in the `wombatd` binary and served at `/`: chat with streaming output and tool steps, approval cards, and pages for the inbox, the outbox and timers |
 | **Observability** | OpenTelemetry-shaped traces with an HTML viewer, Prometheus metrics, and record/replay tapes |
 | **Evaluation** | A benchmark suite of coding tasks with pass@k scoring and anti-cheat checks |
 
@@ -97,6 +98,7 @@ the model, a tool or the filesystem can each be swapped for a fake in a test.
 |---|---|
 | **Go** | 1.25.6 or newer |
 | **An LLM API** | An Anthropic API key, **or** any OpenAI-compatible endpoint. A local Ollama or vLLM server needs no key |
+| *Optional* | Node.js and npm, to build the web UI (`make ui`). Without them wombatd builds and serves the API as usual |
 | *Optional* | Postgres, for `store.driver: postgres` — or podman, for `make pg-up` |
 | *Optional* | `sandbox-exec` (built into macOS) or `bwrap` (Linux), for `tools.confine` |
 
@@ -151,13 +153,24 @@ others can read it.
 **2. Start it**
 
 ```bash
-make serve        # builds bin/wombatd and runs it with wombatd.yaml
+make serve        # builds the web UI (if npm is installed) and bin/wombatd, then runs it with wombatd.yaml
 ```
 
 It listens on `127.0.0.1:8080` and keeps everything in memory. To keep
 sessions across restarts, see [Always on](#en-always).
 
-**3. Ask the agent something, and watch it work**
+**3. Open the web UI**
+
+Open **http://127.0.0.1:8080/** (wombatd logs the URL as `web UI`). Describe a
+task and watch it run: the reply streams in, each tool call shows up as it
+happens, and a call the policy wants you to approve appears as a card with
+**Allow** and **Deny**. The sidebar has every session, and pages for the
+[inbox, the outbox and timers](#en-always). If `server.token` is set, the page
+asks for it once. More in [ui/README.md](ui/README.md).
+
+Prefer the terminal, or writing a client? The same, over the HTTP API:
+
+**4. Ask the agent something, and watch it work**
 
 ```bash
 curl -s localhost:8080/api/sessions -H 'Content-Type: application/json' \
@@ -175,7 +188,7 @@ curl -s localhost:8080/api/sessions/<id>/approvals/<use_id> \
      -H 'Content-Type: application/json' -d '{"allow": true}'       # the turn carries on
 ```
 
-**4. Keep the conversation going, and read what it says**
+**5. Keep the conversation going, and read what it says**
 
 ```bash
 curl -s localhost:8080/api/sessions/<id>/messages \
@@ -547,8 +560,11 @@ into `bin/`.
 |---|---|
 | `make` | gofmt check, `go vet`, `go build` (the default target) |
 | `make test` | `go test -race ./...` |
-| `make bin` | Builds `bin/wombatd` |
-| `make serve` | Builds and runs wombatd with `wombatd.yaml`; `CONFIG=other.yaml` picks another file |
+| `make bin` | Builds `bin/wombatd`, embedding the web UI if `make ui` has built it |
+| `make serve` | Builds the web UI (when npm is installed) and wombatd, and runs it with `wombatd.yaml`; `CONFIG=other.yaml` picks another file |
+| `make ui` | Builds the web UI into `ui/dist`, for `make bin` to embed (needs npm) |
+| `make ui-dev` | The web UI with hot reload on `:5173`, against a wombatd on `:8080` (`WOMBATD_URL=...` for another) |
+| `make ui-check` | Typechecks and lints the web UI |
 | `make pg-up` / `make pg-down` | Starts / removes a Postgres in podman, on port 55432 |
 | `make test-pg` | The Postgres store's tests against it, a daemon restart among them |
 | `make bench` | Runs the benchmarks, for example `make bench N=8 C=4 TASKS=todo-app,fix-bug` |
@@ -789,8 +805,9 @@ pkg/core/review/      adversarial code review that reports defects as failing te
 pkg/daemon/           always on: sessions, the inbox, timers, deferred decisions, the outbox
 pkg/daemon/storetest/ what a store has to do, as tests both stores pass
 pkg/store/postgres/   the sessions and the three tables in Postgres
-pkg/httpapi/          the daemon over HTTP: events in, SSE and the outbox out
+pkg/httpapi/          the daemon over HTTP: events in, SSE and the outbox out; serves the web UI
 cmd/wombatd/          the service; everything configured by wombatd.yaml
+ui/                   the web UI (React + Vite), embedded into wombatd by ui/embed.go
 eval/                 evaluation of the harness itself
 eval/rl/              episodes, verifiers, pass@k
 eval/benchmarks/      eight coding tasks, and the suite that runs them
@@ -807,11 +824,15 @@ docs/                 design notes
 make              # gofmt check + go vet + go build
 make test         # go test -race ./...
 make pg-up && make test-pg   # the Postgres store, against a real database
+make ui-check     # the web UI: tsc + oxlint
+make ui-dev       # the web UI with hot reload, against a running wombatd
 ```
 
 The test suite runs offline against scripted model clients and needs no API
 key; the Postgres tests skip unless they are given a database. The only
-module it downloads is `pgx`, for `pkg/store/postgres`.
+module it downloads is `pgx`, for `pkg/store/postgres`. The web UI's
+dependencies are npm packages under `ui/node_modules`, used only to build it;
+the binary carries the built files and needs none of them.
 
 <a id="en-faq"></a>
 
@@ -826,7 +847,9 @@ module it downloads is `pgx`, for `pkg/store/postgres`.
 | Not sure which model IDs your endpoint accepts | `make models` (reads `.env`) |
 | Token counts and cost stay at 0, so the budget never trips | Some gateways drop usage data when streaming. Set `model.stream: never`. Also check that the model is priced in `pkg/core/llm/pricing.go` |
 | HTTP 400 with `tools.media: true` | The model does not accept images. Turn `tools.media` off |
-| A session sits in `approving` | It is waiting for a decision: `GET /api/sessions/{id}/approvals`, then POST one. It takes nothing else until then |
+| A session sits in `approving` | It is waiting for a decision: answer the card in the web UI, or `GET /api/sessions/{id}/approvals` and POST one. It takes nothing else until then |
+| `/` says "built without its web UI" | Run `make ui`, then `make bin` (or just `make serve`). The UI needs npm to build; the binary does not |
+| The web UI asks for a token | `server.token` is set in `wombatd.yaml`; enter it once, it is kept in that browser |
 | `another daemon is running on this schema` | Another wombatd uses that Postgres schema. Stop it, or give this one its own with `?search_path=name` in `store.dsn` |
 | Messages pile up in the inbox | Look at `GET /api/inbox?session=…` and the log: a session waiting on a decision runs nothing else, and `daemon.max_runs` caps turns at once |
 
