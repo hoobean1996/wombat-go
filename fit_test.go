@@ -203,6 +203,29 @@ func TestTokenWindowNeedsAWindow(t *testing.T) {
 	}
 }
 
+// TestTokenStrategiesWorkInsideASequence: Sequence rebuilt the View for each
+// step from Messages and Results alone, so a token strategy inside one had no
+// window and no estimator, and did nothing.
+func TestTokenStrategiesWorkInsideASequence(t *testing.T) {
+	msgs := agentLoop(40, 4000)
+	estimated := 0
+	v := View{Messages: msgs, Window: 40_000, Tokens: func(m []llm.Message) int {
+		estimated++
+		return (*tokenEstimator)(nil).estimate(m)
+	}}
+	alone := TokenWindow(0.5, 0.25).Apply(v)
+	if reflect.DeepEqual(alone, msgs) {
+		t.Fatal("premise: TokenWindow alone did nothing")
+	}
+	estimated = 0
+	if got := Sequence(Flat, TokenWindow(0.5, 0.25)).Apply(v); !reflect.DeepEqual(got, alone) {
+		t.Error("TokenWindow inside a Sequence did not trim as it does alone")
+	}
+	if estimated == 0 {
+		t.Error("the View's estimator did not reach a strategy inside a Sequence")
+	}
+}
+
 // An elided result is an evicted one as far as a Reconciler is concerned.
 func TestElidedResultsAreNotPresentObservations(t *testing.T) {
 	msgs := elideResults(View{}, agentLoop(4, 10), 5)
@@ -425,7 +448,7 @@ func TestOverflowIsReportedAsAnEvent(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, ev := range evs {
-		if o, ok := ev.(ContextOverflow); ok && o.Level == 1 && o.MessagesAfter < o.MessagesBefore {
+		if o, ok := ev.(ContextOverflow); ok && o.Level == 1 && o.MessagesAfter < o.MessagesBefore && o.TokensAfter < o.TokensBefore {
 			return
 		}
 	}
@@ -443,4 +466,35 @@ func (o *overflowOnce) Complete(ctx context.Context, req llm.Request) (llm.Respo
 		return llm.Response{}, &llm.APIError{Class: llm.ErrContextWindow, Status: 400, Message: "prompt is too long"}
 	}
 	return o.next.Complete(ctx, req)
+}
+
+// TestEstimatorCalibratesOnWhatWasSent: with server-side clearing, the tokens
+// the provider read are fewer than were sent, and calibrating on them taught
+// the estimator that every message is smaller than it is.
+func TestEstimatorCalibratesOnWhatWasSent(t *testing.T) {
+	msgs := agentLoop(10, 4000)
+	var plain, cleared tokenEstimator
+	sent := (*tokenEstimator)(nil).estimate(msgs)
+	plain.observe(msgs, 0, sent)
+	cleared.observe(msgs, 0, llm.Usage{InputTokens: sent / 4, ClearedInputTokens: sent - sent/4}.RequestTokens())
+	if a, b := plain.estimate(msgs), cleared.estimate(msgs); a != b {
+		t.Errorf("estimate after a cleared request = %d, want %d: the server's clearing skewed the calibration", b, a)
+	}
+}
+
+// TestRunCalibratesOnTheRequestItSent pins the call site: the loop must hand
+// the estimator RequestTokens. A response that read one token of a request the
+// server mostly cleared would otherwise calibrate every estimate to nothing.
+func TestRunCalibratesOnTheRequestItSent(t *testing.T) {
+	resp := textTurn("ok")
+	resp.Usage = llm.Usage{InputTokens: 1, ClearedInputTokens: 100_000}
+	task := strings.Repeat("word ", 2000)
+	run := newAgent(t, scripted(resp), nil).Start(context.Background(), Ask(task))
+	drain(t, run)
+	if err := run.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if got := run.tokens.estimate([]llm.Message{llm.UserText(task)}); got < 1000 {
+		t.Errorf("estimate after a cleared request = %d tokens for a 10 KB message: calibrated on what the server read, not on what was sent", got)
+	}
 }

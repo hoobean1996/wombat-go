@@ -1,6 +1,7 @@
 package builtin
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"time"
 )
@@ -80,10 +82,14 @@ type Sandbox struct {
 	Network Network
 
 	// ReadCredentials, when false — the default — makes the paths in
-	// [CredentialPaths] under the home directory unreadable.
+	// [CredentialPaths] under the home directory unreadable, and closes the
+	// sockets through which a process acts with the user's authority instead
+	// of its own (see [SandboxRunner]). Setting it opens both: the command can
+	// then sign with the user's ssh agent, and also drive the tmux it runs in.
 	ReadCredentials bool
 
-	// DenyRead lists more paths commands may neither read nor write.
+	// DenyRead lists more paths commands may neither read nor write, nor
+	// connect to if they are sockets.
 	DenyRead []string
 
 	// CacheDir is where confined toolchains keep their caches. GOCACHE points
@@ -131,6 +137,21 @@ var CredentialPaths = []string{
 // directory, Sandbox.CacheDir and Sandbox.Writable; it reaches only as much of
 // the network as Sandbox.Network allows; and it cannot read the credential
 // paths. The environment is filtered exactly as [OSRunner] filters it.
+//
+// Nor can it connect to the sockets that act with the user's authority rather
+// than its own, in any network mode: key agents, which sign with every key
+// loaded into them; the terminal multiplexer, terminal, editor or window
+// manager the harness runs inside, each of which runs a command it is sent
+// outside any sandbox; the user's runtime directory and session bus, which
+// reach systemd's user instance; container daemons, which are root on the
+// machine. Leaving SSH_AUTH_SOCK out of the environment only hides the
+// path, and the shared temp directories — writable, so open to sockets — are
+// where agents and multiplexers keep theirs; it is the sandbox that makes
+// them unreachable. They are found from the variables that locate them and
+// the places the programs use by default, which makes this a list, as
+// incomplete as lists are: a socket somewhere else needs a DenyRead entry.
+// On Linux, mounts cannot hide an abstract socket — X11's, for one — and
+// only the network namespace NetFull gives up keeps those out.
 //
 // This is the boundary the rest of the package keeps pointing at. A rooted
 // [FS] confines the file tools and leaves bash alone; a permission policy
@@ -211,6 +232,7 @@ func probe(r osRunner) error {
 type sandboxPlan struct {
 	writable []string
 	denied   []string
+	sockets  []string // closed to connections, directories of them included
 	network  Network
 	env      envConfig
 }
@@ -274,7 +296,104 @@ func planSandbox(dir string, sb Sandbox, opts []RunnerOption) (sandboxPlan, erro
 	}
 	denied = append(denied, sb.DenyRead...)
 	p.denied = uniquePaths(denied)
+	if !sb.ReadCredentials {
+		p.sockets = uniquePaths(agentSockets())
+	}
 	return p, nil
+}
+
+// socketEnv names the variables whose value says where a socket that acts
+// with the user's authority listens. The child never sees them — see
+// safeenv — but the path is just as reachable without the variable.
+var socketEnv = []string{
+	// Key agents.
+	"SSH_AUTH_SOCK", "GPG_AGENT_INFO",
+	// What the harness may be running inside: each runs a command it is sent.
+	"TMUX", "KITTY_LISTEN_ON", "WEZTERM_UNIX_SOCKET", "ALACRITTY_SOCKET",
+	"NVIM", "NVIM_LISTEN_ADDRESS", "VSCODE_IPC_HOOK", "VSCODE_IPC_HOOK_CLI",
+	"SWAYSOCK", "I3SOCK",
+	// The session bus, and container daemons.
+	"DBUS_SESSION_BUS_ADDRESS", "DOCKER_HOST", "CONTAINER_HOST",
+}
+
+// agentSockets finds the sockets, and the directories of them, a confined
+// command must not connect to — the ones [SandboxRunner] describes. Where a
+// program keeps one directory per user, the whole directory is listed, so a
+// socket created in it later is covered too.
+func agentSockets() []string {
+	var out []string
+	for _, name := range socketEnv {
+		if p := socketPath(name, os.Getenv(name)); p != "" {
+			out = append(out, p)
+		}
+	}
+
+	uid := os.Getuid()
+	// The shared temp directories, where OpenSSH agents, tmux, zellij and
+	// the Emacs server put theirs: TMPDIR, or /tmp when it is unset.
+	for _, t := range uniquePaths([]string{"/tmp", os.TempDir(), os.Getenv("TMUX_TMPDIR")}) {
+		for _, n := range []string{fmt.Sprintf("tmux-%d", uid), fmt.Sprintf("zellij-%d", uid), fmt.Sprintf("emacs%d", uid)} {
+			out = append(out, filepath.Join(t, n))
+		}
+		agents, _ := filepath.Glob(filepath.Join(t, "ssh-*"))
+		out = append(out, agents...)
+	}
+	out = append(out, os.Getenv("SCREENDIR"), "/tmp/screens", "/var/run/screen", "/var/run/docker.sock")
+
+	switch runtime.GOOS {
+	case "darwin":
+		// launchd's per-session directories: the ssh agent's Listeners
+		// socket, XQuartz's display.
+		for _, g := range []string{"/private/tmp/com.apple.launchd.*", "/private/var/run/com.apple.launchd.*"} {
+			m, _ := filepath.Glob(g)
+			out = append(out, m...)
+		}
+	case "linux":
+		out = append(out, "/tmp/.X11-unix", "/run/screen", "/run/docker.sock",
+			"/run/containerd/containerd.sock", "/run/podman/podman.sock")
+		if os.Getenv("XDG_RUNTIME_DIR") == "" {
+			out = append(out, fmt.Sprintf("/run/user/%d", uid))
+		}
+	}
+	return append(out, os.Getenv("XDG_RUNTIME_DIR"))
+}
+
+// socketPath extracts the filesystem path from a socket address, spelled the
+// way the variable called name spells it. It returns "" for an address that
+// is not a path: an abstract socket, a TCP address, nothing at all.
+func socketPath(name, v string) string {
+	v = strings.TrimSpace(v)
+	switch name {
+	case "TMUX": // /tmp/tmux-501/default,1234,0
+		v, _, _ = strings.Cut(v, ",")
+	case "GPG_AGENT_INFO": // /home/u/.gnupg/S.gpg-agent:1234:1
+		for range 2 {
+			if i := strings.LastIndexByte(v, ':'); i >= 0 {
+				v = v[:i]
+			}
+		}
+	case "DBUS_SESSION_BUS_ADDRESS": // unix:path=/run/user/1000/bus,guid=…[;next]
+		first, _, _ := strings.Cut(v, ";")
+		v = ""
+		if kv, ok := strings.CutPrefix(first, "unix:"); ok {
+			for f := range strings.SplitSeq(kv, ",") {
+				if p, ok := strings.CutPrefix(f, "path="); ok {
+					v = p
+				}
+			}
+		}
+	default: // a path, unix:/path or unix:///path
+		if rest, ok := strings.CutPrefix(v, "unix:"); ok {
+			v = rest
+			if strings.HasPrefix(v, "///") {
+				v = v[2:]
+			}
+		}
+	}
+	if !filepath.IsAbs(v) {
+		return ""
+	}
+	return v
 }
 
 // realPath makes p absolute and resolves its symlinks, as far as they exist.
@@ -317,7 +436,9 @@ func uniquePaths(ps []string) []string {
 // Later rules override earlier ones, which is what the ordering relies on:
 // writes are denied everywhere and then allowed back under the writable
 // directories; credential paths are denied after that, so a credential inside
-// a writable directory is still out of reach.
+// a writable directory is still out of reach. The sockets come last, for the
+// same reason: an agent's socket under the shared /tmp is under a directory
+// whose sockets the network rules open.
 func seatbeltProfile(p sandboxPlan) string {
 	var b strings.Builder
 	b.WriteString("(version 1)\n(allow default)\n")
@@ -352,15 +473,16 @@ func seatbeltProfile(p sandboxPlan) string {
 		// Unix sockets under a writable directory are a test talking to
 		// itself. Others — the DNS resolver's, a container daemon's — are a
 		// way out, and stay closed.
-		b.WriteString("(allow network-bind network-inbound (local unix-socket")
 		for _, w := range p.writable {
-			fmt.Fprintf(&b, " (subpath %s)", sbString(w))
+			fmt.Fprintf(&b, "(allow network-bind network-inbound (local unix-socket (subpath %s)))\n", sbString(w))
+			fmt.Fprintf(&b, "(allow network-outbound (remote unix-socket (subpath %s)))\n", sbString(w))
 		}
-		b.WriteString("))\n(allow network-outbound (remote unix-socket")
-		for _, w := range p.writable {
-			fmt.Fprintf(&b, " (subpath %s)", sbString(w))
-		}
-		b.WriteString("))\n")
+	}
+
+	// In every network mode: a socket that acts for the user, and anything
+	// under a denied path — gpg-agent listens in ~/.gnupg.
+	for _, s := range append(slices.Clip(p.sockets), p.denied...) {
+		fmt.Fprintf(&b, "(deny network-outbound (remote unix-socket (subpath %s)))\n", sbString(s))
 	}
 	return b.String()
 }
@@ -374,10 +496,18 @@ func sbString(s string) string {
 // that precedes the command.
 //
 // The root is bound read-only and the writable directories are bound back
-// over it. A credential directory is hidden under an empty tmpfs and a
-// credential file under /dev/null; neither is mounted if it does not exist,
-// because bwrap cannot mount over nothing. Every network mode but NetFull gets
-// a namespace of its own, whose loopback belongs to the command alone.
+// over it. A credential or socket directory is hidden under an empty tmpfs,
+// and a credential file or a socket under /dev/null, which refuses a
+// connection; none is mounted if it does not exist, because bwrap cannot mount
+// over nothing. Every network mode but NetFull gets a namespace of its own,
+// whose loopback belongs to the command alone.
+//
+// A mount covers whatever was mounted at or under its path before it, so the
+// order is the semantics. Writable directories and sockets go shallowest
+// first, which makes the more specific of two nested paths win: an agent's
+// socket under the writable /tmp is hidden, a writable TMPDIR inside the
+// hidden runtime directory is bound back. Denied paths go last and win
+// outright, as they do in the macOS profile.
 func bwrapArgs(p sandboxPlan) []string {
 	args := []string{
 		"--die-with-parent",
@@ -390,20 +520,44 @@ func bwrapArgs(p sandboxPlan) []string {
 		args = append(args, "--unshare-net")
 	}
 	args = append(args, "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc")
+
+	type mount struct {
+		path string
+		hide bool
+	}
+	var ms []mount
 	for _, w := range p.writable {
-		if _, err := os.Stat(w); err == nil {
-			args = append(args, "--bind", w, w)
+		ms = append(ms, mount{w, false})
+	}
+	for _, s := range p.sockets {
+		ms = append(ms, mount{s, true}) // after the writable ones: at the same path, hiding wins
+	}
+	slices.SortStableFunc(ms, func(a, b mount) int { return cmp.Compare(pathDepth(a.path), pathDepth(b.path)) })
+	for _, m := range ms {
+		if m.hide {
+			args = append(args, hideArgs(m.path)...)
+		} else if _, err := os.Stat(m.path); err == nil {
+			args = append(args, "--bind", m.path, m.path)
 		}
 	}
 	for _, d := range p.denied {
-		fi, err := os.Stat(d)
-		switch {
-		case err != nil:
-		case fi.IsDir():
-			args = append(args, "--tmpfs", d)
-		default:
-			args = append(args, "--ro-bind", "/dev/null", d)
-		}
+		args = append(args, hideArgs(d)...)
 	}
 	return args
 }
+
+// hideArgs mounts over path: an empty tmpfs on a directory, /dev/null on
+// anything else. Nothing, if there is nothing there.
+func hideArgs(path string) []string {
+	fi, err := os.Stat(path)
+	switch {
+	case err != nil:
+		return nil
+	case fi.IsDir():
+		return []string{"--tmpfs", path}
+	default:
+		return []string{"--ro-bind", "/dev/null", path}
+	}
+}
+
+func pathDepth(p string) int { return strings.Count(filepath.Clean(p), string(filepath.Separator)) }

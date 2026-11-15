@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"slices"
 
 	"github.com/hoobean1996/wombat-go/llm"
 )
@@ -187,7 +188,7 @@ func (c *Client) encode(req llm.Request, model string, maxTokens int, stream boo
 			// Only meaningful alongside tools — the edit prunes tool_use
 			// blocks — and only legal with the beta header, hence the gate on
 			// both.
-			body.ContextManagement = defaultContextManagement()
+			body.ContextManagement = defaultContextManagement(req.Tools)
 		}
 	}
 
@@ -388,6 +389,7 @@ type contextEdit struct {
 	Trigger      *cmThreshold `json:"trigger,omitempty"`
 	Keep         *cmThreshold `json:"keep,omitempty"`
 	ClearAtLeast *cmThreshold `json:"clear_at_least,omitempty"`
+	ExcludeTools []string     `json:"exclude_tools,omitempty"`
 }
 
 type cmThreshold struct {
@@ -413,13 +415,29 @@ const (
 	toolUsesThresholdKind = "tool_uses"
 )
 
-func defaultContextManagement() *contextManagement {
+// neverCleared names the tools whose results the server must leave alone.
+//
+// load_skill, because a skill's activation lives on the client: the harness
+// retires a skill whose body leaves the transcript, and it can only see what
+// it removed itself. A body the server cleared would leave the skill's tools
+// on offer with the instructions for them gone, and nothing on this side
+// would know.
+var neverCleared = []string{"load_skill"}
+
+func defaultContextManagement(tools []llm.ToolSpec) *contextManagement {
+	var exclude []string
+	for _, t := range tools {
+		if slices.Contains(neverCleared, t.Name) {
+			exclude = append(exclude, t.Name)
+		}
+	}
 	return &contextManagement{
 		Edits: []contextEdit{{
 			Type:         clearToolUsesType,
 			Trigger:      &cmThreshold{Type: inputTokensThreshold, Value: clearTriggerTokens},
 			Keep:         &cmThreshold{Type: toolUsesThresholdKind, Value: clearKeepToolUses},
 			ClearAtLeast: &cmThreshold{Type: inputTokensThreshold, Value: clearAtLeastTokens},
+			ExcludeTools: exclude,
 		}},
 	}
 }

@@ -2,6 +2,7 @@ package openai
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -209,6 +210,10 @@ func decodeStream(r io.Reader, onDelta func(llm.Delta), model string) (llm.Respo
 	}
 
 	if err := reader.Err(); err != nil {
+		var ae *llm.APIError
+		if errors.As(err, &ae) {
+			return llm.Response{}, ae // already classified: the stream was too long
+		}
 		return llm.Response{}, llm.ClassifyTransport(fmt.Errorf("openai: read stream: %w", err))
 	}
 	if chunks == 0 && !didDone {

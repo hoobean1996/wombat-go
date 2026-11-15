@@ -125,6 +125,9 @@ func (r *Run) compact(ctx context.Context, convo Convo) (Convo, bool) {
 		return convo, false
 	}
 	r.compactRetryAt = 0
+	// The transcript that drove the overflow ladder up is gone; the next call
+	// starts from the bottom of it again rather than trimming a summary.
+	overflowFrom(ctx).reset()
 	r.emit(TranscriptCompacted{
 		Folded:       cut - 1,
 		TokensBefore: before,

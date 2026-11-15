@@ -1,9 +1,12 @@
 package httpapi
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -77,6 +80,10 @@ func TestSessionsSurviveARestart(t *testing.T) {
 	id := s.ID()
 	if err := m1.Close(); err != nil {
 		t.Fatal(err)
+	}
+
+	if data, err := os.ReadFile(filepath.Join(dir, id+".json")); err != nil || !strings.HasPrefix(string(data), fmt.Sprintf(`{"version":%d,`, RecordVersion)) {
+		t.Errorf("the saved record does not lead with its version: %.60s, %v", data, err)
 	}
 
 	m2 := newManager(t, ManagerConfig{Build: builder(cl), Store: st})
@@ -184,6 +191,73 @@ func TestDeletedAndExpiredSessionsLeaveTheStore(t *testing.T) {
 	}
 	if got, _ := st.Load(); len(got) != 0 {
 		t.Errorf("an expired session is still stored: %+v", got)
+	}
+}
+
+// A record from a newer layout is reported as that, not as whatever its new
+// shape fails to decode as — and stays where it is.
+func TestDirStoreRefusesANewerRecord(t *testing.T) {
+	dir := t.TempDir()
+	st, _ := DirStore(dir)
+	good := SessionRecord{Version: RecordVersion, ID: newID(), State: Idle}
+	if err := st.Save(good); err != nil {
+		t.Fatal(err)
+	}
+	newer := filepath.Join(dir, newID()+".json")
+	if err := os.WriteFile(newer, fmt.Appendf(nil, `{"version":%d,"messages":"a shape this build has never seen"}`, RecordVersion+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.Load()
+	if !errors.Is(err, ErrNewerRecord) || len(got) != 1 || got[0].ID != good.ID {
+		t.Errorf("Load = %d records, %v; want the current one, and ErrNewerRecord for the other", len(got), err)
+	}
+	if _, err := os.Stat(newer); err != nil {
+		t.Errorf("the newer record is gone: %v", err)
+	}
+}
+
+// memStore is a Store that checks nothing, which a Store may do.
+type memStore struct {
+	mu      sync.Mutex
+	recs    []SessionRecord
+	deleted []string
+}
+
+func (m *memStore) Save(rec SessionRecord) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.recs = append(m.recs, rec)
+	return nil
+}
+
+func (m *memStore) Load() ([]SessionRecord, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]SessionRecord(nil), m.recs...), nil
+}
+
+func (m *memStore) Delete(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.deleted = append(m.deleted, id)
+	return nil
+}
+
+// The manager does not restore a record it cannot read the layout of, from a
+// Store that handed it over anyway — and does not expire it either.
+func TestARecordFromANewerVersionIsLeftAlone(t *testing.T) {
+	st := &memStore{recs: []SessionRecord{
+		{Version: RecordVersion + 1, ID: newID(), State: Idle, Updated: time.Now()},
+		{Version: RecordVersion + 1, ID: newID(), State: Idle, Updated: time.Now().Add(-2 * DefaultTTL)},
+	}}
+	m := newManager(t, ManagerConfig{Build: builder(script()), Store: st})
+	for _, rec := range st.recs {
+		if _, ok := m.Get(rec.ID); ok {
+			t.Errorf("a version %d record was restored by a build that reads %d", rec.Version, RecordVersion)
+		}
+	}
+	if len(st.deleted) != 0 {
+		t.Errorf("deleted %q: a record in a newer layout was expired by this one's rules", st.deleted)
 	}
 }
 

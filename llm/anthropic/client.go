@@ -639,7 +639,7 @@ func (c *Client) Complete(ctx context.Context, req llm.Request) (llm.Response, e
 
 	var out llm.Response
 	if stream {
-		out, err = readStream(watch.Body(resp.Body), req.OnDelta, model)
+		out, err = readStream(httpcall.Cap(watch.Body(resp.Body), "anthropic", c.maxBody), req.OnDelta, model)
 	} else {
 		out, err = decodeMessage(resp.Body, model, c.maxBody)
 	}

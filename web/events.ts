@@ -88,6 +88,8 @@ export interface WombatContextOverflow {
   strategy: string;
   messages_before: number;
   messages_after: number;
+  tokens_before: number;
+  tokens_after: number;
 }
 
 export interface WombatReasoningDelta {
@@ -117,6 +119,7 @@ export interface WombatLLMDone {
     output_tokens: number;
     cache_creation_input_tokens?: number;
     cache_read_input_tokens?: number;
+    cleared_input_tokens?: number;
   };
   ms: number;
 }

@@ -683,3 +683,23 @@ func TestCompleteTransportFailure(t *testing.T) {
 		t.Errorf("llm.Retryable: got false, want true (err=%v)", err)
 	}
 }
+
+// TestStreamRefusesABlockIndexPastTheBound: the index comes off the wire, and
+// growing the block slice to it let one 265-byte event allocate 556 MiB.
+func TestStreamRefusesABlockIndexPastTheBound(t *testing.T) {
+	for _, tc := range []struct {
+		index int
+		ok    bool
+	}{{0, true}, {maxBlocks - 1, true}, {maxBlocks, false}, {10_000_000, false}, {-1, true}} {
+		stream := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"m\",\"usage\":{}}}\n\n" +
+			fmt.Sprintf("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":%d,\"content_block\":{\"type\":\"text\",\"text\":\"hi\"}}\n\n", tc.index) +
+			"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+		_, err := readStream(strings.NewReader(stream), nil, "m")
+		if (err == nil) != tc.ok {
+			t.Errorf("index %d: err = %v, want ok=%v", tc.index, err, tc.ok)
+		}
+		if err != nil && errors.Is(err, llm.ErrTransport) {
+			t.Errorf("index %d: err = %v is retryable; the same gateway would send it again", tc.index, err)
+		}
+	}
+}

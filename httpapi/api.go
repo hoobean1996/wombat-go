@@ -16,12 +16,17 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"mime"
+	"net"
 	"net/http"
+	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -54,6 +59,17 @@ var (
 	// errNotFound marks a path this handler serves nothing for. Distinct from
 	// ErrNoSuchSession, which means the route was right and the id was not.
 	errNotFound = errors.New("httpapi: no such endpoint")
+
+	// errNotJSON marks a request body that does not say it is JSON.
+	errNotJSON = errors.New("httpapi: request body must be sent as application/json")
+
+	// errUnauthorized marks a request without the token [WithBearerToken]
+	// asks for.
+	errUnauthorized = errors.New("httpapi: missing or wrong bearer token")
+
+	// errWrongHost marks a request for a host [WithAllowedHosts] does not
+	// list.
+	errWrongHost = errors.New("httpapi: this server does not answer for that host")
 )
 
 // The bounded vocabulary of the "kind" field. A UI branches on these; they are
@@ -71,6 +87,9 @@ const (
 	kindTooManySessions = "too_many_sessions"
 	kindClosed          = "closed"
 	kindInternal        = "internal"
+	kindNotJSON         = "unsupported_media_type"
+	kindUnauthorized    = "unauthorized"
+	kindWrongHost       = "misdirected"
 )
 
 const (
@@ -106,6 +125,48 @@ type apiConfig struct {
 	metrics http.Handler
 	ui      fs.FS
 	caps    Capabilities
+	token   string
+	hosts   []string
+}
+
+// WithBearerToken requires token on every request to the API and to
+// /metrics, as "Authorization: Bearer <token>". The events stream takes it as
+// an access_token query parameter too, because a browser's EventSource cannot
+// set a header — and only the events stream, so the token is in no other URL.
+//
+// GET /api/health stays open, for the load balancer that probes it, and so do
+// the files [WithUI] serves: they are how a browser gets as far as asking for
+// the token. A CORS preflight is answered without it, as preflights carry no
+// credentials. An empty token turns the check off.
+func WithBearerToken(token string) Option {
+	return func(c *apiConfig) { c.token = token }
+}
+
+// WithAllowedHosts answers only requests whose Host header names one of
+// hosts, with or without a port. Anything else is refused with 421.
+//
+// It is the defense against DNS rebinding, which a server on loopback needs
+// and does not get from being on loopback: a page on any site the operator
+// visits can point a name it controls at 127.0.0.1, and from then on its
+// requests reach this server as same-origin ones, responses included. The
+// Host header still carries the attacker's name, and that is not a name the
+// operator listed. A bearer token defends against the same thing, for a page
+// cannot send what it does not know; this is the defense that needs nothing
+// from the client.
+func WithAllowedHosts(hosts ...string) Option {
+	return func(c *apiConfig) {
+		for _, h := range hosts {
+			c.hosts = append(c.hosts, normalizeHost(h))
+		}
+	}
+}
+
+// normalizeHost lowercases a host and drops its port and IPv6 brackets.
+func normalizeHost(h string) string {
+	if host, _, err := net.SplitHostPort(h); err == nil {
+		h = host
+	}
+	return strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(h, "["), "]"))
 }
 
 // WithCORS allows the named browser origins to call this API.
@@ -253,15 +314,24 @@ type api struct {
 // its own middleware and its own authentication can mount it wherever it
 // likes; cmd/wombat-serve is thirty lines on top of it.
 //
-// # There is no authentication here
+// # Authentication is opt-in
 //
-// None at all. Any client that can reach the socket can start a session, spend
-// the operator's money, read every transcript and — if it learns a session id
-// — answer another client's approval prompts. Binding to anything other than
-// loopback is therefore a decision the operator makes knowingly, behind auth
-// they supply themselves. [WithCORS] governs which browser ORIGINS may call
-// in; it is a browser's rule about pages, not this server's rule about
-// clients, and it stops nothing that is not a browser.
+// Without [WithBearerToken] there is none. Any client that can reach the
+// socket can start a session, spend the operator's money, read every
+// transcript and — if it learns a session id — answer another client's
+// approval prompts. Binding to anything other than loopback without a token is
+// therefore a decision the operator makes knowingly, behind auth they supply
+// themselves. [WithCORS] governs which browser ORIGINS may call in; it is a
+// browser's rule about pages, not this server's rule about clients, and it
+// stops nothing that is not a browser.
+//
+// Loopback is not a boundary against the browser on the same machine either.
+// A page on another site can send a request here, and the one thing that
+// keeps it from creating a session is that a request body must be declared
+// application/json: that is not a type a cross-site page may send without
+// asking first, and the asking — a CORS preflight — is refused. A page that
+// rebinds its own name to 127.0.0.1 needs no preflight at all; that takes
+// [WithAllowedHosts], or a token.
 //
 // # No WriteTimeout
 //
@@ -335,11 +405,61 @@ func New(m *Manager, opts ...Option) http.Handler {
 		mux.HandleFunc("/", a.notFound)
 	}
 
+	// Outermost last: a misdirected request is refused before anything,
+	// a preflight is answered before the token is asked for.
 	var h http.Handler = mux
+	if a.cfg.token != "" {
+		h = a.withToken(h)
+	}
 	if len(a.cfg.origins) > 0 {
 		h = a.withCORS(h)
 	}
+	if len(a.cfg.hosts) > 0 {
+		h = a.withHosts(h)
+	}
 	return h
+}
+
+func (a *api) withHosts(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !slices.Contains(a.cfg.hosts, normalizeHost(r.Host)) {
+			a.fail(w, r, fmt.Errorf("%w: %q", errWrongHost, r.Host))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// bearerToken reads "Bearer <token>"; the scheme is case-insensitive, as
+// every HTTP authentication scheme is.
+func bearerToken(h string) (string, bool) {
+	const scheme = "bearer "
+	if len(h) < len(scheme) || !strings.EqualFold(h[:len(scheme)], scheme) {
+		return "", false
+	}
+	return h[len(scheme):], true
+}
+
+func (a *api) withToken(next http.Handler) http.Handler {
+	want := []byte(a.cfg.token)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := path.Clean("/" + r.URL.Path)
+		inAPI := p == "/api" || strings.HasPrefix(p, "/api/")
+		if (!inAPI && p != "/metrics") || p == "/api/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		got, ok := bearerToken(r.Header.Get("Authorization"))
+		if !ok && r.Method == http.MethodGet && strings.HasPrefix(p, "/api/sessions/") && strings.HasSuffix(p, "/events") {
+			got, ok = r.URL.Query().Get("access_token"), true
+		}
+		if !ok || subtle.ConstantTimeCompare([]byte(strings.TrimSpace(got)), want) != 1 {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="wombat"`)
+			a.fail(w, r, errUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (a *api) health(w http.ResponseWriter, _ *http.Request) {
@@ -722,7 +842,7 @@ func (a *api) withCORS(next http.Handler) http.Handler {
 			h.Add("Vary", "Access-Control-Request-Headers")
 			if allowed != "" {
 				h.Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-				h.Set("Access-Control-Allow-Headers", "Content-Type, Last-Event-ID")
+				h.Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Last-Event-ID")
 				h.Set("Access-Control-Max-Age", strconv.Itoa(int(corsMaxAge.Seconds())))
 			}
 			// 204 either way. A preflight from a disallowed origin that lacks
@@ -805,6 +925,12 @@ func classify(err error) (status int, kind string) {
 		return http.StatusBadRequest, kindBodyTooLarge
 	case errors.Is(err, ErrBadRequest):
 		return http.StatusBadRequest, kindBadRequest
+	case errors.Is(err, errNotJSON):
+		return http.StatusUnsupportedMediaType, kindNotJSON
+	case errors.Is(err, errUnauthorized):
+		return http.StatusUnauthorized, kindUnauthorized
+	case errors.Is(err, errWrongHost):
+		return http.StatusMisdirectedRequest, kindWrongHost
 	default:
 		return http.StatusInternalServerError, kindInternal
 	}
@@ -829,8 +955,18 @@ func (a *api) fail(w http.ResponseWriter, r *http.Request, err error) {
 // Unknown fields are rejected. A UI that misspells "max_iters" and silently
 // gets the default is a bug that surfaces days later as "the limit setting
 // does nothing"; a 400 surfaces it on the first request. The body is capped
-// for the same reason the session count is: nothing here is authenticated.
+// for the same reason the session count is: nothing here need be
+// authenticated.
+//
+// The body must be declared application/json, and that is a security check,
+// not pedantry. text/plain is a type any web page may POST to any origin
+// without a preflight, so a body decoded whatever its type let a page on any
+// site the operator visited start a session here, prompt and all — and the
+// session then ran tools on the operator's machine.
 func decodeBody(w http.ResponseWriter, r *http.Request, dst any) error {
+	if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/json" {
+		return fmt.Errorf("%w (got %q)", errNotJSON, r.Header.Get("Content-Type"))
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()

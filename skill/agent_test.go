@@ -139,3 +139,35 @@ func TestAnAgentWithoutSkillStateIsWarnedAboutAtNew(t *testing.T) {
 		t.Errorf("Install still produced a warning:\n%s", logs.String())
 	}
 }
+
+// TestInstallNeverClipsASkillBody: the default dispatch chain clips every
+// observation to 64 KiB, and a skill body used to be no exception — the model
+// got its head and tail, and loading it again returned only a reminder that
+// it was loaded, so the middle could never be read.
+func TestInstallNeverClipsASkillBody(t *testing.T) {
+	body := "BEGIN\n" + strings.Repeat("a step of the procedure\n", 4000) + "END\n" // ~96 KB
+	g := skill.New(skill.Skill{Name: "big", Description: "A large skill.", Body: body}).Bind(nil)
+	cl := &script{turns: []llm.Response{call("l1", skill.LoadToolName, `{"name":"big"}`), say("done")}}
+	a, err := wombat.New(wombat.WithClient(cl), wombat.WithModel("m"), g.Install())
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := a.Start(context.Background(), wombat.Ask("go"))
+	for r.Next() {
+	}
+	defer r.Close()
+	if err := r.Err(); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range r.Messages() {
+		for _, b := range m.Content {
+			if tr, ok := b.(llm.ToolResult); ok && tr.ToolUseID == "l1" {
+				if !strings.Contains(tr.Content, body) {
+					t.Errorf("load_skill returned %d bytes of a %d-byte body, want all of it", len(tr.Content), len(body))
+				}
+				return
+			}
+		}
+	}
+	t.Fatal("no load_skill result in the transcript")
+}

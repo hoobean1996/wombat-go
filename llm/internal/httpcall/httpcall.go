@@ -181,6 +181,42 @@ func ReadBody(r io.Reader, prefix string, limit int) ([]byte, error) {
 	return raw, nil
 }
 
+// Cap bounds a streamed body at limit bytes, as [ReadBody] bounds a whole
+// one: reading past it fails with the same server error. A stream has no
+// length to check up front, and without a bound a gateway that never stops
+// sending is memory that grows for as long as the total deadline allows.
+func Cap(r io.Reader, prefix string, limit int) io.Reader {
+	if limit <= 0 {
+		return r
+	}
+	return &capped{r: r, left: int64(limit), prefix: prefix, limit: limit}
+}
+
+type capped struct {
+	r      io.Reader
+	left   int64
+	prefix string
+	limit  int
+}
+
+func (c *capped) Read(p []byte) (int, error) {
+	if c.left <= 0 {
+		// At the limit: only a byte past it makes the stream too long.
+		var one [1]byte
+		if n, err := c.r.Read(one[:]); n == 0 {
+			return 0, err
+		}
+		return 0, &llm.APIError{Class: llm.ErrServer, Status: http.StatusOK,
+			Message: fmt.Sprintf("%s: streamed response exceeds %d bytes", c.prefix, c.limit)}
+	}
+	if int64(len(p)) > c.left {
+		p = p[:c.left]
+	}
+	n, err := c.r.Read(p)
+	c.left -= int64(n)
+	return n, err
+}
+
 // StatusError classifies a non-2xx reply, reading at most MaxErrorBody of it
 // and quoting at most MaxErrorMessage, scrubbed to valid UTF-8.
 func StatusError(resp *http.Response) error {

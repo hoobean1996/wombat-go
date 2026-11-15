@@ -112,12 +112,15 @@ func Sequence(ss ...Strategy) Strategy { return seq(ss) }
 
 type seq []Strategy
 
+// Apply hands each strategy the previous one's output in an otherwise
+// unchanged View. Rebuilding the View from Messages and Results — which this
+// once did — dropped the estimator and the window, and a token strategy inside
+// a sequence quietly did nothing.
 func (s seq) Apply(v View) []llm.Message {
-	msgs := v.Messages
 	for _, st := range s {
-		msgs = st.Apply(View{Messages: msgs, Results: v.Results})
+		v.Messages = st.Apply(v)
 	}
-	return msgs
+	return v.Messages
 }
 
 func (s seq) String() string {

@@ -34,15 +34,26 @@ var (
 )
 
 // Limits caps a run. A zero field means that dimension is unlimited.
+//
+// Steps and ToolCalls are checked BEFORE the unit they count — an iteration
+// about to start, a call about to run — so a limit of N lets exactly N happen
+// and refuses the next. CostUSD can only be checked after the fact, because a
+// call's price is known once it has been paid: the call that reaches the cap
+// completes, and the run stops there.
 type Limits struct {
-	CostUSD       float64
-	Steps         int
-	Wall          time.Duration
+	CostUSD float64
+	// Steps is how many iterations the run may take, sub-agents' included.
+	Steps int
+	Wall  time.Duration
+	// ToolCalls is how many tool calls the run may make. Only calls that
+	// reach execution count: one a permission policy refused never ran.
 	ToolCalls     int
 	SubagentDepth int
 
 	// RepeatedToolCalls stops a run that calls the same tool with the same
-	// arguments this many times in a row.
+	// arguments this many times in a row: the Nth identical call is refused
+	// rather than run. Refused calls count here, unlike for ToolCalls —
+	// asking again for a call that was just refused is the same loop.
 	//
 	// Distinct from the dedup middleware, which annotates the error so the
 	// model can notice it is stuck and pivot. That is advisory and usually
@@ -121,6 +132,13 @@ func FromContext(ctx context.Context) *Budget {
 	return &Budget{start: time.Now()}
 }
 
+// Lookup returns the budget ctx carries, and whether it carries one at all —
+// for a caller that has somewhere better than a throwaway to put a tally.
+func Lookup(ctx context.Context) (*Budget, bool) {
+	b, ok := ctx.Value(budgetKey{}).(*Budget)
+	return b, ok && b != nil
+}
+
 // Ensure returns ctx unchanged if it already carries a budget, and otherwise
 // ctx with a fresh, unlimited one attached.
 //
@@ -170,24 +188,40 @@ func (b *Budget) Step() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.steps++
-	if b.limits.Steps > 0 && b.steps >= b.limits.Steps {
+	if b.limits.Steps > 0 && b.steps > b.limits.Steps {
 		b.abort(ErrStepLimit)
 	}
 }
 
-// AddToolCall records one dispatched tool call.
-//
-// key identifies the call for loop detection — conventionally the tool name
-// plus its arguments. Pass "" to count the call without loop detection.
+// AddToolCall records one tool call that is about to run: it counts toward
+// ToolCalls, and key feeds loop detection exactly as [Budget.Attempt] does.
+// It is the two halves together, for a caller with one place to put them.
 func (b *Budget) AddToolCall(key string) {
+	b.CountToolCall()
+	b.Attempt(key)
+}
+
+// CountToolCall counts one tool call that is about to run against ToolCalls,
+// and refuses it — by cancelling the run — when the run has already made
+// every call it may.
+func (b *Budget) CountToolCall() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-
 	b.toolCalls++
-	if b.limits.ToolCalls > 0 && b.toolCalls >= b.limits.ToolCalls {
+	if b.limits.ToolCalls > 0 && b.toolCalls > b.limits.ToolCalls {
 		b.abort(ErrToolCallLimit)
 	}
+}
 
+// Attempt feeds loop detection with one tool call the model asked for,
+// whether it goes on to run or is refused: asking again for a call that was
+// just refused is as much a loop as repeating one that ran.
+//
+// key identifies the call — conventionally the tool name plus its arguments.
+// "" is a call that is not part of any loop, and breaks the current streak.
+func (b *Budget) Attempt(key string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	if key == "" {
 		b.lastCall, b.repeatRun = "", 0
 		return

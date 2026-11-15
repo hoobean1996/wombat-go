@@ -503,7 +503,7 @@ func (c *Client) Complete(ctx context.Context, req llm.Request) (llm.Response, e
 
 	var out llm.Response
 	if stream {
-		out, err = decodeStream(watch.Body(resp.Body), req.OnDelta, model)
+		out, err = decodeStream(httpcall.Cap(watch.Body(resp.Body), "openai", c.maxBody), req.OnDelta, model)
 	} else {
 		out, err = decodeResponse(resp.Body, model, c.maxBody)
 	}

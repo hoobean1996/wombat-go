@@ -24,6 +24,8 @@ type streamEvent struct {
 	Delta        *streamDelta `json:"delta"`         // content_block_delta, message_delta
 	Usage        *llm.Usage   `json:"usage"`         // message_delta
 	Error        *apiError    `json:"error"`         // error
+
+	ContextManagement *appliedEdits `json:"context_management"` // message_delta
 }
 
 type streamDelta struct {
@@ -62,12 +64,24 @@ type streamState struct {
 	model  string
 }
 
+// maxBlocks bounds the content blocks of one reply. A real one has a handful.
+// The index comes off the wire, and growing a slice to whatever a gateway
+// sent was a way to exhaust memory with one short event: index 10,000,000
+// allocated half a gigabyte of nil pointers, and a larger one is an
+// out-of-memory crash no recover can catch.
+const maxBlocks = 4096
+
 // at returns the accumulator for an SSE block index, growing the slice as
 // needed. Indices are contiguous in practice; the slice preserves emission
-// order without a sort, and a gap left by a skipped index stays nil.
-func (s *streamState) at(i int) *blockAcc {
+// order without a sort, and a gap left by a skipped index stays nil. A
+// negative index is ignored, and one past maxBlocks ends the reply.
+func (s *streamState) at(i int) (*blockAcc, error) {
 	if i < 0 {
-		return nil
+		return nil, nil
+	}
+	if i >= maxBlocks {
+		return nil, &llm.APIError{Class: llm.ErrServer, Status: 200,
+			Message: fmt.Sprintf("anthropic: content block index %d is past the %d a reply may have", i, maxBlocks)}
 	}
 	for len(s.blocks) <= i {
 		s.blocks = append(s.blocks, nil)
@@ -75,7 +89,7 @@ func (s *streamState) at(i int) *blockAcc {
 	if s.blocks[i] == nil {
 		s.blocks[i] = &blockAcc{}
 	}
-	return s.blocks[i]
+	return s.blocks[i], nil
 }
 
 // readStream consumes the event stream and assembles the same llm.Response the
@@ -104,6 +118,10 @@ func readStream(body io.Reader, onDelta func(llm.Delta), model string) (llm.Resp
 	}
 
 	if err := r.Err(); err != nil {
+		var ae *llm.APIError
+		if errors.As(err, &ae) {
+			return llm.Response{}, ae // already classified: the stream was too long
+		}
 		return llm.Response{}, llm.ClassifyTransport(fmt.Errorf("anthropic: read stream: %w", err))
 	}
 	if !saw {
@@ -145,9 +163,15 @@ func (s *streamState) handle(ev sse.Event, onDelta func(llm.Delta)) error {
 		// whether the breakpoints in request.go are working), message_delta
 		// carries the final output count. Merge, do not overwrite.
 		s.usage = e.Message.Usage
+		if n := e.Message.ContextManagement.cleared(); n > 0 {
+			s.usage.ClearedInputTokens = n
+		}
 
 	case "content_block_start":
-		b := s.at(e.Index)
+		b, err := s.at(e.Index)
+		if err != nil {
+			return err
+		}
 		if b == nil || e.ContentBlock == nil {
 			return nil
 		}
@@ -175,7 +199,10 @@ func (s *streamState) handle(ev sse.Event, onDelta func(llm.Delta)) error {
 		}
 
 	case "content_block_delta":
-		b := s.at(e.Index)
+		b, err := s.at(e.Index)
+		if err != nil {
+			return err
+		}
 		if b == nil || e.Delta == nil {
 			return nil
 		}
@@ -220,6 +247,9 @@ func (s *streamState) handle(ev sse.Event, onDelta func(llm.Delta)) error {
 	case "message_delta":
 		if e.Delta != nil && e.Delta.StopReason != "" {
 			s.stop = llm.StopReason(e.Delta.StopReason)
+		}
+		if n := e.ContextManagement.cleared(); n > 0 {
+			s.usage.ClearedInputTokens = n
 		}
 		if e.Usage != nil {
 			// Only the non-zero fields: this event reports output_tokens and

@@ -96,6 +96,13 @@ on its own, so aborting from arbitrary depth costs zero new return values.
 through the whole stack from inside an effect handler and needs care at every
 `try` that might swallow it.
 
+A cap of N lets N happen: `Steps: 3` is three model calls, sub-agents'
+included, and `ToolCalls: 1` runs the one call it allows. Only a call that
+reaches its tool counts toward `ToolCalls` — one a permission gate turned down
+used nothing — but every request counts toward `RepeatedToolCalls`, refused or
+not, because asking again and again for a call that keeps being refused is
+exactly the loop it is there to catch.
+
 ## Talking to a gateway
 
 Corporate deployments put the model behind a proxy, a routing header and a
@@ -125,6 +132,9 @@ Two things a real gateway teaches you that a mock does not:
   some servers omit it, and then a streamed call reports zero tokens and cost
   budgeting quietly stops working. `llm.StreamNever` trades deltas for
   accounting when that happens.
+- **A stream is a response too.** It is held to the same size cap as a
+  buffered body, and one that runs past it fails as a server error instead of
+  growing for as long as the gateway keeps sending.
 
 ## Context has structure, and the structure is the point
 
@@ -174,6 +184,17 @@ is the heavier tool: past its trigger the old part of the transcript is
 replaced, for the rest of the run, by a summary of it. `ContextTrimmed`,
 `TranscriptCompacted` and `ContextOverflow` events say when each happened.
 
+When the provider refuses a request anyway, `WithOverflowRecovery` shrinks it
+a rung at a time and sends it again. It starts in tokens — eliding old tool
+results — because the run that overflows most, one instruction and a long run
+of tool calls, has nowhere a window counted in messages may cut. A rung counts
+only if the request came out smaller in tokens; each refusal is taken as an
+upper bound on the real window, so the next attempt aims under the smallest
+one refused; and a compaction, having made room, starts the ladder again from
+the bottom. With Anthropic's server-side `clear_tool_uses` on, `load_skill`
+results are excluded from it, so the server cannot evict a skill's body behind
+the back of the bookkeeping that retires its tools.
+
 ## What a tool hands back
 
 - **Long output is kept, not lost.** `bash` returns the start and the end of
@@ -185,6 +206,13 @@ replaced, for the rest of the run, by a summary of it. `ContextTrimmed`,
   an image or a PDF to a call's result, and both providers carry it to the
   model. `builtin.ViewMedia` (`-media` on the CLI) lets the model look at a
   screenshot or a rendered chart rather than at its bytes.
+- **Reads are bounded.** `view_file` and `str_replace` read regular files
+  only, at most `builtin.MaxReadBytes`, and give up when the call is
+  cancelled, so `/dev/zero`, a FIFO or a multi-gigabyte log cannot take the
+  process down with them. A tool's result is capped as well;
+  `WithTruncationExempt` names the ones that must arrive whole, and
+  `skill.Install` exempts `load_skill`, because a skill body is shown once and
+  a truncated one could never be read in full.
 - **Reads run together; anything else is a barrier.** A turn's calls run up to
   four at a time, but only read-only tools overlap: a write, a command, or a
   tool that declares nothing waits for every call before it and holds back
@@ -253,6 +281,10 @@ the skill activation set, the tape and the tracer all reach the child by being
 values on `ctx`. Nothing forks, nothing is reinstalled. The child's events reach
 the parent's stream wrapped in `SubagentEvent`, so a UI can nest them.
 
+`ParallelDelegateTool` runs a batch of children at once. A batch is capped at
+`wombat.DefaultMaxTasks` (16, `WithMaxTasks` to change it) and refused whole
+beyond that, and a task waiting for a free slot gives up when the run does.
+
 The depth cap is the one governor limit that **refuses instead of aborting**.
 Every other cap is a resource the run has exhausted; nesting depth is a shape,
 and a parent told "not deeper" can still do the job itself — but only if it is
@@ -269,7 +301,7 @@ still running.
 | `WithRetry` | needs `Idempotent` **and** `Retryable`; a write is never replayed because an error looked transient |
 | `WithCircuitBreaker` | per tool, **process-wide** — a dependency that is down is down for every run |
 | `WithDedupRepeats` | per **run** — being stuck in a loop is a property of one conversation |
-| `WithOverflowRecovery` | the one error the harness can actually fix: shrink the transcript and retry, sticky for the rest of the run |
+| `WithOverflowRecovery` | the one error the harness can actually fix: shrink the transcript and retry, sticky until a compaction makes room again |
 
 The model sees a short message; the stack goes to `slog`.
 
@@ -289,7 +321,10 @@ performing them again.
 Entries are keyed by a **content hash of the request**, not by position. The
 OCaml original keyed by position and died with `tape misalignment` the moment a
 run diverged — which, for a differential-testing tool, is exactly when you need
-it. A miss in `Auto` is a live call.
+it. A miss in `Auto` is a live call. A line may carry a format revision; every
+line so far is revision 0 and spells nothing, and a tape with a line from a
+revision newer than the reader's is refused by name rather than replayed as
+something it is not.
 
 Measured on a real run: record took minutes against a gateway, replay took
 **0.107 s with the endpoint pointed at a dead address**, and the answer was
@@ -369,6 +404,16 @@ containment rather than hygiene, `SandboxRunner` runs every command under
 and the temp directory, the usual credential directories unreadable, the
 network loopback-only unless asked otherwise. It refuses to run rather than
 running unconfined, and `-confine` turns it on in the CLIs.
+
+Leaving `SSH_AUTH_SOCK` out of the environment turned out to hide the agent's
+path and nothing else: its socket sat in the shared temp directory, which is
+writable and therefore open to sockets, and a child could list it as well as
+the harness could. The sandbox now closes, in every network mode, the sockets
+through which a process acts with the user's authority rather than its own —
+ssh and gpg agents, the tmux or editor the harness runs inside, the user's
+session bus and runtime directory, container daemons. It is a list, so a socket
+it does not know about needs a `DenyRead` entry; `ReadCredentials` opens it
+along with the credential directories.
 
 ## Knowing when it is done
 
@@ -477,9 +522,24 @@ across a turn boundary resumes at the event it dropped instead of at the start
 of the current turn. With `-sessions-dir` (an `httpapi.Store`) the sessions
 survive a restart: a turn the restart interrupted comes back failed, with its
 transcript as it was when the turn began, and a model that was waiting on a
-question is still waiting on it. `cmd/wombat-serve` wires it up with a single-file browser
-client, and `cmd/wombat-tsgen` reflects over the event registry to generate
-`web/events.ts`, so the TypeScript types cannot drift from the Go ones.
+question is still waiting on it. A saved session records the version of its
+layout, and a server that finds one newer than it can read leaves it on disk
+rather than restoring it wrong. `cmd/wombat-serve` wires it up with a
+single-file browser client, and `cmd/wombat-tsgen` reflects over the event
+registry to generate `web/events.ts`, so the TypeScript types cannot drift
+from the Go ones; a test fails when the checked-in copy is stale, and another
+when an event type is missing from its registry.
+
+Being on loopback is not being private from the browser on the same machine.
+A request body must be sent as `application/json`, which is not a type a page
+on another site may POST without asking first — before that check, any page
+the operator visited could start a session here, prompt and all, and the
+session ran tools. A page can also rebind a name of its own to 127.0.0.1 and
+become same-origin; `wombat-serve` listens on loopback by default and, there,
+answers only to loopback names (`httpapi.WithAllowedHosts`). `-token`, or
+`$WOMBAT_SERVE_TOKEN`, adds a bearer token (`httpapi.WithBearerToken`), which
+the bundled UI asks for; beyond loopback, a server without one logs that
+anyone who can reach it can drive it.
 
 ## What is kept
 

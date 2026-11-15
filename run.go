@@ -676,7 +676,9 @@ func (r *Run) iterate(parent context.Context, iter int, convo Convo) (Convo, boo
 	if err == nil {
 		// Calibrate on what was actually sent, which is not msgs when the
 		// overflow ladder shrank the request on its way out.
-		r.tokens.observe(sent.or(msgs), len(req.System)+specBytes(req.Tools), resp.Usage.PromptTokens())
+		// RequestTokens, not PromptTokens: what the server cleared before
+		// reading was still sent, and the estimate is of what was sent.
+		r.tokens.observe(sent.or(msgs), len(req.System)+specBytes(req.Tools), resp.Usage.RequestTokens())
 	}
 	if err != nil {
 		// Keep the half-answer. The user watched it arrive; a transcript that

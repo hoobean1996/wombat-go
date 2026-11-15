@@ -94,6 +94,11 @@ var (
 
 	// ErrEmptyTask means the model called a delegate tool with nothing to do.
 	ErrEmptyTask = errors.New("wombat: delegate called with an empty task")
+
+	// ErrTooManyTasks means one parallel_delegate call listed more tasks than
+	// [WithMaxTasks] allows. The call's fault, so a model that overreaches
+	// does not trip the tool's breaker.
+	ErrTooManyTasks = tool.CallerError(errors.New("wombat: too many tasks for one parallel_delegate call"))
 )
 
 // ===== Options =====
@@ -103,12 +108,17 @@ const (
 	DefaultDelegateName         = "delegate"
 	DefaultParallelDelegateName = "parallel_delegate"
 	DefaultMaxBranches          = 4
+	// DefaultMaxTasks bounds the tasks of one parallel_delegate call. Each is
+	// a whole child run; the budget bounds what they spend together, but not
+	// how many goroutines and transcripts one reply can ask for.
+	DefaultMaxTasks = 16
 )
 
 type delegateConfig struct {
 	name        string
 	description string
 	maxBranches int
+	maxTasks    int
 }
 
 // DelegateOption configures [DelegateTool] and [ParallelDelegateTool].
@@ -131,6 +141,16 @@ func WithDelegateName(name string) DelegateOption {
 // looks like.
 func WithDelegateDescription(text string) DelegateOption {
 	return func(c *delegateConfig) { c.description = text }
+}
+
+// WithMaxTasks bounds how many tasks one [ParallelDelegateTool] call may
+// list; a call with more is refused, and the model told the limit. Default
+// [DefaultMaxTasks]. Ignored by [DelegateTool].
+func WithMaxTasks(n int) DelegateOption {
+	if n < 1 {
+		panic("wombat: WithMaxTasks requires n >= 1")
+	}
+	return func(c *delegateConfig) { c.maxTasks = n }
 }
 
 // WithMaxBranches caps how many branches of one [ParallelDelegateTool] call
@@ -291,6 +311,7 @@ func ParallelDelegateTool(child *Agent, opts ...DelegateOption) tool.Def {
 		name:        DefaultParallelDelegateName,
 		description: parallelDelegateDescription,
 		maxBranches: DefaultMaxBranches,
+		maxTasks:    DefaultMaxTasks,
 	}
 	for _, o := range opts {
 		o(&cfg)
@@ -314,6 +335,10 @@ func ParallelDelegateTool(child *Agent, opts ...DelegateOption) tool.Def {
 		}
 		if len(tasks) == 0 {
 			return "", fmt.Errorf("%w: 'tasks' must list at least one task", ErrEmptyTask)
+		}
+		if len(tasks) > cfg.maxTasks {
+			return "", fmt.Errorf("%w: %d listed, at most %d at once — group related tasks into one, or do some of the work yourself",
+				ErrTooManyTasks, len(tasks), cfg.maxTasks)
 		}
 
 		// One tick for the whole fan-out. The cap is RECURSION depth, not
@@ -343,7 +368,15 @@ func ParallelDelegateTool(child *Agent, opts ...DelegateOption) tool.Def {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				sem <- struct{}{}
+				// A branch still waiting for a slot when the run is cancelled
+				// does not start: it would only open a child run to watch it
+				// end, one queued task at a time.
+				select {
+				case sem <- struct{}{}:
+				case <-ctx.Done():
+					results[i] = branch{err: context.Cause(ctx)}
+					return
+				}
 				defer func() { <-sem }()
 
 				// Branches emit into the parent's stream concurrently, so

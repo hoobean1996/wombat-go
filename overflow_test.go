@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -167,7 +168,7 @@ func TestNextRung(t *testing.T) {
 
 	t.Run("skips past rungs that remove nothing", func(t *testing.T) {
 		ladder := []Strategy{noop, noop, SlidingWindow(8)}
-		level, shrunk, ok := nextRung(ctx, ladder, 0, original, original)
+		level, shrunk, ok := nextRung(ctx, nil, ladder, 0, original, original)
 		if !ok {
 			t.Fatal("ok = false, want the ladder to reach the window")
 		}
@@ -181,15 +182,15 @@ func TestNextRung(t *testing.T) {
 
 	t.Run("reports exhaustion when nothing shortens the transcript", func(t *testing.T) {
 		ladder := []Strategy{noop, noop}
-		if _, _, ok := nextRung(ctx, ladder, 0, original, original); ok {
+		if _, _, ok := nextRung(ctx, nil, ladder, 0, original, original); ok {
 			t.Error("ok = true, want false when no rung removes anything")
 		}
 	})
 
-	t.Run("starts above the current level", func(t *testing.T) {
+	t.Run("passes over a level that changes nothing again", func(t *testing.T) {
 		ladder := []Strategy{SlidingWindow(24), SlidingWindow(10)}
-		current := applyLevel(ctx, ladder, 1, original)
-		level, shrunk, ok := nextRung(ctx, ladder, 1, current, original)
+		current := applyLevel(ctx, nil, ladder, 1, original)
+		level, shrunk, ok := nextRung(ctx, nil, ladder, 1, current, original)
 		if !ok {
 			t.Fatal("ok = false, want the second rung")
 		}
@@ -203,7 +204,8 @@ func TestNextRung(t *testing.T) {
 
 	t.Run("past the end of the ladder", func(t *testing.T) {
 		ladder := []Strategy{SlidingWindow(24)}
-		if _, _, ok := nextRung(ctx, ladder, 1, original, original); ok {
+		current := applyLevel(ctx, nil, ladder, 1, original)
+		if _, _, ok := nextRung(ctx, nil, ladder, 1, current, original); ok {
 			t.Error("ok = true, want false past the last rung")
 		}
 	})
@@ -227,7 +229,7 @@ func TestApplyLevel(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := len(applyLevel(ctx, ladder, tc.level, msgs)); got != tc.want {
+			if got := len(applyLevel(ctx, nil, ladder, tc.level, msgs)); got != tc.want {
 				t.Errorf("got %d messages, want %d", got, tc.want)
 			}
 		})
@@ -246,7 +248,7 @@ func TestApplyLevelComposesTheRungs(t *testing.T) {
 	)
 	ladder := []Strategy{DropTagged(0, 0, "skill"), SlidingWindow(6)}
 
-	got := applyLevel(ctx, ladder, 2, msgs)
+	got := applyLevel(ctx, nil, ladder, 2, msgs)
 	if strings.Contains(allText(got), "BODY") {
 		t.Errorf("level 2 still carries the skill body rung 1 dropped: %d messages", len(got))
 	}
@@ -408,10 +410,11 @@ func TestResultsOnContext(t *testing.T) {
 	}
 }
 
-// The default ladder is documented as three progressively tighter windows;
-// pinning it keeps the doc comment and the code from drifting apart.
+// The default ladder is documented as a token rung and then three
+// progressively tighter windows; pinning it keeps the doc comment and the code
+// from drifting apart.
 func TestDefaultOverflowEscalation(t *testing.T) {
-	want := []string{"sliding_window(keep=24)", "sliding_window(keep=10)", "sliding_window(keep=4)"}
+	want := []string{"token_window(trigger=0.85, keep=0.6)", "sliding_window(keep=24)", "sliding_window(keep=10)", "sliding_window(keep=4)"}
 	if len(DefaultOverflowEscalation) != len(want) {
 		t.Fatalf("ladder has %d rungs, want %d", len(DefaultOverflowEscalation), len(want))
 	}
@@ -420,4 +423,148 @@ func TestDefaultOverflowEscalation(t *testing.T) {
 			t.Errorf("rung %d = %q, want %q", i, s.String(), want[i])
 		}
 	}
+}
+
+// refuseOver is a provider whose window is limit estimated tokens. It records
+// the estimated size of every request it is sent.
+type refuseOver struct {
+	limit int
+	sizes []int
+}
+
+func (r *refuseOver) Complete(ctx context.Context, req llm.Request) (llm.Response, error) {
+	n := estimateAt(ctx, req.Messages)
+	r.sizes = append(r.sizes, n)
+	if n > r.limit {
+		return llm.Response{}, &llm.APIError{Class: llm.ErrContextWindow, Status: 400, Message: "prompt is too long"}
+	}
+	if err := Convo(req.Messages).Validate(); err != nil {
+		return llm.Response{}, fmt.Errorf("the ladder sent an invalid transcript: %w", err)
+	}
+	return textTurn("ok"), nil
+}
+
+// TestOverflowLadderShrinksAnAgentLoop: the transcript that overflows most —
+// one instruction and a long run of tool calls — has nowhere a window may cut,
+// and a rung that thins it without shortening it was passed over for changing
+// no message count. Every ladder below used to send the refused request once
+// and give up.
+func TestOverflowLadderShrinksAnAgentLoop(t *testing.T) {
+	msgs := agentLoop(40, 4000) // about 40k tokens
+	for name, ladder := range map[string][]Strategy{
+		"the default ladder":       nil,
+		"FitTokens alone":          {FitTokens(20_000, 10_000)},
+		"FitTokens, then a window": {FitTokens(20_000, 10_000), SlidingWindow(4)},
+		"a window alone":           {SlidingWindow(4)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := &refuseOver{limit: 25_000}
+			_, err := llm.Chain(p, WithOverflowRecovery(ladder...)).Complete(context.Background(), llm.Request{Messages: msgs})
+			if name == "a window alone" {
+				// Still nothing it can do; it must say so after one request.
+				if !errors.Is(err, llm.ErrContextWindow) || len(p.sizes) != 1 {
+					t.Errorf("err = %v after %v, want the provider's refusal after one request", err, p.sizes)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("err = %v after requests of %v tokens", err, p.sizes)
+			}
+			if last := p.sizes[len(p.sizes)-1]; len(p.sizes) < 2 || last > p.limit {
+				t.Errorf("requests of %v tokens, want a refused one and then one under %d", p.sizes, p.limit)
+			}
+		})
+	}
+}
+
+// A refusal teaches the ladder an upper bound on the window, so a token rung
+// that did not shrink a request far enough is applied again, smaller — and
+// the attempts are bounded, because each refusal is paid for.
+func TestOverflowTokenRungConvergesAndIsBounded(t *testing.T) {
+	msgs := agentLoop(40, 4000)
+	ladder := []Strategy{TokenWindow(0.85, 0.6)}
+
+	p := &refuseOver{limit: 22_000}
+	if _, err := llm.Chain(p, WithOverflowRecovery(ladder...)).Complete(context.Background(), llm.Request{Messages: msgs}); err != nil {
+		t.Fatalf("err = %v after %v: one rung should converge on a window it is not told", err, p.sizes)
+	}
+	for i := 1; i < len(p.sizes); i++ {
+		if p.sizes[i] >= p.sizes[i-1] {
+			t.Errorf("request %d (%d tokens) is no smaller than the one refused before it: %v", i, p.sizes[i], p.sizes)
+		}
+	}
+
+	hopeless := &refuseOver{limit: 50}
+	_, err := llm.Chain(hopeless, WithOverflowRecovery(ladder...)).Complete(context.Background(), llm.Request{Messages: msgs})
+	if !errors.Is(err, llm.ErrContextWindow) || len(hopeless.sizes) > maxOverflowAttempts {
+		t.Errorf("err = %v after %d requests, want the refusal within %d", err, len(hopeless.sizes), maxOverflowAttempts)
+	}
+}
+
+// elideAll is a rung that elides every tool result, for observing whether a
+// request went out with the ladder applied.
+type elideAll struct{}
+
+func (elideAll) Apply(v View) []llm.Message { return elideResults(v, v.Messages, len(v.Messages)) }
+func (elideAll) String() string             { return "elide_all" }
+
+// TestCompactionStartsTheLadderAgain: the overflow level is sticky, and it
+// used to stay up after WithCompaction had replaced the transcript that drove
+// it there, so every later request was still trimmed for a problem that was
+// gone.
+func TestCompactionStartsTheLadderAgain(t *testing.T) {
+	var turns []llm.Response
+	for i := range 8 {
+		turns = append(turns, toolTurn(fmt.Sprintf("c%d", i), "big", `{}`))
+	}
+	turns = append(turns, textTurn("done"))
+	cl := scripted(turns...)
+	// Refuse the second call once: by then there is a tool result to elide.
+	calls := 0
+	refuseSecond := llm.ClientFunc(func(ctx context.Context, req llm.Request) (llm.Response, error) {
+		if calls++; calls == 2 {
+			return llm.Response{}, &llm.APIError{Class: llm.ErrContextWindow, Status: 400, Message: "prompt is too long"}
+		}
+		return cl.Complete(ctx, req)
+	})
+	client := llm.Chain(refuseSecond, WithOverflowRecovery(elideAll{}))
+	compactor := func(context.Context, []llm.Message) (string, error) { return "summary", nil }
+	a := newAgent(t, client, []tool.Def{bigTool("big", 8000)},
+		WithCompaction(6000, 2500, compactor), WithForceTerminalLastN(0))
+
+	run := a.Start(context.Background(), Ask("do the big thing"))
+	_, evs := drain(t, run)
+	if err := run.Err(); err != nil {
+		t.Fatal(err)
+	}
+	compacted := false
+	for _, ev := range evs {
+		if _, ok := ev.(TranscriptCompacted); ok {
+			compacted = true
+		}
+	}
+	if !compacted {
+		t.Fatal("premise: the run never compacted")
+	}
+	elided := func(req llm.Request) bool {
+		return strings.Contains(allText(req.Messages)+resultText(req.Messages), elidedPrefix)
+	}
+	if !elided(cl.request(t, 1)) {
+		t.Fatal("premise: the request after the overflow went out with the ladder applied")
+	}
+	if last := cl.request(t, cl.calls()-1); elided(last) {
+		t.Error("the last request was still trimmed by the ladder after compaction replaced the transcript")
+	}
+}
+
+func resultText(msgs []llm.Message) string {
+	var b strings.Builder
+	for _, m := range msgs {
+		for _, blk := range m.Content {
+			if tr, ok := blk.(llm.ToolResult); ok {
+				b.WriteString(tr.Content)
+			}
+		}
+	}
+	return b.String()
 }

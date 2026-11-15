@@ -35,8 +35,26 @@ type Store interface {
 	Delete(id string) error
 }
 
+// RecordVersion is the layout of [SessionRecord] this package writes, and
+// the newest it reads.
+//
+// A change that a reader of the old layout would misread — a field renamed,
+// retyped or given a new meaning — bumps it. A record from a newer layout is
+// then left alone rather than restored wrong: a server rolled back past a
+// format change keeps the sessions the newer one saved, and gets them back
+// when it is rolled forward again. Adding a field a reader may ignore is not
+// such a change.
+const RecordVersion = 1
+
+// ErrNewerRecord reports a saved session written in a newer layout than
+// [RecordVersion].
+var ErrNewerRecord = errors.New("httpapi: session saved by a newer version")
+
 // SessionRecord is what a [Store] keeps of one session.
 type SessionRecord struct {
+	// Version is the layout the record was written in; see [RecordVersion].
+	Version int `json:"version"`
+
 	ID       string         `json:"id"`
 	Options  SessionOptions `json:"options"`
 	Created  time.Time      `json:"created"`
@@ -135,6 +153,15 @@ func (d dirStore) Load() ([]SessionRecord, error) {
 		data, err := os.ReadFile(filepath.Join(d.dir, name))
 		if err != nil {
 			errs = append(errs, err)
+			continue
+		}
+		// The version first: a newer layout may not decode into this one
+		// at all, and "newer" is the error worth reporting.
+		var head struct {
+			Version int `json:"version"`
+		}
+		if err := json.Unmarshal(data, &head); err == nil && head.Version > RecordVersion {
+			errs = append(errs, fmt.Errorf("%s: %w (version %d; this build reads up to %d)", name, ErrNewerRecord, head.Version, RecordVersion))
 			continue
 		}
 		var rec SessionRecord

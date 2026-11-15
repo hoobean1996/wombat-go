@@ -167,6 +167,13 @@ func (m *Manager) restore() {
 	}
 	slices.SortFunc(recs, func(a, b SessionRecord) int { return a.Created.Compare(b.Created) })
 	for _, rec := range recs {
+		if rec.Version > RecordVersion {
+			// From a Store that does not check, which DirStore does. Left
+			// where it is, expiry included: its layout is not this one.
+			m.cfg.Logger.Warn("session store: a session saved by a newer version is left on disk",
+				"session", rec.ID, "version", rec.Version, "reads", RecordVersion)
+			continue
+		}
 		if time.Since(rec.Updated) >= m.cfg.TTL {
 			_ = m.cfg.Store.Delete(rec.ID)
 			continue

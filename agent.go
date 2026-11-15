@@ -82,6 +82,7 @@ type config struct {
 	parallel            int
 	toolFallbackTimeout time.Duration
 	toolFallbackSet     bool
+	untruncated         []string
 
 	systemPrompt string
 	systemBlocks []block
@@ -161,6 +162,15 @@ func WithTools(defs ...tool.Def) Option {
 // WithToolSet supplies a dynamic surface, for cases where visibility changes
 // mid-run (skill gating). Overrides WithTools.
 func WithToolSet(s tool.Set) Option { return func(c *config) { c.set = s } }
+
+// WithTruncationExempt names tools whose output the dispatch chain never
+// clips to [DefaultToolOutputLimit]. skill.Gated.Install passes load_skill: a
+// skill whose middle was cut is worse than none, because the model follows
+// instructions it only half saw, and loading it again returns only a reminder
+// that it is already loaded.
+func WithTruncationExempt(names ...string) Option {
+	return func(c *config) { c.untruncated = append(c.untruncated, names...) }
+}
 
 // WithToolMiddleware appends to the dispatch chain, outside the built-in
 // middleware but inside observation.
@@ -424,12 +434,14 @@ func New(opts ...Option) (*Agent, error) {
 		c.logger = slog.Default()
 	}
 
-	// Kept before anything below is derived from it; see Agent.base. The
-	// slices are clipped so that the appends below always copy rather than
-	// writing into a backing array base still shares.
+	// Kept before anything below is derived from it; see Agent.base. Every
+	// slice is clipped first, so an append — the ones below, or a derived
+	// agent's options in With — always copies rather than writing into a
+	// backing array another agent still shares. Two agents derived from one
+	// parent used to share llmMW's spare capacity, and deriving the second
+	// overwrote the middleware the first had been given.
+	c.clipSlices()
 	base := c
-	c.toolMW = slices.Clip(c.toolMW)
-	c.runCtx = slices.Clip(c.runCtx)
 
 	if len(c.llmMW) > 0 {
 		c.client = llm.Chain(c.client, c.llmMW...)
@@ -518,12 +530,16 @@ func (a *Agent) toolFallback() time.Duration {
 //     the breaker and dedup all see a panic as the failure it is;
 //   - retry sits inside the breaker so the breaker counts logical failures,
 //     not attempts;
-//   - dedup sits outside both so it observes the final verdict, which is the
-//     only thing that tells the model it is stuck;
+//   - the ToolCalls count sits inside every gate — inherited ones included —
+//     so only a call that is about to run is counted;
 //   - inherited middleware — a parent run's permission gate, carried into this
 //     run by the delegate call it allowed — sits just inside the caller's own
 //     middleware, so this agent's own gate rules first (see
 //     [tool.WithInherited]);
+//   - dedup and the budget's loop detection sit outside the caller's
+//     middleware, so they see every call the model asked for, refused ones
+//     included: asking again for a call a policy just refused is being stuck
+//     too, and the model is the one who has to be told;
 //   - observation is outermost so one logical call produces exactly one
 //     Start/Done pair, with retries already collapsed.
 //
@@ -537,13 +553,14 @@ func (a *Agent) defaultToolChain() tool.Handler {
 		tool.WithTimeout(a.toolFallback()),
 		tool.WithRetry(tool.RetryPolicy{MaxAttempts: DefaultToolRetryAttempts}),
 		tool.WithCircuitBreaker(DefaultBreakerThreshold, DefaultBreakerCooldown),
-		tool.WithDedupRepeats(DefaultDedupThreshold),
-		tool.WithTruncation(DefaultToolOutputLimit),
+		tool.WithTruncation(DefaultToolOutputLimit, a.cfg.untruncated...),
+		budgetToolCalls,
 		tool.WithInherited,
 	}
 	mw = append(mw, a.cfg.toolMW...)
 	mw = append(mw,
-		budgetToolCalls,
+		tool.WithDedupRepeats(DefaultDedupThreshold),
+		budgetAttempts,
 		tool.WithLogging(a.log),
 		tool.WithObserver(observeTool),
 	)
@@ -560,12 +577,7 @@ func (a *Agent) defaultToolChain() tool.Handler {
 // [WithTracing] install is installed once, and an opts entry that replaces the
 // client or the tracer is wrapped exactly like the original was.
 func (a *Agent) With(opts ...Option) (*Agent, error) {
-	base := a.base
-	base.systemBlocks = append([]block(nil), a.base.systemBlocks...)
-	base.envBlocks = append([]block(nil), a.base.envBlocks...)
-	base.tools = append([]tool.Def(nil), a.base.tools...)
-	base.toolMW = append([]tool.Middleware(nil), a.base.toolMW...)
-	base.runCtx = append([]func(context.Context) context.Context(nil), a.base.runCtx...)
+	base := a.base // every slice in it is clipped (see New), so opts append to copies
 
 	all := make([]Option, 0, len(opts)+1)
 	all = append(all, func(c *config) { *c = base })
@@ -641,4 +653,18 @@ func observeTool(ctx context.Context, o tool.Observation) {
 		}
 		Emit(ctx, ev)
 	}
+}
+
+// clipSlices clips every slice in c, so that appending to any of them copies.
+// TestClipSlicesCoversEveryField fails when config gains a slice field this
+// does not clip: an unclipped one is shared by every agent derived from it.
+func (c *config) clipSlices() {
+	c.tools = slices.Clip(c.tools)
+	c.toolMW = slices.Clip(c.toolMW)
+	c.systemBlocks = slices.Clip(c.systemBlocks)
+	c.envBlocks = slices.Clip(c.envBlocks)
+	c.llmMW = slices.Clip(c.llmMW)
+	c.runCtx = slices.Clip(c.runCtx)
+	c.metricOpts = slices.Clip(c.metricOpts)
+	c.untruncated = slices.Clip(c.untruncated)
 }

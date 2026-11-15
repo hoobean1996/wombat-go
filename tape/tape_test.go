@@ -788,6 +788,32 @@ func TestLoadRejectsCorruptLines(t *testing.T) {
 		}
 	})
 
+	// A line from a newer layout is refused by name: replayed, it could be
+	// read as something it is not; skipped, it is a miss nobody can explain.
+	t.Run("newer format", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "newer.jsonl")
+		line := fmt.Sprintf(`{"kind":"llm","key":"a","seq":0,"request":{},"response":{},"format":%d}`, formatRevision+1)
+		if err := os.WriteFile(path, []byte(line+"\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		_, err := Open(path, Replay)
+		if err == nil || !strings.Contains(err.Error(), "newer version") || !strings.Contains(err.Error(), "line 1") {
+			t.Fatalf("got error %v, want one saying line 1 is from a newer version", err)
+		}
+	})
+
+	// The revision this package writes is the one every existing tape is in,
+	// so it costs them nothing: no new key on the line, no re-record.
+	t.Run("current lines carry no revision", func(t *testing.T) {
+		raw, err := os.ReadFile(good(t))
+		if err != nil {
+			t.Fatalf("ReadFile: %v", err)
+		}
+		if formatRevision == 0 && strings.Contains(string(raw), `"format"`) {
+			t.Errorf("a revision-0 line spells its revision out, which changes every line of every re-recorded tape:\n%s", raw)
+		}
+	})
+
 	t.Run("blank lines are tolerated", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "blank.jsonl")
 		body := "\n" + `{"kind":"llm","key":"a","seq":0,"request":{},"response":{}}` + "\n\n"

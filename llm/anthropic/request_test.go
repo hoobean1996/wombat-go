@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -534,5 +535,56 @@ func TestEncodeMediaRefusesAnUnsupportedType(t *testing.T) {
 	}}}}, "m", 10, false)
 	if !errors.Is(err, llm.ErrBadRequest) {
 		t.Errorf("err = %v, want ErrBadRequest naming the type", err)
+	}
+}
+
+// TestServerClearingNeverTakesASkillBody: a skill's activation lives on the
+// client, which retires a skill whose body it removed. A body the server
+// cleared would leave the skill's tools on offer with their instructions gone.
+func TestServerClearingNeverTakesASkillBody(t *testing.T) {
+	cfg := Config{Beta: []string{BetaContextManagement}}
+	for _, tc := range []struct {
+		tools []llm.ToolSpec
+		want  []string
+	}{
+		{[]llm.ToolSpec{toolSpec("alpha"), toolSpec("load_skill")}, []string{"load_skill"}},
+		{[]llm.ToolSpec{toolSpec("alpha")}, nil}, // never name a tool the request does not carry
+	} {
+		body := encodeFor(t, cfg, llm.Request{Messages: []llm.Message{llm.UserText("q")}, Tools: tc.tools})
+		var doc struct {
+			ContextManagement *contextManagement `json:"context_management"`
+		}
+		decodeBody(t, body, &doc)
+		if got := doc.ContextManagement.Edits[0].ExcludeTools; !slices.Equal(got, tc.want) {
+			t.Errorf("exclude_tools = %v, want %v", got, tc.want)
+		}
+	}
+}
+
+// TestClearedTokensAreReported: what the server cleared is reported, so the
+// harness can still compare its estimate with the request it actually sent.
+func TestClearedTokensAreReported(t *testing.T) {
+	body := `{"model":"m","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn",
+		"usage":{"input_tokens":100,"output_tokens":5},
+		"context_management":{"applied_edits":[{"type":"clear_tool_uses_20250919","cleared_tool_uses":3,"cleared_input_tokens":4000}]}}`
+	resp, err := decodeMessage(strings.NewReader(body), "m", 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Usage.ClearedInputTokens != 4000 || resp.Usage.RequestTokens() != 4100 || resp.Usage.PromptTokens() != 100 {
+		t.Errorf("usage = %+v, want 4000 cleared on top of the 100 read", resp.Usage)
+	}
+
+	stream := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"m\",\"usage\":{\"input_tokens\":100}}}\n\n" +
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"ok\"}}\n\n" +
+		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}," +
+		"\"context_management\":{\"applied_edits\":[{\"type\":\"clear_tool_uses_20250919\",\"cleared_input_tokens\":4000}]}}\n\n" +
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+	sresp, err := readStream(strings.NewReader(stream), nil, "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sresp.Usage.ClearedInputTokens != 4000 || sresp.Usage.InputTokens != 100 {
+		t.Errorf("streamed usage = %+v, want the cleared tokens alongside the input", sresp.Usage)
 	}
 }

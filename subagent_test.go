@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -640,4 +641,51 @@ func TestPreview(t *testing.T) {
 			t.Errorf("preview cut mid-rune: %d bytes of a 3-byte-rune string", len(body))
 		}
 	})
+}
+
+func TestParallelDelegateRefusesTooManyTasks(t *testing.T) {
+	childCl := scripted(textTurn("never"))
+	child := newAgent(t, childCl, nil)
+	d := ParallelDelegateTool(child, WithMaxTasks(2))
+	_, err := d.Fn(context.Background(), json.RawMessage(`{"tasks":["a","b","c"]}`))
+	if !errors.Is(err, ErrTooManyTasks) || !tool.IsCallerFault(err) {
+		t.Errorf("err = %v, want ErrTooManyTasks as a caller fault", err)
+	}
+	if childCl.calls() != 0 {
+		t.Errorf("the child ran %d times for a refused call", childCl.calls())
+	}
+}
+
+// TestParallelDelegateStartsNoQueuedBranchAfterCancel: a branch waiting for a
+// slot used to wait it out and then start a child run on the cancelled
+// context, one queued task after another.
+func TestParallelDelegateStartsNoQueuedBranchAfterCancel(t *testing.T) {
+	blocked := llm.ClientFunc(func(ctx context.Context, _ llm.Request) (llm.Response, error) {
+		<-ctx.Done()
+		return llm.Response{}, context.Cause(ctx)
+	})
+	child := newAgent(t, blocked, nil)
+	d := ParallelDelegateTool(child, WithMaxBranches(1))
+
+	var mu sync.Mutex
+	started := 0
+	first := make(chan struct{})
+	ctx, cancel := context.WithCancel(WithEmitter(context.Background(), func(e Event) {
+		if _, ok := e.(SubagentStart); ok {
+			mu.Lock()
+			if started++; started == 1 {
+				close(first)
+			}
+			mu.Unlock()
+		}
+	}))
+	go func() { <-first; cancel() }()
+	if _, err := d.Fn(ctx, json.RawMessage(`{"tasks":["a","b","c"]}`)); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if started != 1 {
+		t.Errorf("%d branches started, want only the one running when the run was cancelled", started)
+	}
 }

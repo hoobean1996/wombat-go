@@ -94,7 +94,7 @@ func (s *Session) recordLocked(msgs []llm.Message) (SessionRecord, uint64) {
 	}
 	s.saveSeq++
 	return SessionRecord{
-		ID: s.id, Options: s.opts, Created: s.created, Updated: s.updated,
+		Version: RecordVersion, ID: s.id, Options: s.opts, Created: s.created, Updated: s.updated,
 		Turns: s.turns, State: s.state, Messages: msgs, Spend: s.spend,
 		Outcome: s.outcome, Answer: s.answer, Error: s.errText, ErrorKind: s.errKind,
 		PauseID: s.pauseID, Events: s.base + len(s.frames),

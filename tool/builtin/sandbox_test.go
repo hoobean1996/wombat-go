@@ -4,13 +4,19 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/hoobean1996/wombat-go/internal/fspath"
 )
 
 // ===== the environment =====
@@ -143,9 +149,75 @@ func TestPlanSandbox(t *testing.T) {
 
 func TestPlanSandboxCredentialsCanBeOptedInto(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
+	t.Setenv("SSH_AUTH_SOCK", "/agents/ssh.sock")
 	p, _ := testPlan(t, Sandbox{ReadCredentials: true})
-	if len(p.denied) != 0 {
-		t.Errorf("denied = %q, want nothing with ReadCredentials", p.denied)
+	if len(p.denied) != 0 || len(p.sockets) != 0 {
+		t.Errorf("denied = %q, sockets = %q; want neither with ReadCredentials", p.denied, p.sockets)
+	}
+}
+
+// TestPlanSandboxClosesAgentSockets: leaving SSH_AUTH_SOCK out of the child's
+// environment hid the path and nothing else. The agent's socket sat under the
+// shared temp directory, which is writable and so open to sockets, and the
+// child could list that directory as well as the harness could.
+func TestPlanSandboxClosesAgentSockets(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix socket paths")
+	}
+	t.Setenv("HOME", t.TempDir())
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	agentDir := filepath.Join(tmp, "ssh-AbCd1234") // where ssh-agent puts one it starts
+	if err := os.Mkdir(agentDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rt := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", rt)
+	t.Setenv("SSH_AUTH_SOCK", "/agents/ssh.sock")
+	t.Setenv("TMUX", "/mux/tmux-1/default,4242,0")
+	t.Setenv("DOCKER_HOST", "unix:///daemons/docker.sock")
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/bus/session,guid=1f2e")
+	t.Setenv("NVIM", "127.0.0.1:6666") // an address, not a path
+
+	p, _ := testPlan(t, Sandbox{})
+	for _, want := range []string{
+		"/agents/ssh.sock", "/mux/tmux-1/default", "/daemons/docker.sock", "/bus/session",
+		realPath(rt), realPath(agentDir),
+		filepath.Join(realPath(tmp), fmt.Sprintf("tmux-%d", os.Getuid())),
+	} {
+		if !slices.Contains(p.sockets, want) {
+			t.Errorf("sockets %q is missing %q", p.sockets, want)
+		}
+	}
+	for _, s := range p.sockets {
+		if strings.Contains(s, "6666") {
+			t.Errorf("a TCP address was taken for a path: %q", s)
+		}
+	}
+}
+
+func TestSocketPath(t *testing.T) {
+	for _, tc := range []struct{ name, v, want string }{
+		{"SSH_AUTH_SOCK", "/tmp/ssh-x/agent.1", "/tmp/ssh-x/agent.1"},
+		{"SSH_AUTH_SOCK", "", ""},
+		{"SSH_AUTH_SOCK", "relative/agent", ""},
+		{"TMUX", "/tmp/tmux-501/default,1234,0", "/tmp/tmux-501/default"},
+		{"GPG_AGENT_INFO", "/home/u/.gnupg/S.gpg-agent:1234:1", "/home/u/.gnupg/S.gpg-agent"},
+		{"DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus", "/run/user/1000/bus"},
+		{"DBUS_SESSION_BUS_ADDRESS", "unix:guid=ab,path=/run/user/1000/bus;tcp:host=x", "/run/user/1000/bus"},
+		{"DBUS_SESSION_BUS_ADDRESS", "unix:abstract=/tmp/dbus-x,guid=ab", ""},
+		{"DOCKER_HOST", "unix:///var/run/docker.sock", "/var/run/docker.sock"},
+		{"DOCKER_HOST", "tcp://127.0.0.1:2375", ""},
+		{"KITTY_LISTEN_ON", "unix:/tmp/kitty", "/tmp/kitty"},
+		{"KITTY_LISTEN_ON", "unix:@kitty", ""},
+		{"NVIM", "127.0.0.1:6666", ""},
+	} {
+		if runtime.GOOS == "windows" {
+			t.Skip("unix socket paths")
+		}
+		if got := socketPath(tc.name, tc.v); got != tc.want {
+			t.Errorf("socketPath(%s=%q) = %q, want %q", tc.name, tc.v, got, tc.want)
+		}
 	}
 }
 
@@ -217,6 +289,29 @@ func TestSeatbeltProfile(t *testing.T) {
 	if strings.Contains(full, "(deny network*)") {
 		t.Errorf("NetFull denies the network:\n%s", full)
 	}
+
+	// The sockets are closed in every network mode — NetFull opens the
+	// network, not the user's agents — and after the rules that open the
+	// sockets under a writable directory, which would otherwise win.
+	for _, n := range []Network{NetLoopback, NetNone, NetFull} {
+		prof := seatbeltProfile(sandboxPlan{
+			writable: []string{"/private/tmp"},
+			sockets:  []string{"/private/tmp/ssh-x"},
+			denied:   []string{"/home/u/.gnupg"},
+			network:  n,
+		})
+		for _, want := range []string{
+			`(deny network-outbound (remote unix-socket (subpath "/private/tmp/ssh-x")))`,
+			`(deny network-outbound (remote unix-socket (subpath "/home/u/.gnupg")))`,
+		} {
+			i := strings.Index(prof, want)
+			if i < 0 {
+				t.Errorf("network %v: the profile is missing %s:\n%s", n, want, prof)
+			} else if strings.LastIndex(prof, "(allow network-outbound") > i {
+				t.Errorf("network %v: %s precedes an allow that overrides it:\n%s", n, want, prof)
+			}
+		}
+	}
 }
 
 // TestSeatbeltProfileCompiles hands every variant of the profile to
@@ -282,6 +377,55 @@ func TestBwrapArgs(t *testing.T) {
 	}
 }
 
+// TestBwrapArgsHideSockets: a mount covers what was mounted under it before,
+// so the order of the arguments decides which of two nested paths wins.
+func TestBwrapArgsHideSockets(t *testing.T) {
+	base := t.TempDir()
+	dir := func(rel string) string {
+		p := filepath.Join(base, rel)
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	tmp := dir("tmp")          // writable
+	agents := dir("tmp/ssh-x") // a socket directory under it: hidden
+	rt := dir("run")           // the runtime directory: hidden
+	rtTmp := dir("run/tmp")    // a writable TMPDIR inside it: bound back
+	sock := filepath.Join(rtTmp, "agent.sock")
+	if err := os.WriteFile(sock, nil, 0o600); err != nil { // stands in for a socket under that
+		t.Fatal(err)
+	}
+	same := dir("same") // both writable and a socket directory: hidden
+	p := sandboxPlan{
+		writable: []string{tmp, rtTmp, same},
+		sockets:  []string{sock, agents, rt, same, filepath.Join(base, "gone")},
+		network:  NetLoopback,
+	}
+	args := " " + strings.Join(bwrapArgs(p), " ") + " "
+	at := func(arg string) int {
+		i := strings.Index(args, " "+arg+" ")
+		if i < 0 {
+			t.Errorf("bwrap args are missing %q:\n%s", arg, args)
+		}
+		return i
+	}
+	for _, order := range [][]string{
+		{"--bind " + tmp + " " + tmp, "--tmpfs " + agents},
+		{"--tmpfs " + rt, "--bind " + rtTmp + " " + rtTmp, "--ro-bind /dev/null " + sock},
+		{"--bind " + same + " " + same, "--tmpfs " + same},
+	} {
+		for i := 1; i < len(order); i++ {
+			if a, b := at(order[i-1]), at(order[i]); a >= 0 && b >= 0 && a > b {
+				t.Errorf("%q comes after %q, so it is covered by it:\n%s", order[i-1], order[i], args)
+			}
+		}
+	}
+	if strings.Contains(args, "gone") {
+		t.Errorf("bwrap args mount a path that does not exist:\n%s", args)
+	}
+}
+
 func TestParseNetwork(t *testing.T) {
 	for in, want := range map[string]Network{"": NetLoopback, "loopback": NetLoopback, "none": NetNone, "FULL": NetFull} {
 		if got, err := ParseNetwork(in); err != nil || got != want {
@@ -308,9 +452,16 @@ func TestSandboxRunnerConfines(t *testing.T) {
 		t.Fatal(err)
 	}
 	work := t.TempDir()
-	outside := t.TempDir()
+	sb := Sandbox{CacheDir: filepath.Join(t.TempDir(), "c"), Network: NetNone}
 
-	r, err := SandboxRunner(work, Sandbox{CacheDir: filepath.Join(t.TempDir(), "c"), Network: NetNone})
+	// The ssh agent's socket, somewhere only SSH_AUTH_SOCK says: under the
+	// temp directory, whose sockets are open to a test talking to itself.
+	// Short paths, because a socket's is capped at about 100 bytes.
+	agent, agentConns := listen(t, "ag")
+	t.Setenv("SSH_AUTH_SOCK", agent)
+	own, ownConns := listen(t, "ok")
+
+	r, err := SandboxRunner(work, sb)
 	if errors.Is(err, ErrNoSandbox) {
 		t.Skipf("no sandbox can be applied here: %v", err)
 	}
@@ -322,10 +473,86 @@ func TestSandboxRunnerConfines(t *testing.T) {
 	if _, err := r.Shell(ctx, "echo ok > "+shQuote(filepath.Join(work, "in.txt"))); err != nil {
 		t.Errorf("a write inside the workspace failed: %v", err)
 	}
-	if _, err := r.Shell(ctx, "echo no > "+shQuote(filepath.Join(outside, "out.txt"))); err == nil {
-		t.Error("a write outside the workspace succeeded")
-	}
 	if out, _ := r.Shell(ctx, "cat "+shQuote(filepath.Join(home, ".ssh", "id_test"))); strings.Contains(out, "PRIVATE") {
 		t.Error("a credential file was readable")
 	}
+
+	// Outside means outside every writable directory, and the temp
+	// directory is one of them — the package directory is not, unless the
+	// checkout itself lives somewhere writable.
+	outside, err := os.MkdirTemp(".", ".sandbox-outside-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(outside) })
+	outside = realPath(outside)
+	plan, err := planSandbox(work, sb, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.ContainsFunc(plan.writable, func(w string) bool { return fspath.Within(w, outside) }) {
+		t.Logf("%s is under a writable directory; not checking a write outside them", outside)
+	} else {
+		target := filepath.Join(outside, "out.txt")
+		if _, err := r.Shell(ctx, "echo no > "+shQuote(target)); err == nil {
+			t.Error("a write outside the writable directories succeeded")
+		}
+		if _, err := os.Stat(target); err == nil {
+			t.Error("a write outside the writable directories left a file")
+		}
+	}
+
+	nc, err := exec.LookPath("nc")
+	if err != nil {
+		t.Log("no nc; not checking the sockets")
+		return
+	}
+	dial := func(sock string) { _, _ = r.Shell(ctx, "echo hi | "+shQuote(nc)+" -U -w 2 "+shQuote(sock)) }
+	dial(own)
+	if !eventually(func() bool { return ownConns.Load() > 0 }) {
+		t.Log("nc reached no socket at all, not even one the sandbox allows; not checking the agent's")
+		return
+	}
+	dial(agent)
+	if eventually(func() bool { return agentConns.Load() > 0 }) {
+		t.Error("a confined command connected to the ssh agent's socket")
+	}
+}
+
+// listen accepts connections on a unix socket in a new directory under the
+// temp directory, and counts them.
+func listen(t *testing.T, prefix string) (string, *atomic.Int32) {
+	t.Helper()
+	d, err := os.MkdirTemp("", prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(d) })
+	path := filepath.Join(d, "s")
+	l, err := net.Listen("unix", path)
+	if err != nil {
+		t.Skipf("cannot listen on %s: %v", path, err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	var n atomic.Int32
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			n.Add(1)
+			_ = c.Close()
+		}
+	}()
+	return path, &n
+}
+
+func eventually(cond func() bool) bool {
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		if cond() {
+			return true
+		}
+	}
+	return cond()
 }

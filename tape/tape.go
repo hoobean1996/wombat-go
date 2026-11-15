@@ -366,6 +366,9 @@ func (t *Tape) loadLine(byKey map[recKey][]seqEntry, line []byte, lineNo int) er
 	if err := json.Unmarshal(trimmed, &e); err != nil {
 		return fmt.Errorf("tape: %s line %d is not a tape entry (delete the line to recover the rest): %w", t.path, lineNo, err)
 	}
+	if e.Format > formatRevision {
+		return fmt.Errorf("tape: %s line %d is in format revision %d, written by a newer version of this package; this one reads up to %d", t.path, lineNo, e.Format, formatRevision)
+	}
 	switch e.Kind {
 	case kindLLM, kindTool:
 	default:
@@ -494,6 +497,7 @@ func (t *Tape) record(k recKey, req, resp json.RawMessage) {
 		Seq:      seq,
 		Request:  req,
 		Response: resp,
+		Format:   formatRevision,
 	})
 	if err != nil {
 		t.setWriteErr(fmt.Errorf("tape: encode %s entry: %w", k.kind, err))

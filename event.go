@@ -148,11 +148,16 @@ type ContextTrimmed struct {
 
 // ContextOverflow reports that the provider refused a request as too long and
 // [WithOverflowRecovery] is retrying it shorter, at Level of its ladder.
+//
+// The sizes are estimates. Messages can stay the same while tokens fall a
+// long way: eliding tool results keeps every message and drops their bodies.
 type ContextOverflow struct {
 	Level          int    `json:"level"`
 	Strategy       string `json:"strategy"`
 	MessagesBefore int    `json:"messages_before"`
 	MessagesAfter  int    `json:"messages_after"`
+	TokensBefore   int    `json:"tokens_before"`
+	TokensAfter    int    `json:"tokens_after"`
 }
 
 // TranscriptCompacted reports that [WithCompaction] folded the oldest Folded

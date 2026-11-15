@@ -23,6 +23,11 @@ func (g Gated) Install() wombat.Option {
 	opts := []wombat.Option{
 		wombat.WithToolSet(g.Set),
 		wombat.WithToolMiddleware(g.Middleware),
+		// A skill body is never clipped. Cutting its middle leaves the model
+		// following instructions it only half saw, and loading the skill again
+		// returns a reminder rather than the body, so the cut part could never
+		// be recovered.
+		wombat.WithTruncationExempt(LoadToolName),
 	}
 	// Installed skills first, then the loadable catalogue: method before
 	// reference, in an order that never changes, because both blocks are part

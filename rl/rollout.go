@@ -199,8 +199,15 @@ func Rollout(ctx context.Context, mk AgentFunc, env Env, n int, opts ...Option) 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
+			// Cancelled while waiting for a slot: run without one. The episode
+			// ends at its first check of ctx and records why, and the group
+			// returns now rather than after every queued sample has taken its
+			// turn at being cancelled.
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+			}
 
 			ep := runEpisode(ctx, mk, env, sample, &cfg)
 			// Distinct indices from distinct goroutines: no lock needed, and

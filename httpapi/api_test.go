@@ -391,6 +391,133 @@ func TestUIAndMetricsMount(t *testing.T) {
 	h.wantErr(h.do(http.MethodGet, "/api/nope", ""), http.StatusNotFound, "not_found")
 }
 
+// ===== who may call =====
+
+// raw sends a request with headers the harness's do would not set.
+func (h *apiHarness) raw(method, path, body string, set func(*http.Request)) *http.Response {
+	h.t.Helper()
+	var rdr io.Reader
+	if body != "" {
+		rdr = strings.NewReader(body)
+	}
+	req, err := http.NewRequest(method, h.srv.URL+path, rdr)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	if set != nil {
+		set(req)
+	}
+	resp, err := h.srv.Client().Do(req)
+	if err != nil {
+		h.t.Fatalf("%s %s: %v", method, path, err)
+	}
+	h.t.Cleanup(func() { _ = resp.Body.Close() })
+	return resp
+}
+
+// TestBodiesMustBeDeclaredJSON is a regression test for a cross-site request
+// forgery. text/plain is a type any page may POST to any origin without a
+// preflight, and the body was decoded whatever its type: a page on any site
+// the operator visited could start a session here, with a prompt of its
+// choosing, and the session ran tools on the operator's machine. That it
+// could not read the 201 did not matter.
+func TestBodiesMustBeDeclaredJSON(t *testing.T) {
+	t.Parallel()
+	h := apiServe(t, apiScript(apiText("ran"), apiText("ran")), nil, nil)
+	prompt := `{"prompt":"do what the page says"}`
+	for _, ct := range []string{"text/plain", "application/x-www-form-urlencoded", "multipart/form-data; boundary=x", ""} {
+		resp := h.raw(http.MethodPost, "/api/sessions", prompt, func(r *http.Request) {
+			r.Header.Set("Origin", "https://elsewhere.example")
+			if ct != "" {
+				r.Header.Set("Content-Type", ct)
+			}
+		})
+		h.wantErr(resp, http.StatusUnsupportedMediaType, "unsupported_media_type")
+	}
+	var list httpapi.SessionList
+	h.decode(h.do(http.MethodGet, "/api/sessions", ""), http.StatusOK, &list)
+	if len(list.Sessions) != 0 {
+		t.Fatalf("a body not declared JSON started %d session(s)", len(list.Sessions))
+	}
+
+	resp := h.raw(http.MethodPost, "/api/sessions", prompt, func(r *http.Request) {
+		r.Header.Set("Content-Type", "application/json; charset=utf-8")
+	})
+	h.decode(resp, http.StatusCreated, nil)
+}
+
+func TestBearerToken(t *testing.T) {
+	t.Parallel()
+	ui := fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("<h1>wombat</h1>")}}
+	metrics := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "# HELP x\n") })
+	h := apiServe(t, apiScript(apiText("hi")), nil, nil, httpapi.WithBearerToken("s3cret"),
+		httpapi.WithUI(ui), httpapi.WithMetrics(metrics), httpapi.WithCORS("http://ui.example"))
+	bearer := func(tok string) func(*http.Request) {
+		return func(r *http.Request) {
+			r.Header.Set("Authorization", "Bearer "+tok)
+			r.Header.Set("Content-Type", "application/json")
+		}
+	}
+
+	for _, set := range []func(*http.Request){nil, bearer("wrong"), bearer("s3cret-and-more")} {
+		resp := h.raw(http.MethodGet, "/api/sessions", "", set)
+		if resp.Header.Get("WWW-Authenticate") == "" {
+			t.Error("a 401 without WWW-Authenticate does not say what it wants")
+		}
+		h.wantErr(resp, http.StatusUnauthorized, "unauthorized")
+	}
+	h.wantErr(h.raw(http.MethodGet, "/metrics", "", nil), http.StatusUnauthorized, "unauthorized")
+	h.wantErr(h.raw(http.MethodGet, "/./api/../api/sessions", "", nil), http.StatusUnauthorized, "unauthorized")
+
+	// Open: the probe, the page that asks for the token, and a preflight.
+	for _, p := range []string{"/api/health", "/"} {
+		if resp := h.raw(http.MethodGet, p, "", nil); resp.StatusCode != http.StatusOK {
+			t.Errorf("GET %s without a token = %d, want it open", p, resp.StatusCode)
+		}
+	}
+	pre := h.raw(http.MethodOptions, "/api/sessions", "", func(r *http.Request) {
+		r.Header.Set("Origin", "http://ui.example")
+		r.Header.Set("Access-Control-Request-Method", "POST")
+		r.Header.Set("Access-Control-Request-Headers", "authorization, content-type")
+	})
+	if pre.StatusCode != http.StatusNoContent || !strings.Contains(pre.Header.Get("Access-Control-Allow-Headers"), "Authorization") {
+		t.Errorf("preflight = %d, Allow-Headers %q; want 204 allowing Authorization", pre.StatusCode, pre.Header.Get("Access-Control-Allow-Headers"))
+	}
+
+	var info httpapi.SessionInfo
+	h.decode(h.raw(http.MethodPost, "/api/sessions", `{"prompt":"hello"}`, bearer("s3cret")), http.StatusCreated, &info)
+	lower := h.raw(http.MethodGet, "/api/sessions", "", func(r *http.Request) { r.Header.Set("Authorization", "bearer s3cret") })
+	h.decode(lower, http.StatusOK, nil) // the scheme is case-insensitive
+
+	// EventSource cannot set a header, so the stream takes the token in its
+	// URL — and only the stream does.
+	ev := h.raw(http.MethodGet, "/api/sessions/"+info.ID+"/events?access_token=s3cret", "", nil)
+	if ev.StatusCode != http.StatusOK || ev.Header.Get("Content-Type") != "text/event-stream" {
+		t.Errorf("events with ?access_token = %d %s, want the stream", ev.StatusCode, ev.Header.Get("Content-Type"))
+	}
+	_ = ev.Body.Close()
+	h.wantErr(h.raw(http.MethodGet, "/api/sessions/"+info.ID+"/events?access_token=wrong", "", nil), http.StatusUnauthorized, "unauthorized")
+	h.wantErr(h.raw(http.MethodGet, "/api/sessions?access_token=s3cret", "", nil), http.StatusUnauthorized, "unauthorized")
+}
+
+// TestAllowedHosts: DNS rebinding makes a page on another site same-origin
+// with a loopback server, responses and all. What it cannot change is the
+// Host header, which still names the attacker's domain.
+func TestAllowedHosts(t *testing.T) {
+	t.Parallel()
+	h := apiServe(t, apiScript(apiText("hi")), nil, nil, httpapi.WithAllowedHosts("localhost", "127.0.0.1", "[::1]"))
+	host := func(name string) func(*http.Request) { return func(r *http.Request) { r.Host = name } }
+
+	for _, bad := range []string{"rebound.example", "rebound.example:8080", "localhost.rebound.example", "127.0.0.1.nip.io"} {
+		h.wantErr(h.raw(http.MethodGet, "/api/sessions", "", host(bad)), http.StatusMisdirectedRequest, "misdirected")
+	}
+	for _, good := range []string{"localhost:8080", "LOCALHOST", "127.0.0.1:1", "[::1]:8080"} {
+		if resp := h.raw(http.MethodGet, "/api/sessions", "", host(good)); resp.StatusCode != http.StatusOK {
+			t.Errorf("Host %q = %d, want it served", good, resp.StatusCode)
+		}
+	}
+}
+
 // ===== sessions =====
 
 func TestCreateSessionRunsTheFirstTurn(t *testing.T) {
@@ -1067,7 +1194,7 @@ func TestCORSActualRequest(t *testing.T) {
 		t.Fatalf("Expose-Headers = %q", resp.Header.Get("Access-Control-Expose-Headers"))
 	}
 	if resp.Header.Get("Access-Control-Allow-Credentials") != "" {
-		t.Fatal("credentialed CORS is never offered: there is no auth here to carry")
+		t.Fatal("credentialed CORS is never offered: a bearer token rides in a header the page sets, not in a cookie the browser adds")
 	}
 }
 

@@ -20,6 +20,30 @@ type apiMessage struct {
 	Content    []apiBlock `json:"content"`
 	StopReason string     `json:"stop_reason"`
 	Usage      llm.Usage  `json:"usage"`
+
+	ContextManagement *appliedEdits `json:"context_management"`
+}
+
+// appliedEdits is what the server reports of the context edits it applied to
+// a request before reading it.
+type appliedEdits struct {
+	Applied []struct {
+		Type               string `json:"type"`
+		ClearedToolUses    int    `json:"cleared_tool_uses"`
+		ClearedInputTokens int    `json:"cleared_input_tokens"`
+	} `json:"applied_edits"`
+}
+
+// cleared is how many input tokens the edits removed; 0 for none.
+func (a *appliedEdits) cleared() int {
+	if a == nil {
+		return 0
+	}
+	n := 0
+	for _, e := range a.Applied {
+		n += e.ClearedInputTokens
+	}
+	return n
 }
 
 // apiBlock is one response content block. Every known variant's fields are
@@ -52,10 +76,12 @@ func decodeMessage(r io.Reader, requestedModel string, limit int) (llm.Response,
 		// well-formed request.
 		return llm.Response{}, llm.ClassifyTransport(fmt.Errorf("anthropic: decode response: %w", err))
 	}
+	usage := msg.Usage
+	usage.ClearedInputTokens = msg.ContextManagement.cleared()
 	return llm.Response{
 		Content:    decodeBlocks(msg.Content),
 		StopReason: llm.StopReason(msg.StopReason),
-		Usage:      msg.Usage,
+		Usage:      usage,
 		Model:      pick(msg.Model, requestedModel),
 	}, nil
 }

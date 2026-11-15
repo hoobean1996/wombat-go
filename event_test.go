@@ -126,9 +126,11 @@ func TestEventTypesAreExhaustivelyDiscriminated(t *testing.T) {
 		})
 	}
 
-	// Every type the package defines must be reachable from the list. This is
-	// the half a test can only approximate; the list is checked against the
-	// kinds the loop actually emits in TestRunToolCallThenAnswerEventOrder.
+	// Every type the package defines must be reachable from the list. The
+	// exact check — every type with a Kind method, read from the source — is
+	// TestEveryEventIsRegistered in internal/wiringcheck; this one keeps the
+	// core kinds by name, and TestRunToolCallThenAnswerEventOrder checks the
+	// list against the kinds the loop actually emits.
 	for _, want := range []string{
 		"iter_start", "llm_start", "text_delta", "reasoning_delta", "tool_args_delta",
 		"llm_done", "tool_start", "tool_done", "spend",

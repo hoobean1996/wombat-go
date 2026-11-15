@@ -73,6 +73,11 @@ type Usage struct {
 	OutputTokens     int `json:"output_tokens"`
 	CacheWriteTokens int `json:"cache_creation_input_tokens,omitempty"`
 	CacheReadTokens  int `json:"cache_read_input_tokens,omitempty"`
+
+	// ClearedInputTokens is what the provider removed from the request
+	// before reading it — Anthropic's server-side clear_tool_uses edit. Not
+	// charged, and not part of PromptTokens.
+	ClearedInputTokens int `json:"cleared_input_tokens,omitempty"`
 }
 
 // PromptTokens is the size of the request the provider read: input tokens
@@ -81,12 +86,20 @@ type Usage struct {
 // counts cached tokens inside itself, is normalised to the same shape.
 func (u Usage) PromptTokens() int { return u.InputTokens + u.CacheReadTokens + u.CacheWriteTokens }
 
+// RequestTokens is the size of the request as it was sent: PromptTokens plus
+// whatever the provider cleared from it before reading. It is the number to
+// compare an estimate of the sent messages against — calibrating on
+// PromptTokens alone would teach the estimator that every message is smaller
+// than it is, by however much the server happened to clear.
+func (u Usage) RequestTokens() int { return u.PromptTokens() + u.ClearedInputTokens }
+
 // Add accumulates u2 into u.
 func (u *Usage) Add(u2 Usage) {
 	u.InputTokens += u2.InputTokens
 	u.OutputTokens += u2.OutputTokens
 	u.CacheWriteTokens += u2.CacheWriteTokens
 	u.CacheReadTokens += u2.CacheReadTokens
+	u.ClearedInputTokens += u2.ClearedInputTokens
 }
 
 // ===== Content blocks =====

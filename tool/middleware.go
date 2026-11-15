@@ -539,10 +539,10 @@ func WithDedupRepeats(threshold int) Middleware {
 // motivating case: a half-loaded skill is worse than no skill at all, because
 // the model acts on instructions whose second half it never saw.
 //
-// Errors are deliberately left alone. Truncating an error string would cut off
-// the note WithDedupRepeats appends — the layer immediately inside this one —
-// and would mean re-wrapping, which destroys the identity errors.Is depends
-// on. Tool errors are short; observations are what blow up.
+// Errors are deliberately left alone. Truncating an error string could cut off
+// the note WithDedupRepeats appends, and would mean re-wrapping, which destroys
+// the identity errors.Is depends on. Tool errors are short; observations are
+// what blow up.
 //
 // limit at zero disables truncation.
 func WithTruncation(limit int, exempt ...string) Middleware {

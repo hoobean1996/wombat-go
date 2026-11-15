@@ -23,7 +23,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -36,6 +38,7 @@ import (
 	wombat "github.com/hoobean1996/wombat-go"
 	"github.com/hoobean1996/wombat-go/governor"
 	"github.com/hoobean1996/wombat-go/httpapi"
+	"github.com/hoobean1996/wombat-go/internal/fspath"
 	"github.com/hoobean1996/wombat-go/llm"
 	"github.com/hoobean1996/wombat-go/llm/anthropic"
 	"github.com/hoobean1996/wombat-go/llm/openai"
@@ -56,7 +59,11 @@ var assets embed.FS
 const shutdownGrace = 5 * time.Second
 
 func main() {
-	addr := flag.String("addr", ":8080", "listen address")
+	addr := flag.String("addr", "127.0.0.1:8080", "listen address. Loopback by default: without -token there is no\n"+
+		"authentication, and anything that can reach the port can run the agent and read every transcript.")
+	token := flag.String("token", "", "bearer token every API request must carry; $WOMBAT_SERVE_TOKEN when not given.\n"+
+		"Prefer the variable: a flag's value is visible to every user of this machine in ps. The bundled UI\n"+
+		"asks for the token, or takes it from the page's address as #token=….")
 	provider := flag.String("provider", envOr("WOMBAT_PROVIDER", "openai"), "anthropic | openai")
 	model := flag.String("model", "", "default model id; a session may override it")
 	workdir := flag.String("working-dir", ".", "root for the shell and file tools.\n"+
@@ -69,8 +76,8 @@ func main() {
 		"off | readonly | workspace | ask — the default policy every tool call is checked\n"+
 			"against, and the strictest a session may choose. workspace gives the agent its full\n"+
 			"tool set but parks exec and anything outside -working-dir on an Allow/Deny card in the\n"+
-			"browser. off offers read-only tools and no gate at all; a browser-facing agent with an\n"+
-			"ungated shell is not a reasonable default.")
+			"browser. off offers read-only tools, kept inside the session's workspace, and asks no one;\n"+
+			"a browser-facing agent with an ungated shell is not a reasonable default.")
 	metrics := flag.Bool("metrics", true,
 		"serve Prometheus metrics on GET /metrics. On by default: this process is already\n"+
 			"listening, the endpoint costs one handler and an in-memory registry, and a server\n"+
@@ -78,8 +85,8 @@ func main() {
 	cors := flag.String("cors", "",
 		"comma-separated browser origins allowed to call the API, or * for any.\n"+
 			"Empty (the default) sends no CORS headers, which is correct when the bundled UI is\n"+
-			"served from this same origin. There is no authentication here, so * lets any page the\n"+
-			"operator visits drive this agent with the operator's network access.")
+			"served from this same origin. Without -token, * lets any page the operator visits\n"+
+			"drive this agent with the operator's network access.")
 	sessionsDir := flag.String("sessions-dir", "",
 		"keep sessions in this directory, one JSON file each, so a restart picks the conversations\n"+
 			"back up — including a question the model was waiting on. Empty keeps them in memory only.")
@@ -95,6 +102,9 @@ func main() {
 			"{\"mcpServers\": {...}} format. The servers are started once and shared by every session;\n"+
 			"their tools are held to the same -permission policy as the built-in ones.")
 	flag.Parse()
+	if *token == "" {
+		*token = os.Getenv("WOMBAT_SERVE_TOKEN")
+	}
 
 	var sandbox *builtin.Network
 	if *confine {
@@ -112,7 +122,7 @@ func main() {
 	// goes to a different stream from everything else.
 	slog.SetDefault(logger)
 
-	if err := run(*addr, *provider, *model, *workdir, *perm, *cors,
+	if err := run(*addr, *token, *provider, *model, *workdir, *perm, *cors,
 		*budget, *maxIters, *metrics, sandbox, *sessionsDir, *mcpConfig, logger); err != nil {
 		logger.Error("wombat-serve", "err", err)
 		os.Exit(1)
@@ -120,7 +130,7 @@ func main() {
 }
 
 func run(
-	addr, provider, model, workdir, perm, cors string,
+	addr, token, provider, model, workdir, perm, cors string,
 	budget float64,
 	maxIters int,
 	metrics bool,
@@ -129,6 +139,11 @@ func run(
 	logger *slog.Logger,
 ) error {
 	root, err := filepath.Abs(workdir)
+	if err == nil {
+		// Resolved once, here, so that every workspace is compared with the
+		// directory itself rather than with one of the names it goes by.
+		root, err = filepath.EvalSymlinks(root)
+	}
 	if err != nil {
 		return fmt.Errorf("resolving -working-dir: %w", err)
 	}
@@ -206,7 +221,7 @@ func run(
 			// every iteration is stopped by wombat.ErrMaxIterations — which says
 			// what happened — rather than by the governor, which says the budget
 			// ran out.
-			Steps:             maxIters + 2,
+			Steps:             maxIters + 1,
 			RepeatedToolCalls: 5,
 		},
 		Logger: logger,
@@ -231,6 +246,7 @@ func run(
 	if origins := splitList(cors); len(origins) > 0 {
 		opts = append(opts, httpapi.WithCORS(origins...))
 	}
+	opts = append(opts, access(addr, token, logger)...)
 
 	srv := &http.Server{
 		Addr:    addr,
@@ -320,8 +336,14 @@ func (f *factory) build(opts httpapi.SessionOptions) (*wombat.Agent, error) {
 			return nil, fmt.Errorf("-confine: %w", err)
 		}
 	}
+	// With a policy, reads outside the workspace are a question for a person;
+	// without one, there is nobody to ask, and the file tools are rooted there.
+	fsRoot := ""
+	if gate == nil {
+		fsRoot = workspace
+	}
 	tools := builtin.Default(builtin.Deps{
-		FS:   builtin.OSFS(""),
+		FS:   builtin.OSFS(fsRoot),
 		Exec: runner,
 		HTTP: &http.Client{Timeout: 30 * time.Second},
 		Now:  time.Now,
@@ -333,12 +355,13 @@ func (f *factory) build(opts httpapi.SessionOptions) (*wombat.Agent, error) {
 	// routed back through the pause with wombat.AnswerPause. So, unlike the
 	// old one-shot server, the pause tools stay.
 
-	// With no gate installed, the only thing keeping a browser-reachable agent
-	// away from the shell is the tool list, so the tool list is what does it.
-	// With a gate, the full surface is on offer and the policy decides — which
-	// is the point of having one.
+	// With no policy chosen, the tool list is what keeps a browser-reachable
+	// agent away from the shell, and confineReads is what keeps its reads in
+	// the workspace. With a policy, the full surface is on offer and the
+	// policy decides — which is the point of having one.
 	if gate == nil {
 		tools = tool.Filter(tools, tool.OnlyCaps(tool.CapReadOnly|tool.CapNetwork))
+		gate = confineReads(workspace)
 	}
 
 	agentOpts := []wombat.Option{
@@ -408,10 +431,15 @@ func strictness(mode string) int {
 
 // workspace resolves a session's requested directory INSIDE the process root.
 //
-// The check is on the resolved absolute path, not on the string, so "../.."
-// and a symlink that points out both fail. Without it, -working-dir would be a
-// suggestion: SessionOptions.Workspace arrives from a JSON body, and a browser
-// that asked for "/" would get an agent rooted at the filesystem.
+// The check is on the resolved path — symlinks followed, as far as the path
+// exists — not on the string, so "../.." and a symlink that points out both
+// fail, and what is returned is the directory itself: the file tools, the
+// permission rules and the sandbox all go on to use this path, and a name
+// that merely looks inside the root would take all three outside it. The
+// comparison used to be lexical, and a link inside the root to anywhere at
+// all passed. Without the check, -working-dir would be a suggestion:
+// SessionOptions.Workspace arrives from a JSON body, and a browser that asked
+// for "/" would get an agent rooted at the filesystem.
 func (f *factory) workspace(requested string) (string, error) {
 	if strings.TrimSpace(requested) == "" {
 		return f.root, nil
@@ -421,11 +449,13 @@ func (f *factory) workspace(requested string) (string, error) {
 		abs = filepath.Join(f.root, abs)
 	}
 	abs, err := filepath.Abs(abs)
+	if err == nil {
+		abs, err = realPath(abs)
+	}
 	if err != nil {
 		return "", fmt.Errorf("resolving the requested workspace: %w", err)
 	}
-	rel, err := filepath.Rel(f.root, abs)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	if !fspath.Within(f.root, abs) {
 		// httpapi.ErrBadRequest, so this reaches the client as a 400 naming
 		// what it asked for. Without it a refusal the CLIENT caused arrives as
 		// a 500, which reads as "the server is broken" and sends whoever is
@@ -434,6 +464,40 @@ func (f *factory) workspace(requested string) (string, error) {
 			httpapi.ErrBadRequest, requested, f.root)
 	}
 	return abs, nil
+}
+
+// realPath resolves the symlinks in the longest prefix of p that exists — a
+// session may name a workspace before it is created — and appends the rest.
+func realPath(p string) (string, error) {
+	p = filepath.Clean(p)
+	rest := ""
+	for {
+		real, err := filepath.EvalSymlinks(p)
+		if err == nil {
+			return filepath.Join(real, rest), nil
+		}
+		parent := filepath.Dir(p)
+		if !errors.Is(err, fs.ErrNotExist) || parent == p {
+			return "", err
+		}
+		rest = filepath.Join(filepath.Base(p), rest)
+		p = parent
+	}
+}
+
+// confineReads is the gate a session without a policy still gets: every path
+// a tool is given must be inside the workspace, and nobody is asked anything.
+//
+// The tool list keeps such a session away from the shell, and that is not
+// enough on its own: view_file, grep_search and the git tools only read, and
+// read-only is not harmless when the path is ~/.ssh/id_ed25519 and the agent
+// answers to a browser.
+func confineReads(workspace string) tool.Middleware {
+	nobody := permission.ApproverFunc(func(context.Context, permission.Request) (bool, error) { return false, nil })
+	return permission.Gate(permission.Policy{
+		Rules:   []permission.Rule{permission.FSRoot(workspace)},
+		Default: permission.Allow,
+	}, nobody)
 }
 
 // defaultPolicy turns a permission mode into tool middleware, or nil for
@@ -552,6 +616,38 @@ func version() string {
 		return info.Main.Version
 	}
 	return "dev"
+}
+
+// access decides who may call. The token, when there is one, from anywhere;
+// and on a loopback address, only by the names a browser on this machine
+// knows it by — which a page that rebinds a name of its own to 127.0.0.1 is
+// not using. A server anyone can reach and no one has to authenticate to says
+// so in its log.
+func access(addr, token string, logger *slog.Logger) []httpapi.Option {
+	var opts []httpapi.Option
+	if token != "" {
+		opts = append(opts, httpapi.WithBearerToken(token))
+		logger.Info("API requests must carry -token as a bearer token; the UI asks for it")
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	if loopback(host) {
+		opts = append(opts, httpapi.WithAllowedHosts("localhost", "127.0.0.1", "::1", host))
+	} else if token == "" {
+		logger.Warn("listening beyond loopback with no -token: anyone who can reach this address can run the agent, spend its budget and read every transcript",
+			"addr", addr)
+	}
+	return opts
+}
+
+func loopback(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.TrimSuffix(strings.TrimPrefix(host, "["), "]"))
+	return ip != nil && ip.IsLoopback()
 }
 
 func splitList(s string) []string {

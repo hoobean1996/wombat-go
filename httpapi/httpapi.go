@@ -33,6 +33,10 @@
 // instead of parsing prose:
 //
 //	{"error": {"kind": "no_such_session", "message": "…"}}
+//
+// A request body must be declared application/json, or it is refused with 415
+// unsupported_media_type — a security check, not pedantry; see [New]. Who may
+// call at all is [WithBearerToken] and [WithAllowedHosts].
 package httpapi
 
 import (

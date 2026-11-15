@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -45,8 +46,7 @@ func (k Kind) String() string {
 //
 // Every method takes a context so that an implementation which is not local —
 // a network filesystem, a sandbox daemon — can honour cancellation. [OSFS]
-// only checks it before each syscall: a read of a local file is not
-// interruptible anyway, and pretending otherwise would be theatre.
+// checks it before each syscall and, reading, between chunks.
 type FS interface {
 	ReadFile(ctx context.Context, path string) ([]byte, error)
 	WriteFile(ctx context.Context, path string, data []byte) error
@@ -140,6 +140,27 @@ func (f osFS) resolve(path string) (string, error) {
 	return clean, nil
 }
 
+// MaxReadBytes is the most [OSFS] reads of one file. A file a model can
+// usefully read whole or edit in place is far smaller; for a bigger one, bash
+// shows the part that matters (sed -n, head, tail, grep).
+const MaxReadBytes = 16 << 20
+
+// Read refusals. Both are the call's fault — the path names something a read
+// cannot sensibly return — so neither counts against the tool's health.
+var (
+	ErrNotRegularFile = tool.CallerError(errors.New("builtin: not a regular file"))
+	ErrFileTooLarge   = tool.CallerError(errors.New("builtin: file too large to read whole"))
+)
+
+// ReadFile reads a regular file of at most MaxReadBytes.
+//
+// It used to be os.ReadFile, which reads until EOF: a FIFO blocked it in
+// open, /dev/zero filled memory, and a multi-gigabyte log was read whole to
+// return eight kilobytes of it — and a per-call timeout could not stop any of
+// them, because cancelling a context does not interrupt a read. So: the file
+// is opened without blocking, anything but a regular file is refused before a
+// byte is read, the size is checked up front, and the read is chunked with
+// the context checked in between.
 func (f osFS) ReadFile(ctx context.Context, path string) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -148,7 +169,69 @@ func (f osFS) ReadFile(ctx context.Context, path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return os.ReadFile(p)
+	file, err := openForRead(p)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	st, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !st.Mode().IsRegular() {
+		return nil, fmt.Errorf("%w: %s is a %s", ErrNotRegularFile, path, modeName(st.Mode()))
+	}
+	if st.Size() > MaxReadBytes {
+		return nil, tooLarge(path, st.Size())
+	}
+	return readChunked(ctx, file, int(st.Size()), path)
+}
+
+func tooLarge(path string, size int64) error {
+	return fmt.Errorf("%w: %s is %d bytes, more than the %d read at once; "+
+		"look at the part you need with bash (sed -n 'START,ENDp', head, tail, grep)",
+		ErrFileTooLarge, path, size, MaxReadBytes)
+}
+
+// readChunked reads r to EOF in chunks, checking ctx between them. size is
+// what Stat said; a file that grows past MaxReadBytes while it is read is
+// refused all the same.
+func readChunked(ctx context.Context, r io.Reader, size int, path string) ([]byte, error) {
+	buf := make([]byte, 0, size+1)
+	chunk := make([]byte, 256<<10)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, context.Cause(ctx)
+		}
+		n, err := r.Read(chunk)
+		buf = append(buf, chunk[:n]...)
+		if len(buf) > MaxReadBytes {
+			return nil, tooLarge(path, int64(len(buf)))
+		}
+		if errors.Is(err, io.EOF) {
+			return buf, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+}
+
+func modeName(m fs.FileMode) string {
+	switch {
+	case m&fs.ModeNamedPipe != 0:
+		return "named pipe (FIFO)"
+	case m&fs.ModeSocket != 0:
+		return "socket"
+	case m&fs.ModeCharDevice != 0:
+		return "character device"
+	case m&fs.ModeDevice != 0:
+		return "device"
+	case m.IsDir():
+		return "directory"
+	default:
+		return "special file (" + m.Type().String() + ")"
+	}
 }
 
 // WriteFile writes atomically: a sibling temp file, fsync, rename over the

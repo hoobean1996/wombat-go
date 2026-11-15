@@ -48,19 +48,36 @@ func TestCapsTripWithCause(t *testing.T) {
 			last:   func(b *Budget) { b.AddCall(0.50, Tokens{In: 10, Out: 5}) },
 			want:   ErrBudgetExhausted,
 		},
+		// Steps and tool calls are counted BEFORE the unit runs, so a cap of 3
+		// lets three happen and refuses the fourth. Counting with >= refused
+		// the third: Steps: 1 made no model call at all.
 		{
 			name:   "steps",
 			limits: Limits{Steps: 3},
-			upTo:   func(b *Budget) { b.Step(); b.Step() },
+			upTo:   func(b *Budget) { b.Step(); b.Step(); b.Step() },
 			last:   func(b *Budget) { b.Step() },
 			want:   ErrStepLimit,
 		},
 		{
 			name:   "tool calls",
 			limits: Limits{ToolCalls: 3},
-			upTo:   func(b *Budget) { b.AddToolCall(""); b.AddToolCall("") },
+			upTo:   func(b *Budget) { b.AddToolCall(""); b.AddToolCall(""); b.AddToolCall("") },
 			last:   func(b *Budget) { b.AddToolCall("") },
 			want:   ErrToolCallLimit,
+		},
+		{
+			name:   "counted tool calls",
+			limits: Limits{ToolCalls: 1},
+			upTo:   func(b *Budget) { b.Attempt("x"); b.Attempt("x"); b.CountToolCall() },
+			last:   func(b *Budget) { b.CountToolCall() },
+			want:   ErrToolCallLimit,
+		},
+		{
+			name:   "attempts that were refused still form a loop",
+			limits: Limits{RepeatedToolCalls: 3},
+			upTo:   func(b *Budget) { b.Attempt("x"); b.Attempt("x") },
+			last:   func(b *Budget) { b.Attempt("x") },
+			want:   ErrToolLoop,
 		},
 		{
 			name:   "repeated identical tool calls",
@@ -147,7 +164,8 @@ func TestFirstCauseWins(t *testing.T) {
 	defer cancel()
 	b := FromContext(ctx)
 
-	b.Step() // trips ErrStepLimit
+	b.Step()
+	b.Step() // a second step past Steps: 1 trips ErrStepLimit
 	b.AddCall(99, Tokens{})
 	b.AddToolCall("")
 
@@ -683,7 +701,11 @@ func TestNoticeAtSpeaksWithRoomLeft(t *testing.T) {
 	if err := ctx.Err(); err != nil {
 		t.Fatalf("after the 9th of 10 steps: ctx.Err() = %v, want nil", err)
 	}
-	b.Step() // step 10 of 10: now the cap
+	b.Step() // step 10 of 10: the last one allowed
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("after the 10th of 10 steps: ctx.Err() = %v, want nil — a cap of 10 allows 10", err)
+	}
+	b.Step() // an 11th is refused
 	if got := context.Cause(ctx); !errors.Is(got, ErrStepLimit) {
 		t.Errorf("context.Cause = %v, want %v", got, ErrStepLimit)
 	}

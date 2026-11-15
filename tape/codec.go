@@ -21,7 +21,23 @@ type entry struct {
 	Seq      int             `json:"seq"`
 	Request  json.RawMessage `json:"request"`
 	Response json.RawMessage `json:"response"`
+
+	// Format is the revision of this layout the line was written in; see
+	// [formatRevision]. Omitted at 0, so every line written so far is
+	// revision 0 as it stands.
+	Format int `json:"format,omitempty"`
 }
+
+// formatRevision is the revision of the line layout, and of the key scheme,
+// this package writes and the newest it reads.
+//
+// It is bumped by a change a reader of the old revision would get wrong —
+// a field renamed or given a new meaning, a request canonicalized so that
+// keys come out differently — and not by one it can ignore. A newer line is
+// then refused by name, rather than replayed as something it is not or
+// reported as a miss nobody can explain. Keeping a change compatible instead,
+// as Temperature and TopP were, keeps the revision and every existing tape.
+const formatRevision = 0
 
 // canonical encodes v the one way this package ever encodes anything.
 //

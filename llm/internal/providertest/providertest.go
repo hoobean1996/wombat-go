@@ -221,6 +221,26 @@ func Run(t *testing.T, w Wire) {
 			t.Errorf("a body of exactly the limit: %v, want it accepted", err)
 		}
 	})
+
+	t.Run("an oversized stream is refused, not accumulated without end", func(t *testing.T) {
+		whole := w.StreamStart + w.StreamFinish
+		srv := server(t, func(rw http.ResponseWriter, r *http.Request, _ <-chan struct{}) {
+			startStream(rw, whole)
+		})
+		l := defaults
+		l.MaxBody = len(whole) - 1
+		_, err := complete(t, w.New(t, srv.URL, l), context.Background(), streamed())
+		if err == nil || !strings.Contains(err.Error(), "exceeds") {
+			t.Errorf("err = %v, want the size bound to end the stream", err)
+		}
+		if errors.Is(err, llm.ErrTransport) {
+			t.Errorf("err = %v is a transport failure, which is retried: the same stream would be read again", err)
+		}
+		l.MaxBody = len(whole)
+		if resp, err := complete(t, w.New(t, srv.URL, l), context.Background(), streamed()); err != nil || llm.TextOf(resp.Content) != "hello" {
+			t.Errorf("a stream of exactly the limit: %q, %v; want it accepted", llm.TextOf(resp.Content), err)
+		}
+	})
 }
 
 func streamed() llm.Request {
