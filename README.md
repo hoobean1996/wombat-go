@@ -1,549 +1,722 @@
+<div align="center">
+
 # wombat-go
 
-A ReAct agent harness in Go, with no third-party dependencies.
+**A ReAct agent harness for Go, with zero third-party dependencies.**
 
-It is a rewrite of a private OCaml 5 project of mine that is built on algebraic
-effects.
+**English** · [简体中文](README.zh-CN.md)
 
-The OCaml version's thesis is that every side effect — LLM calls, tool
-dispatch, file I/O, logging, time, human input — should be an algebraic effect,
-so that the handler stack installed around the agent decides what actually
-happens. This version does not translate that. It asks what the same
-properties look like when Go writes them.
+![Go](https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go&logoColor=white)
+![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
 
-The answer is: mostly, they were dependency injection.
+</div>
 
-```go
-a, err := wombat.New(
-    wombat.WithClient(anthropic.New(anthropic.Config{Model: "claude-opus-5"})),
-    wombat.WithTools(builtin.Default(builtin.Deps{})...),
-)
+---
 
-ctx, cancel := governor.WithBudget(ctx, governor.Limits{CostUSD: 1.00})
-defer cancel()
+- [What is wombat-go?](#en-what)
+- [Features](#en-features)
+- [Requirements](#en-requirements)
+- [Quick start: command line](#en-quickstart-cli)
+- [Quick start: Go library](#en-quickstart-lib)
+- [Core concepts](#en-concepts)
+- [Built-in tools](#en-tools)
+- [Configuration](#en-config)
+- [Command-line tools](#en-cli)
+- [Feature guide](#en-guide)
+- [Project layout](#en-layout)
+- [Development](#en-dev)
+- [Troubleshooting](#en-faq)
+- [Design notes](#en-design)
 
-run := a.Start(ctx, wombat.Ask("what does this repo do?"))
-defer run.Close()
+<a id="en-what"></a>
 
-for run.Next() {
-    switch ev := run.Event().(type) {
-    case wombat.TextDelta: os.Stdout.WriteString(ev.Text)
-    case wombat.ToolStart: log.Println("→", ev.Name)
-    }
-}
-if err := run.Err(); err != nil { return err }
-```
+## What is wombat-go?
 
-## Try it
+wombat-go is a Go library, plus a few command-line tools, for building **LLM
+agents**. It runs the classic **ReAct** loop: ask the model, run the tools it
+asks for, feed the results back, and repeat until the model is done.
 
 ```
-git clone https://github.com/hoobean1996/wombat-go && cd wombat-go
-cp .env.example .env          # base URL, model, key
-go build -o bin/ ./cmd/...
+              ┌───────────────────────────────────────────────┐
+              ▼                                               │
+  task ──▶  model  ──▶ wants a tool? ── yes ──▶ run tools ──▶ results
+                            │
+                            no
+                            ▼
+                       final answer
+```
 
+You supply three things:
+
+1. **A model client**: Anthropic, or any OpenAI-compatible endpoint (OpenAI,
+   DeepSeek, vLLM, Ollama, a corporate gateway).
+2. **Tools** the model may call: a shell, file editing, grep, git, HTTP, MCP
+   servers, or functions you write.
+3. **A task**, and optionally a **budget** (cost, time, steps) it must stay within.
+
+It is written for people who want to see and control every part of the loop.
+Everything is plain Go using only the standard library, and every dependency is
+injected, so the model, a tool or the filesystem can each be swapped for a fake
+in a test.
+
+<a id="en-features"></a>
+
+## Features
+
+| | |
+|---|---|
+| **Two providers, one interface** | Anthropic Messages API and any OpenAI-compatible `/chat/completions` endpoint, including gateways that need proxies and custom headers |
+| **Streaming events** | A run is an iterator of typed events (`TextDelta`, `ReasoningDelta`, `ToolStart`, …) that you can render in a terminal, as JSONL, or in a web UI |
+| **12 built-in tools** | `bash`, `view_file`, `write_file`, `str_replace`, `grep_search`, `git_log`, `http_get`, …, plus MCP tools and your own |
+| **Budgets** | Cap cost in USD, wall-clock time, steps, tool calls and sub-agent depth. Going over a limit cancels the run cleanly |
+| **Safety** | Per-call permission policies with human approval, a scrubbed environment for child processes, and an optional OS sandbox (`sandbox-exec` / `bwrap`) |
+| **Long tasks** | Token-aware context trimming, automatic summarization (compaction), and recovery from context-overflow errors |
+| **Skills and sub-agents** | Tools that appear only after a skill is loaded, and child agents that share the parent's budget |
+| **Observability** | OpenTelemetry-shaped traces with an HTML viewer, Prometheus metrics, and record/replay tapes |
+| **HTTP server** | Resumable multi-turn sessions over Server-Sent Events, with a bundled web UI |
+| **Evaluation** | A benchmark suite of coding tasks with pass@k scoring and anti-cheat checks |
+
+<a id="en-requirements"></a>
+
+## Requirements
+
+| | |
+|---|---|
+| **Go** | 1.25.6 or newer |
+| **An LLM API** | An Anthropic API key, **or** any OpenAI-compatible endpoint. A local Ollama or vLLM server needs no key |
+| **Python 3** | Only for `scripts/wombat`, the terminal renderer |
+| *Optional* | `sandbox-exec` (built into macOS) or `bwrap` (Linux), for `-confine` |
+
+<a id="en-quickstart-cli"></a>
+
+## Quick start: command line
+
+**1. Clone and configure**
+
+```bash
+git clone https://github.com/hoobean1996/wombat-go.git
+cd wombat-go
+cp .env.example .env
+```
+
+Open `.env` and fill in **one** provider. `.env` is git-ignored, so your key
+stays on your machine.
+
+```bash
+# Option A: OpenAI, or any OpenAI-compatible API (DeepSeek, a gateway, ...)
+export WOMBAT_PROVIDER="openai"
+export OPENAI_BASE_URL="https://api.openai.com/v1"
+export OPENAI_API_KEY="sk-..."
+export WOMBAT_MODEL="gpt-4o-mini"
+```
+
+```bash
+# Option B: Anthropic
+export WOMBAT_PROVIDER="anthropic"
+export ANTHROPIC_API_KEY="sk-ant-..."
+export WOMBAT_MODEL="claude-sonnet-5-5"
+```
+
+```bash
+# Option C: a local model with Ollama (no key needed)
+export WOMBAT_PROVIDER="openai"
+export OPENAI_BASE_URL="http://localhost:11434/v1"
+export OPENAI_API_KEY=""            # empty means no auth header is sent
+export WOMBAT_MODEL="qwen2.5-coder"
+```
+
+**2. Ask the agent something**
+
+```bash
 scripts/wombat "how many Go files are in this repo? use bash"
 ```
 
-`scripts/wombat` is `wombat-jsonl | scripts/pretty.py` — the binary speaks
-JSONL and nothing else, so the renderer is forty lines of Python and any other
-front end is equally cheap. Add `-r` to watch the model think.
+`scripts/wombat` builds the binaries into `bin/`, loads `.env`, runs one agent
+turn and renders it as readable text. You see the answer stream in, and each
+tool call as it happens. Add `-r` to also see the model's reasoning.
 
-Multi-turn, including across process boundaries:
+> [!WARNING]
+> By default the agent has an **unrestricted shell in the current directory**.
+> For anything beyond a quick try, add `-permission workspace`, `-confine`, or
+> both. See [Safety](#en-safety).
 
-```
+**3. Keep the conversation going**
+
+```bash
 scripts/wombat -session /tmp/s.json "remember the number 8317"
 scripts/wombat -session /tmp/s.json "what was it times three?"
 ```
 
-If the first turn stopped on `ask_user`, the second turn's text is the *answer*
-to that question rather than a new instruction.
+The transcript is saved to the session file after every turn. If the agent
+ended a turn by asking you a question, your next message is treated as the
+answer to it.
 
-## Three decisions
+**4. Or chat in the browser**
 
-**A tool takes a context and its arguments. Nothing else.**
+```bash
+make serve        # then open http://localhost:8080
+```
+
+This starts a web UI with live streaming. By default, shell commands and
+anything outside the working directory wait for you on an **Allow / Deny** card.
+
+<a id="en-quickstart-lib"></a>
+
+## Quick start: Go library
+
+```bash
+go get github.com/hoobean1996/wombat-go
+```
 
 ```go
-type Fn func(ctx context.Context, in json.RawMessage) (string, error)
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"time"
+
+	wombat "github.com/hoobean1996/wombat-go"
+	"github.com/hoobean1996/wombat-go/governor"
+	"github.com/hoobean1996/wombat-go/llm"
+	"github.com/hoobean1996/wombat-go/llm/anthropic"
+	"github.com/hoobean1996/wombat-go/tool/builtin"
+)
+
+func main() {
+	// 1. A model client. ConfigFromEnv reads ANTHROPIC_API_KEY, ANTHROPIC_MODEL,
+	//    ANTHROPIC_BASE_URL, ... For OpenAI-compatible endpoints use
+	//    openai.New(openai.ConfigFromEnv()) instead.
+	leaf, err := anthropic.New(anthropic.ConfigFromEnv())
+	if err != nil {
+		log.Fatal(err)
+	}
+	// TrackCost charges each response to the run's budget.
+	// Without it, a CostUSD limit never trips.
+	client := llm.Chain(leaf, wombat.TrackCost(llm.DefaultPricing))
+
+	// 2. An agent: the client plus the tools it may use.
+	agent, err := wombat.New(
+		wombat.WithClient(client),
+		wombat.WithModel("claude-sonnet-5-5"),
+		wombat.WithTools(builtin.Default(builtin.Deps{})...),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// 3. A budget: the run is cancelled at $1 or 10 minutes, whichever comes first.
+	ctx, cancel := governor.WithBudget(context.Background(),
+		governor.Limits{CostUSD: 1.00, Wall: 10 * time.Minute})
+	defer cancel()
+
+	// 4. Start a run and consume its event stream.
+	run := agent.Start(ctx, wombat.Ask("How many Go files are in this directory?"))
+	defer run.Close()
+
+	for run.Next() {
+		switch ev := run.Event().(type) {
+		case wombat.TextDelta:
+			fmt.Print(ev.Text)
+		case wombat.ToolStart:
+			fmt.Fprintln(os.Stderr, "\n→", ev.Name)
+		}
+	}
+	if err := run.Err(); err != nil {
+		log.Fatal(err)
+	}
+}
 ```
 
-Whatever a tool needs is captured when it is constructed — `ViewFile(fsys)`,
-`Bash(runner)`, `HTTPGet(client)`. Eight of the OCaml's thirteen effects exist
-only because an OCaml tool handler was `Yojson.t -> result` and had no other
-route to the outside world. Give the closure the dependency and they are not
-needed. A tool is then an ordinary function: testing one requires no harness.
+```bash
+ANTHROPIC_API_KEY=sk-ant-... go run .
+```
 
-**A run is a stream of events, not a value plus four callbacks.**
-
-The OCaml harness returns an outcome and emits through `on_log`,
-`on_text_delta`, `on_event` and `on_tool_event`; a 473-line sidecar exists to
-sew those back into one JSONL stream. Here the stream is the primary API and
-the sidecar is a loop and an encoder. Four callbacks were never a design — they
-were the shape of not having a stream type.
-
-Diagnostics are separate: they go to `log/slog`. The event stream carries
-semantic events a front end renders.
-
-**A budget is a context.**
+**How did the run end?** After the loop, `run.Outcome()` tells you:
 
 ```go
-ctx, cancel := governor.WithBudget(ctx, governor.Limits{CostUSD: 1.00, Wall: 10*time.Minute})
+switch run.Outcome().(type) {
+case wombat.Answer:    // the model finished its turn
+case wombat.Paused:    // it asked the user a question (ask_user); answer it and resume
+case wombat.Submitted: // it called a terminal tool; the tool's arguments are the result
+}
 ```
 
-Exceeding a limit cancels the context. Every blocking operation in the process
-— the HTTP request, `exec.CommandContext`, a channel select — already unwinds
-on its own, so aborting from arbitrary depth costs zero new return values.
-`context.Cause(ctx)` reports which limit tripped. The OCaml equivalent raises
-through the whole stack from inside an effect handler and needs care at every
-`try` that might swallow it.
-
-## Talking to a gateway
-
-Corporate deployments put the model behind a proxy, a routing header and a
-non-default base URL. `ConfigFromEnv` reads all of it and hands back a plain
-`Config`, so anything the environment got wrong is fixable before `New` sees
-it:
+**Multi-turn:** pass the previous transcript to the next run.
 
 ```go
-cfg := openai.ConfigFromEnv()   // OPENAI_BASE_URL, OPENAI_PROXY, OPENAI_EXTRA_HEADERS, …
-cfg.Stream = llm.StreamNever    // if this gateway drops usage while streaming
-client, err := openai.New(cfg)
+run = agent.Start(ctx, wombat.Then(run.Messages(), "What was it times three?"))
 ```
 
-```
-cp .env.example .env      # fill in a base URL and a key
-scripts/wombat "what does this repo do?"
-```
+Use `wombat.AnswerPause` or `wombat.Resume` instead when the previous turn ended
+in `Paused`.
 
-Two things a real gateway teaches you that a mock does not:
-
-- **Reasoning models stream a second channel.** `reasoning_content` (OpenAI
-  compat) and `thinking_delta` (Anthropic) both arrive as
-  `llm.Delta{Reasoning: …}` and surface as `ReasoningDelta` events, kept
-  separate from the answer. On some models it is most of the generated tokens,
-  so a UI that only renders `TextDelta` looks frozen.
-- **Streaming and accounting can conflict.** Usage rides on a trailing chunk;
-  some servers omit it, and then a streamed call reports zero tokens and cost
-  budgeting quietly stops working. `llm.StreamNever` trades deltas for
-  accounting when that happens.
-
-## Context has structure, and the structure is the point
-
-Three layers, each structured differently on purpose:
-
-| | shape | why |
-|---|---|---|
-| conversation | typed blocks: `Text` / `ToolUse` / `ToolResult` / `Thinking` | lets eviction be surgical |
-| system prompt | `[]block` at construction, one frozen string afterwards | the cache prefix must be byte-stable, so nothing may rebuild it |
-| what the harness knows | `View.Results`, keyed by tool_use id | a strategy that sees only messages can trim by position and nothing else |
-
-That third row is what makes the rest work. Two `ToolResult` blocks have the
-same type whether one is nine kilobytes of loaded skill and the other is a
-line of grep output. A tool labels its own observation:
+**Add your own tool.** A tool is a name, a JSON schema, its capabilities and a
+plain Go function:
 
 ```go
-tool.Annotate(ctx, skill.Tag, skill.TagPrefix+name)
-```
+type weatherIn struct {
+	City string `json:"city"`
+}
 
-and a strategy acts on the label:
+weather := tool.Typed(tool.Def{
+	Name:        "get_weather",
+	Description: "Current weather for a city.",
+	InputSchema: json.RawMessage(`{
+	    "type": "object",
+	    "properties": {"city": {"type": "string"}},
+	    "required": ["city"]
+	}`),
+	Caps: tool.CapReadOnly, // tells the scheduler and the permission gate what it does
+}, func(ctx context.Context, in weatherIn) (string, error) {
+	return "Sunny, 22°C in " + in.City, nil
+})
 
-```go
-wombat.DropTagged(40, 12, skill.Tag)   // evict skill bodies, keep everything else
-```
-
-`DropTagged` removes whole `tool_use`/`tool_result` **pairs**, not a prefix of
-the transcript. It reclaims exactly the nine kilobytes and leaves the reasoning
-around them intact — only possible because content is a typed block list.
-
-A window counted in messages cannot help the run that needs it most: one
-instruction followed by a hundred tool calls has exactly one place such a
-window may cut, at the very start, and one message can be a line of grep or
-sixty kilobytes of log. `TokenWindow` cuts in tokens, and inside the exchanges:
-
-```go
-wombat.WithContextWindow(200_000),
-wombat.WithStrategy(wombat.TokenWindow(0.7, 0.5)),       // trim at 70%, back to about 50%
-wombat.WithCompaction(160_000, 50_000, wombat.Summarize(client, "")),
-```
-
-Old tool results are elided first — each keeps its place and its `tool_use`,
-with a note saying what was there — and only then are old exchanges dropped
-whole. The estimate is calibrated against the prompt tokens the provider
-reports after every call, and the boundary moves in quantized steps of token
-mass, so the prefix the provider caches is not edited every turn. Compaction
-is the heavier tool: past its trigger the old part of the transcript is
-replaced, for the rest of the run, by a summary of it. `ContextTrimmed`,
-`TranscriptCompacted` and `ContextOverflow` events say when each happened.
-
-## What a tool hands back
-
-- **Long output is kept, not lost.** `bash` returns the start and the end of
-  what a command printed, because a failing test run's assertion is at the end.
-  The whole of it is saved to a file the clipped result names, so a model that
-  needs the one stack frame in the middle greps that file instead of paying for
-  the run again.
-- **Pictures are observations too.** `tool.Attach(ctx, llm.Media{...})` adds
-  an image or a PDF to a call's result, and both providers carry it to the
-  model. `builtin.ViewMedia` (`-media` on the CLI) lets the model look at a
-  screenshot or a rendered chart rather than at its bytes.
-- **Reads run together; anything else is a barrier.** A turn's calls run up to
-  four at a time, but only read-only tools overlap: a write, a command, or a
-  tool that declares nothing waits for every call before it and holds back
-  every call after it. A turn of five greps runs at once; a turn that writes a
-  file and then tests it runs exactly as written.
-
-## Skills
-
-Discovery is static, load and unload are dynamic:
-
-```go
-skills, _ := skill.LoadDir("./skills", func(err error) { log.Print(err) })
-reg := skill.New(skills...)
-reg.Gate("git-history", "git_log")     // hidden until the skill is loaded
-g := reg.Bind(builtin.Default(deps))
-
-a, _ := wombat.New(wombat.WithClient(client), g.Install())
-```
-
-`Install` is the gated set, the middleware that enforces it, the catalogue and
-a per-run activation state, as one option. They used to be four options to pass
-together, and leaving one out failed quietly — a hidden tool that still ran
-when named, or a `load_skill` that reported success while its tools never
-appeared — so `New` also asks a set that needs per-run state whether a run
-would have it, and logs a warning when it would not.
-
-Live, against a real model: turn 1 offers 12 tools, the model reads the
-catalogue and calls `load_skill("git-history")`, turn 2 offers 14.
-
-Four things that are easy to get wrong and are handled:
-
-- **Activation is per run, not per agent.** An `Agent` is immutable and shared
-  across goroutines; activation state is born in `WithRunContext` so two
-  concurrent runs cannot see each other's skills.
-- **Visibility hides; middleware enforces.** Dropping a tool from the list does
-  not stop a model that saw the name earlier in the transcript from calling it.
-  `Set.Find` therefore stays unfiltered, so the refusal can say *call
-  `load_skill("git-history")` first* instead of *unknown tool*.
-- **Eviction retires the skill.** A skill's body enters the conversation as a
-  tool_result. When a strategy drops it, `tool.Reconciler` tells the set, and
-  the gated tools go with it — otherwise the model keeps tools whose knowledge
-  left the context.
-- **The catalogue is sorted.** It lands in the system prompt, so map iteration
-  order would change the bytes between processes and silently kill the cache.
-
-Unloading retires tools, not tokens: the body stays in the transcript until a
-strategy evicts it. Those are two mechanisms and it is worth knowing which one
-you are reaching for.
-
-## Sub-agents
-
-A delegate tool runs a whole child agent, on the parent's context:
-
-```go
-child, _ := wombat.New(wombat.WithClient(client), wombat.WithName("researcher"),
-    wombat.WithTools(tool.Filter(all, tool.OnlyCaps(tool.CapReadOnly))...))
-
-parent, _ := wombat.New(...,
-    wombat.WithTools(append(all, wombat.DelegateTool(child))...),
-    wombat.WithToolTimeoutFallback(0),   // a child's bound is its own iteration cap
+agent, err := wombat.New(
+	wombat.WithClient(client),
+	wombat.WithTools(append(builtin.Default(builtin.Deps{}), weather)...),
 )
 ```
 
-Running on the parent's context is the payoff of the whole design: the budget,
-the skill activation set, the tape and the tracer all reach the child by being
-values on `ctx`. Nothing forks, nothing is reinstalled. The child's events reach
-the parent's stream wrapped in `SubagentEvent`, so a UI can nest them.
+Always set `Caps`. A tool that declares nothing is treated as one that writes
+and reaches the network, so it never runs in parallel and the permission gate
+treats it with suspicion.
 
-The depth cap is the one governor limit that **refuses instead of aborting**.
-Every other cap is a resource the run has exhausted; nesting depth is a shape,
-and a parent told "not deeper" can still do the job itself — but only if it is
-still running.
+<a id="en-concepts"></a>
 
-## Fault tolerance
+## Core concepts
 
-| layer | what it does |
+| Concept | What it is |
 |---|---|
-| `WithRecovery` | innermost: a panicking tool becomes an error the model reads, and trips the breaker exactly like any other failure |
-| dispatcher backstop | catches a panic in a *middleware*, which under `WithParallelism` would otherwise die on a worker goroutine |
-| loop recover | a panic in a strategy or a client becomes `ErrPanic`, not a dead process |
-| `WithTimeout` | a context deadline, so a tool that honours `ctx` is actually stopped — not abandoned |
-| `WithRetry` | needs `Idempotent` **and** `Retryable`; a write is never replayed because an error looked transient |
-| `WithCircuitBreaker` | per tool, **process-wide** — a dependency that is down is down for every run |
-| `WithDedupRepeats` | per **run** — being stuck in a loop is a property of one conversation |
-| `WithOverflowRecovery` | the one error the harness can actually fix: shrink the transcript and retry, sticky for the rest of the run |
+| `Agent` | Built once with `wombat.New(options...)`. Immutable and safe to share across goroutines |
+| `Run` | One execution of an agent on an input. Iterate with `Next()` / `Event()`, then check `Err()` and `Outcome()` |
+| `Event` | Something a UI can render: `TextDelta`, `ReasoningDelta`, `ToolStart`, `Spend`, `ContextTrimmed`, … |
+| `Outcome` | How a successful run ended: `Answer`, `Paused` or `Submitted`. Failures come from `run.Err()` and are matched with `errors.Is` |
+| `tool.Def` | A tool: name, description, JSON schema, capabilities (`Caps`) and a `func(ctx, args) (string, error)` |
+| Middleware | Wrappers around the model client (`llm.Chain`) or around tools: retry, logging, cost tracking, permission, timeouts |
+| Budget | `governor.WithBudget(ctx, limits)` returns a `context.Context` that is cancelled when a limit is exceeded |
+| Strategy | Decides which part of a long transcript is sent to the model (`TokenWindow`, `DropTagged`, …) |
 
-The model sees a short message; the stack goes to `slog`.
+<a id="en-tools"></a>
 
-## Recording and replay
+## Built-in tools
+
+`builtin.Default(deps)` returns these 12 tools:
+
+| Tool | What it does |
+|---|---|
+| `bash` | Runs a shell command (60 s timeout). Long output keeps the start and the end, and the full output is saved to a file the model can grep |
+| `view_file` | Reads a file with line numbers, optionally a line range, or lists a directory |
+| `write_file` | Creates or overwrites a file |
+| `str_replace` | Edits a file by replacing one exact string |
+| `grep_search` | Searches files with an extended regex |
+| `git_log` / `git_show` | Lists recent commits / shows one commit with its diff |
+| `http_get` | Fetches a URL |
+| `calculator` | Evaluates an arithmetic expression |
+| `current_time` | Returns the current date and time |
+| `save_tool_result` | Saves an earlier tool result to disk without repeating it |
+| `ask_user` | Pauses the run to ask the user a question |
+
+Optional extras: `view_media` (lets the model look at images and PDFs, CLI flag
+`-media`), `delegate` (a sub-agent, `-delegate`), `load_skill` / `unload_skill`
+(`-skills-dir`), and MCP tools named `<server>__<tool>` (`-mcp`).
+
+<a id="en-config"></a>
+
+## Configuration
+
+The CLIs read their settings from environment variables, which `scripts/wombat`
+and `make` load from `.env`. In library code, `openai.ConfigFromEnv()` and
+`anthropic.ConfigFromEnv()` read the same variables and return a plain `Config`
+struct you can edit before calling `New`. The library reads nothing else from
+the environment behind your back, apart from falling back to the API key.
+
+| Variable | Description |
+|---|---|
+| `WOMBAT_PROVIDER` | `openai` or `anthropic`. Set it explicitly: the CLIs have different defaults |
+| `WOMBAT_MODEL` | Default model for whichever provider is selected |
+| **OpenAI-compatible** | |
+| `OPENAI_BASE_URL` | Origin plus `/v1`, for example `https://api.openai.com/v1`. `/chat/completions` is appended |
+| `OPENAI_API_KEY` | Sent as `Authorization: Bearer …`. Leave it empty for local servers that need no auth |
+| `OPENAI_MODEL` | Takes priority over `WOMBAT_MODEL` |
+| `OPENAI_PROXY` | HTTP proxy, as `host:port` or a full URL |
+| `OPENAI_EXTRA_HEADERS` | Extra headers, one `Name: value` per line |
+| `OPENAI_STREAM` | `auto` (default), `always` or `never` |
+| `OPENAI_TEMPERATURE`, `OPENAI_TOP_P` | Sampling parameters |
+| **Anthropic** | |
+| `ANTHROPIC_API_KEY` | Required |
+| `ANTHROPIC_MODEL` | Takes priority over `WOMBAT_MODEL`. There is no built-in default model |
+| `ANTHROPIC_BASE_URL` | Default `https://api.anthropic.com` (falls back to `AGENT_LLM_BASE_URL`) |
+| `ANTHROPIC_PROXY` | HTTP proxy (falls back to `AGENT_LLM_PROXY`) |
+| `ANTHROPIC_CUSTOM_HEADERS` | Extra headers, one `Name: value` per line |
+| `ANTHROPIC_BETA` | Comma-separated beta flags |
+| `ANTHROPIC_STREAM` | `auto` (default), `always` or `never` |
+| `ANTHROPIC_TEMPERATURE`, `ANTHROPIC_TOP_P` | Sampling parameters |
+| **Scripts** | |
+| `WOMBAT_ENV` | Env file that `scripts/wombat` loads (default `./.env`). For `make`, pass `ENV=path` |
+
+`.env.example` documents each of these in more detail.
+
+<a id="en-cli"></a>
+
+## Command-line tools
+
+`make bin` builds all of them into `bin/`.
+
+| Binary | Purpose |
+|---|---|
+| `wombat-jsonl` | Runs one agent turn and writes a JSON-Lines event stream to stdout. `scripts/wombat` wraps it with a renderer |
+| `wombat-serve` | HTTP + SSE server with a built-in web UI |
+| `wombat-bench` | Runs the benchmark suite and reports pass@k |
+| `wombat-judge` | Scores the episodes that `wombat-bench` produced |
+| `wombat-trace-html` | Turns a trace file into a self-contained HTML report |
+| `wombat-tsgen` | Generates TypeScript types for the event stream and the HTTP API |
+
+**Common `wombat-jsonl` / `scripts/wombat` flags**
+
+| Area | Flags |
+|---|---|
+| Model | `-provider openai\|anthropic`, `-model ID`, `-system "prompt"`, `-max-tokens N` |
+| Workspace | `-working-dir DIR` (where shell and git tools run), `-read-only` (hide tools that write or execute) |
+| Safety | `-permission off\|readonly\|workspace\|ask`, `-confine`, `-confine-network loopback\|none\|full` |
+| Limits | `-budget USD`, `-wall 10m`, `-max-iters N` (default 30) |
+| Conversation | `-session FILE` (multi-turn), `-resume FILE` (continue a transcript, read-only) |
+| Long tasks | `-context-window TOKENS`, `-compact-at 0.85`, `-check 'go test ./...'`, `-check-attempts N` |
+| Extras | `-skills-dir skills`, `-delegate`, `-mcp mcp.json`, `-media` |
+| Recording | `-tape FILE`, `-tape-mode auto\|record\|replay`, `-trace FILE`, `-trace-html FILE`, `-metrics-file FILE` |
+| Logging | `-log debug\|info\|warn\|error`, `-v`, and `-r` (show reasoning, `scripts/wombat` only) |
+
+Run `bin/wombat-jsonl -h` for the full list, including the build, review and
+acceptance workflow flags (`-plan-only`, `-accept`, `-review`, …).
+
+**Common `wombat-serve` flags:** `-addr :8080`, `-working-dir DIR`,
+`-permission workspace` (default), `-budget 1.0` (USD per turn),
+`-max-iters 12`, `-sessions-dir DIR` (keep sessions across restarts), `-cors`,
+`-confine`, `-mcp`.
+
+**Make targets**
+
+| Target | What it does |
+|---|---|
+| `make` | gofmt check, `go vet`, `go build` (the default target) |
+| `make test` | `go test -race ./...` |
+| `make bin` | Builds every command into `bin/` |
+| `make serve` | Starts `wombat-serve` with `.env` loaded. Pass extra flags with `FLAGS="..."` |
+| `make bench` | Runs the benchmarks, for example `make bench N=8 C=4 TASKS=todo-app,fix-bug` |
+| `make models` | Lists the model IDs your OpenAI-compatible endpoint offers |
+| `make ts` | Regenerates `web/events.ts` |
+| `make help` | Lists the documented targets |
+
+<a id="en-guide"></a>
+
+## Feature guide
+
+Each section below is a short summary. [docs/DESIGN.md](docs/DESIGN.md)
+explains why each mechanism works the way it does.
+
+<a id="en-safety"></a>
+
+### Safety
+
+Three independent layers:
+
+| Layer | What it does | How to enable |
+|---|---|---|
+| **Permission policy** | Allows, denies or asks a human about each tool call, looking at the actual command, path and arguments | `-permission …` (CLI), `permission.Gate` (library) |
+| **Environment scrubbing** | Commands the agent runs inherit only an allowlist of environment variables, so your API keys are not visible to them | On by default |
+| **OS sandbox** | Commands run under `sandbox-exec` (macOS) or `bwrap` (Linux): writes only inside the workspace and the temp directory, credential directories unreadable, network loopback-only by default | `-confine` |
+
+Permission levels:
+
+| Level | Behavior |
+|---|---|
+| `off` | No checks (the `wombat-jsonl` default) |
+| `readonly` | Only read-only tools run |
+| `workspace` | Reads and writes inside the working directory are allowed, and so are common harmless commands (`go test`, `ls`, `cat`, …). Anything else needs approval |
+| `ask` | Every call needs approval |
+
+`wombat-jsonl` has no way to ask you, so "needs approval" means "denied", and
+the model is told why. Use `wombat-serve` if you want to approve calls in the
+browser. In library code:
 
 ```go
-tp, _ := tape.Open("run.jsonl", tape.Auto)
-defer tp.Close()
-a, _ := wombat.New(wombat.WithClient(client), tp.Install())
+approver := permission.ApproverFunc(func(ctx context.Context, r permission.Request) (bool, error) {
+	fmt.Printf("allow %s? (%s) [y/N] ", r.Tool.Name, r.Reason)
+	var answer string
+	fmt.Scanln(&answer)
+	return answer == "y", nil
+})
+
+agent, err := wombat.New(
+	wombat.WithClient(client),
+	wombat.WithTools(builtin.Default(builtin.Deps{})...),
+	wombat.WithToolMiddleware(permission.Gate(permission.Workspace("."), approver)),
+)
 ```
 
-`Install` puts the model half outside the client's retry layer and the tool
-half in the tool chain. Recording only the model half was the easy mistake, and
-it replays the model asking for every side effect again — and the tools
-performing them again.
+A `nil` approver turns every "ask" into "deny".
 
-Entries are keyed by a **content hash of the request**, not by position. The
-OCaml original keyed by position and died with `tape misalignment` the moment a
-run diverged — which, for a differential-testing tool, is exactly when you need
-it. A miss in `Auto` is a live call.
-
-Measured on a real run: record took minutes against a gateway, replay took
-**0.107 s with the endpoint pointed at a dead address**, and the answer was
-byte-identical. Deltas coalesce to one per block on replay, and a replayed call
-charges no budget — both documented, neither hidden.
-
-## Tracing
+### Budgets
 
 ```go
-sink, closer, _ := trace.FileSink("run.ndjson")
-defer closer.Close()
-a, _ := wombat.New(..., wombat.WithTracing(trace.New(sink)))
+ctx, cancel := governor.WithBudget(ctx, governor.Limits{
+	CostUSD:       2.00,
+	Wall:          15 * time.Minute,
+	Steps:         50,
+	ToolCalls:     200,
+	SubagentDepth: 2,
+})
+defer cancel()
 ```
 
-```
-run        wombat                 26632ms
-  iteration  wombat iteration 1   21375ms
-    llm        other               2819ms
-    tool       delegate           18540ms
-      subagent   delegate         18539ms
-        run        researcher     18531ms
-          iteration  …               900ms
-            llm        subagent      814ms
-            tool       git_log        77ms
-```
+Going over any limit cancels the context, and everything in flight (HTTP
+requests, child processes) stops. `context.Cause(ctx)` tells you which limit
+tripped. Cost is computed from `llm.DefaultPricing`. A model that is not in that
+table costs `0`, so for such models rely on `Wall` and `Steps`, or pass your
+own rates with `wombat.WithPricing`. CLI: `-budget`, `-wall`, `-max-iters`.
 
-That nesting is free: a goroutine inherits `ctx` and therefore its parent span.
-The OCaml needed `Domain.DLS` plus an explicit `Trace.fork`, which does not
-exist here.
-
-Attribute keys are OpenTelemetry `gen_ai.*` semconv verbatim, so bridging to a
-real `TracerProvider` is about thirty lines in your own module — the dependency
-is yours to add, not this library's. `trace.WriteHTML` renders a self-contained
-report with no external assets, and neither middleware records message content:
-traces get shipped to places transcripts should not go.
-
-## Permission
-
-A tool call can be allowed, denied, or put in front of a person. The gate is a
-`tool.Middleware`, so it sees the same call the tool would have seen — the
-command string, the path, the arguments — and decides with all of it in hand.
+### Long conversations
 
 ```go
-gate := permission.Gate(permission.Workspace("/work/proj"), approver)
+wombat.WithContextWindow(200_000),
+wombat.WithStrategy(wombat.TokenWindow(0.7, 0.5)),                  // trim at 70%, back to ~50%
+wombat.WithCompaction(160_000, 50_000, wombat.Summarize(client, "")), // summarize old turns
 ```
 
-Three things this got right only after being wrong first.
+Old tool results are shortened first, and only then are whole old exchanges
+dropped. Compaction replaces the oldest part of the transcript with a summary.
+CLI: `-context-window 200000 -compact-at 0.85`.
 
-**A rooted filesystem is not a sandbox.** An early version confined the file
-tools to a prefix and left `bash` alone; a model refused `view_file /etc/hosts`
-and read the same file with `cat` on the next turn. The flag was renamed to say
-what it does, and the honest boundary is `permission`, which has an opinion
-about the shell too.
-
-**An allowlist that never fires is not a safety feature.** `SafeCommands` skips
-the approval for `go build`, `go test`, `ls`, `cat` and about thirty others so
-that nobody is asked twenty times in an afternoon. It originally refused any
-command containing a shell metacharacter, which is the safe reading and also
-every command a model writes — in a live run an agent could not test the code
-it had just written, because it wrote `go test ./... 2>&1 | head -n 300`. A
-pipeline is now admitted, with *every stage checked independently*: that is
-strictly stronger than a prefix match over the whole string, which never
-examined the dangerous half of `go test; rm -rf /` at all.
-
-**A denial has to teach.** When the same agent was refused, the message said
-"try an approach the policy allows outright" and it hit the same wall three
-times. It now names the commands and the constraint.
-
-**A policy is not a sandbox either.** Every process the tools started used to
-inherit the harness's environment, provider key included, so one `go test` a
-policy waved through was enough to print it. `OSRunner` now passes an
-allowlist — the process basics, the toolchain's own settings, proxies — and
-nothing else; `WithEnvAllow`, `WithEnv` and `WithInheritedEnv` change that, and
-the verifiers that run the agent's code get the same filtered environment. For
-containment rather than hygiene, `SandboxRunner` runs every command under
-`sandbox-exec` on macOS or `bwrap` on Linux: writes only inside the workspace
-and the temp directory, the usual credential directories unreadable, the
-network loopback-only unless asked otherwise. It refuses to run rather than
-running unconfined, and `-confine` turns it on in the CLIs.
-
-## Knowing when it is done
-
-A run that ends because the model said so is only as good as that judgement,
-and the benchmark report below has a line for each way it goes wrong.
-`WithCompletionCheck` asks something better at the moment it matters:
+### Checking that the work is done, and steering
 
 ```go
 wombat.WithCompletionCheck(3, wombat.CommandCheck(runner, "go test ./...", 0))
 ```
 
-A rejected answer is followed by a user turn carrying the check's output; a
-rejected terminal call gets it as its `tool_result`, as an error. After the
-given number of rejections the run ends as the model wanted, and the last
-`CompletionChecked` event says the check still disagreed — a check that can
-never pass must not hold a run until its iteration cap, at full price. Run it
-through the same `Runner` as the agent's own commands: a check that escapes
-the sandbox is a way out of it.
+When the model says it is finished, the check runs. If it fails, the model gets
+the output and keeps working, up to 3 times. CLI: `-check 'go test ./...'`.
 
-The other direction is a person who can see the run going wrong.
-`run.Steer("use the v2 API")` puts a message in front of the model at its next
-step without stopping the turn; one that arrives too late for it comes back
-from `run.Undelivered()` rather than being dropped. Over HTTP it is
-`POST /api/sessions/{id}/steer`.
+To redirect a run while it is going, call `run.Steer("use the v2 API")`. Over
+HTTP, use `POST /api/sessions/{id}/steer`.
 
-## MCP
+### Skills
 
-`mcp/` connects to Model Context Protocol servers, over stdio or Streamable
-HTTP, and offers their tools like any others:
+A skill is a folder with a `SKILL.md` file. The front matter gives it a name and
+a description; the body is instructions the model loads only when it needs them.
+
+```markdown
+---
+name: git-history
+description: Reading a repository's history. Load before any question about the past.
+---
+
+# Reading git history
+...
+```
+
+```bash
+scripts/wombat -skills-dir skills "who last changed run.go, and why?"
+```
+
+The model sees a catalogue of skills and calls `load_skill` to load one. A skill
+can also unlock tools that stay hidden until it is loaded:
 
 ```go
-servers, _ := mcp.LoadConfig("mcp.json")    // {"mcpServers": {...}}, as desktop clients write it
-conns, err := mcp.ConnectAll(ctx, servers)
-defer conns.Close()
-tools := append(builtin.Default(deps), conns.Tools()...)
+skills, _ := skill.LoadDir("./skills", func(err error) { log.Print(err) })
+reg := skill.New(skills...)
+reg.Gate("git-history", "git_log") // git_log appears only after git-history is loaded
+g := reg.Bind(builtin.Default(deps))
+
+agent, _ := wombat.New(wombat.WithClient(client), g.Install())
 ```
 
-A tool is offered as `<server>__<tool>`, and its annotations become
-capabilities — `readOnlyHint` is `CapReadOnly`, `openWorldHint` is
-`CapNetwork`, and a tool that says nothing is taken to write and to reach the
-network — so the read-only filters, the permission policies and the parallel
-scheduler treat it as they would a built-in one. Those hints are the server's
-claims about itself; `"ignoreHints": true` takes every tool of that server to
-mutate. A stdio server gets the same filtered environment as the agent's
-commands plus exactly the `env` its entry names (`"${GITHUB_TOKEN}"` passes one
-through), the images a tool returns reach the model as images, and a server
-that dies fails its calls with the end of its stderr. `-mcp mcp.json` wires it
-into `wombat-jsonl` and `wombat-serve`.
+This repository ships four example skills in `skills/`.
 
-## Evaluation
+### Sub-agents
 
-`rl/` turns a run into an `Episode`: a trajectory with a reward. `Rollout` runs
-n samples of an `Env` and reports **pass@k** with the unbiased estimator from
-Chen et al. rather than "did any of n succeed", which overstates every number
-it produces.
-
-`benchmarks/` is eight coding tasks defined as data, in two tiers. The easy
-tier is the floor — a live model scores 4/4, and when it does not the harness
-is broken rather than the agent. The hard tier discriminates: files the prompt
-never names, a bug two hops from its symptom, a genuinely underspecified
-request, and a haystack that does not fit in the window.
-
-The interesting part is the anti-cheat. `GoProbe` writes a test into a *private
-copy* of the workspace after the agent has stopped, from bytes it never had
-access to, and it closes two freebies a naive scorer hands out: `go test ./...`
-exits 0 in a module whose packages were all deleted, and a `-run` pattern
-matching no test also exits 0.
-
-```
-$ wombat-bench -tasks hard -n 4
-TASK                N  PASS@1  PASS@K   MEAN    STD  TURNS  TOK/IN  TOK/OUT  COST
-refactor-interface  4   0.000   0.000  0.250  0.433   30.0  423.1k    67.3k   n/a
-
-unpriced: some-gateway-model — no rate for the above, so COST reads n/a
-
-solved but did not finish (1): full reward, and the run still failed —
-the agent did the work and could not tell it was done. Not counted as a pass.
-  refactor-interface#2  reward 1.000  max_iterations
-```
-
-That last block exists because the first version of this report said pass@1
-0.000 for a task one sample had solved outright, and the only trace of it was a
-standard deviation. "This agent cannot do the task" and "this agent cannot tell
-when it is done" are different bugs with different fixes, and they rendered
-identically.
-
-## Over HTTP
-
-`httpapi/` is the same agent behind Server-Sent Events, for a UI:
-
-```
-POST   /api/sessions                          {"prompt": …} → creates the session and starts its first turn
-GET    /api/sessions/{id}/events              SSE, honours Last-Event-ID
-POST   /api/sessions/{id}/messages            {"prompt": …} → the next turn of the conversation
-POST   /api/sessions/{id}/steer               {"prompt": …} → a message for the turn still running
-GET    /api/sessions/{id}/approvals           what is waiting on a human
-POST   /api/sessions/{id}/approvals/{use_id}  {"allow": true|false} → answer a permission prompt
-DELETE /api/sessions/{id}                     cancel and drop
-```
-
-The full table — health, config, listing, the transcript, `/metrics` — is in
-the `httpapi` package doc.
-
-Sequence numbers are **session-global, not per turn**, so a UI that reconnects
-across a turn boundary resumes at the event it dropped instead of at the start
-of the current turn. With `-sessions-dir` (an `httpapi.Store`) the sessions
-survive a restart: a turn the restart interrupted comes back failed, with its
-transcript as it was when the turn began, and a model that was waiting on a
-question is still waiting on it. `cmd/wombat-serve` wires it up with a single-file browser
-client, and `cmd/wombat-tsgen` reflects over the event registry to generate
-`web/events.ts`, so the TypeScript types cannot drift from the Go ones.
-
-## What is kept
-
-The middleware chains, which are the best part of the original and translate
-exactly:
+A `delegate` tool runs a whole child agent. The child shares the parent's
+budget, permission gate and tracing, because they all travel on the `context`.
 
 ```go
-client := llm.Chain(leaf,
-    llm.WithValidation,
-    wombat.TrackCost(llm.DefaultPricing),
-    llm.WithRetry(llm.DefaultRetryPolicy),   // cost is charged per attempt
-    llm.WithLogging(logger),
+child, _ := wombat.New(wombat.WithClient(client), wombat.WithName("researcher"),
+	wombat.WithTools(tool.Filter(all, tool.OnlyCaps(tool.CapReadOnly))...))
+
+parent, _ := wombat.New(wombat.WithClient(client),
+	wombat.WithTools(append(all, wombat.DelegateTool(child))...),
+	wombat.WithToolTimeoutFallback(0), // the child is bounded by its own iteration cap
 )
 ```
 
-Order is semantic — chaos outside retry, tracing outside chaos, observation
-outermost so one logical call yields one event pair. Unlike a stack of effect
-handlers, position here cannot cause an inner layer to be silently shadowed.
+CLI: `-delegate` adds a read-only researcher sub-agent.
 
-`Pause` and `Terminal` were effects that abandoned their continuation. They are
-outcomes:
+### MCP (Model Context Protocol)
 
-```go
-switch o := run.Outcome().(type) {
-case wombat.Answer:    // the model ended its turn
-case wombat.Paused:    // it called a CapPause tool; answer and resume
-case wombat.Submitted: // it called a CapTerminal tool; the args are the result
+Connect to MCP servers over stdio or Streamable HTTP. The config file uses the
+same format as desktop MCP clients:
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"}
+    },
+    "docs": {"type": "http", "url": "https://example.com/mcp"}
+  }
 }
 ```
 
-Failure is `run.Err()`, matched with `errors.Is`. One failure channel, not two.
-
-## What is lost
-
-- Exhaustive matching over `Event` and `Outcome`. A linter, not a compiler.
-- Illegal transcripts being unrepresentable. `Convo` is an append-only slice
-  validated at the boundary, because Go cannot express the OCaml version's
-  abstract type without a package per invariant.
-- Installing a handler from outside to change an inner leaf's behavior. The
-  OCaml documents this and never uses it.
-- The effect system itself, which is the original project's reason to exist.
-
-## Layout
-
-```
-.                     Agent, Run, Event, Outcome, Convo, Strategy   ← the front door
-llm/                  wire vocabulary, Client, middleware, pricing
-llm/anthropic/        Messages API client (net/http, no curl subprocess)
-llm/openai/           OpenAI-compatible client
-tool/                 Def, Set, Typed, dispatch, middleware, fault attribution
-tool/builtin/         the twelve built-in tools, view_media, and the runners: filtered and sandboxed
-skill/                progressive disclosure: tools that appear when a skill loads
-permission/           per-call authorization, with a human in the loop
-mcp/                  Model Context Protocol client: a server's tools as tool.Defs
-governor/             budgets as context cancellation
-tape/                 content-hash record and replay
-trace/                OTel-shaped spans, NDJSON and a self-contained HTML report
-metric/               Prometheus text exposition, hand-written
-httpapi/              resumable multi-turn sessions over SSE
-rl/                   episodes, verifiers, pass@k
-benchmarks/           eight coding tasks as data
-web/                  TypeScript event types, generated from the Go registry
-cmd/                  wombat-jsonl, -serve, -bench, -trace-html, -tsgen
+```bash
+scripts/wombat -mcp mcp.json "list my open pull requests"
 ```
 
-Standard library only — `go.mod` has no `require` block, and there is nothing
-to vendor.
+Tools appear as `<server>__<tool>`. Their MCP hints (`readOnlyHint`, …) become
+capabilities, so permission policies apply to them exactly as to built-in tools.
+In code, use `mcp.LoadConfig`, `mcp.ConnectAll` and `conns.Tools()`.
+
+### Record and replay
+
+```go
+tp, _ := tape.Open("run.jsonl", tape.Auto)
+defer tp.Close()
+agent, _ := wombat.New(wombat.WithClient(client), tp.Install())
+```
+
+Model responses and tool results are recorded, keyed by a hash of the request.
+A replay is fast, deterministic and makes no network calls. CLI:
+`-tape run.jsonl -tape-mode replay`.
+
+### Tracing and metrics
+
+```bash
+scripts/wombat -trace run.ndjson -trace-html run.html "..."
+bin/wombat-trace-html run.ndjson        # or render an existing trace later
+```
+
+Traces use OpenTelemetry `gen_ai.*` attribute names, nest sub-agents
+automatically, and never record message content. `wombat-serve` exposes
+Prometheus metrics on `GET /metrics`, and `wombat-jsonl -metrics-file` writes a
+one-off dump.
+
+### HTTP API
+
+`wombat-serve` (or the `httpapi` package, a plain `http.Handler`) serves
+multi-turn sessions:
+
+| Method and path | Purpose |
+|---|---|
+| `POST /api/sessions` | Create a session and start its first turn: `{"prompt": "..."}` |
+| `GET /api/sessions/{id}/events` | Server-Sent Events stream. Reconnect with `Last-Event-ID` to resume |
+| `POST /api/sessions/{id}/messages` | Send the next turn: `{"prompt": "..."}` |
+| `POST /api/sessions/{id}/steer` | Send a message to the turn that is still running |
+| `GET /api/sessions/{id}/approvals` | List calls waiting for a human |
+| `POST /api/sessions/{id}/approvals/{use_id}` | Answer one: `{"allow": true}` |
+| `DELETE /api/sessions/{id}` | Cancel and delete a session |
+
+```bash
+curl -s localhost:8080/api/sessions -H 'Content-Type: application/json' \
+     -d '{"prompt": "what does this repo do?"}'      # returns {"id": "...", ...}
+curl -N localhost:8080/api/sessions/<id>/events
+```
+
+The full list (health, config, listing sessions, the transcript) is in the
+`httpapi` package documentation. TypeScript types for every event and request
+are in `web/events.ts`, generated from the Go types.
+
+### Benchmarks and evaluation
+
+```bash
+make bench TASKS=easy N=4                 # or: bin/wombat-bench -tasks hard -n 4
+bin/wombat-judge -in runs/episodes.jsonl  # score the episodes afterwards
+```
+
+`benchmarks/` holds eight coding tasks in two tiers. The easy tier should always
+score 100%; if it does not, the harness is broken. The hard tier is the one that
+tells agents apart. Results are reported as pass@k. `eval/` measures whether the
+harness mechanisms themselves work; see [eval/README.md](eval/README.md).
+
+<a id="en-layout"></a>
+
+## Project layout
+
+```
+.                 Agent, Run, Event, Outcome, Convo, Strategy   ← start here
+llm/              provider-neutral types, Client interface, middleware, pricing
+llm/anthropic/    Anthropic Messages API client
+llm/openai/       OpenAI-compatible client
+tool/             tool definitions, dispatch, middleware (retry, timeout, breaker, …)
+tool/builtin/     the 12 built-in tools, view_media, plain and sandboxed runners
+permission/       per-call authorization, with a human in the loop
+governor/         budgets as context cancellation
+skill/            skills: instructions and tools that load on demand
+skills/           example skills
+mcp/              Model Context Protocol client
+tape/             record and replay
+trace/            spans, NDJSON output, HTML report
+metric/           Prometheus metrics
+httpapi/          multi-turn sessions over SSE
+accept/           deterministic "is it really done?" gates (build, vet, test, TODO.md)
+review/           adversarial code review that reports defects as failing tests
+rl/               episodes, verifiers, pass@k
+benchmarks/       eight coding tasks
+eval/             evaluation of the harness itself
+cmd/              the command-line tools
+scripts/          wombat (run and render), pretty.py (the renderer)
+web/              TypeScript event types, generated
+docs/             design notes
+```
+
+<a id="en-dev"></a>
+
+## Development
+
+```bash
+make              # gofmt check + go vet + go build
+make test         # go test -race ./...
+make ts           # regenerate web/events.ts after changing event types
+```
+
+The test suite runs offline against scripted model clients and needs no API key.
+The only thing you need installed is the Go toolchain: there are no third-party
+modules to download.
+
+<a id="en-faq"></a>
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `scripts/wombat: no env file` | Run `cp .env.example .env` and fill it in, or point `WOMBAT_ENV` at your env file |
+| `no API key` error | Set `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` in `.env`, and check that `WOMBAT_PROVIDER` matches |
+| `no model on the request and no client default` | Set `WOMBAT_MODEL` (or `ANTHROPIC_MODEL`), or pass `-model` |
+| Not sure which model IDs your endpoint accepts | `make models` |
+| Token counts and cost stay at 0, so the budget never trips | Some gateways drop usage data when streaming. Set `OPENAI_STREAM="never"` (or `ANTHROPIC_STREAM`). Also check that the model is priced in `llm/pricing.go` |
+| Output seems frozen with a reasoning model | It is thinking. Use `scripts/wombat -r` to see the reasoning stream |
+| HTTP 400 when using `-media` | The model does not accept images. Drop `-media` |
+| Every shell command is refused | You are using `-permission workspace` or `ask` with `wombat-jsonl`, which cannot ask you. Use `-permission off` with `-confine`, or use `wombat-serve` |
+| Prompt with quotes or `&&` breaks under `make` | Use `scripts/wombat "..."` rather than a make target |
+
+<a id="en-design"></a>
+
+## Design notes
+
+wombat-go is a Go rewrite of a private OCaml 5 project built on **algebraic
+effects**, where every side effect (LLM calls, tools, file I/O, time, human
+input) is an effect, and handlers decide what actually happens. In Go, most of
+those effects turned out to be plain **dependency injection**. Three decisions
+shape the API:
+
+1. **A tool takes a context and its arguments, nothing else.** Whatever it
+   needs (a filesystem, a runner, an HTTP client) is passed in when it is
+   constructed, so a tool is an ordinary function you can test directly.
+2. **A run is a stream of events**, not a return value plus callbacks. A
+   terminal, a JSONL pipe and a web UI all consume the same stream.
+3. **A budget is a `context.Context`.** Going over a limit cancels it, and every
+   blocking call in the process already knows how to unwind from that.
+
+The full write-up covers context structure, skills, fault tolerance, tracing,
+permissions and evaluation, and what was gained and lost compared with the
+OCaml original: **[docs/DESIGN.md](docs/DESIGN.md)**.
