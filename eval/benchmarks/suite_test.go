@@ -3,7 +3,7 @@
 // is — it runs the agent on tasks and measures the result — but one that
 // spends money and needs a key, so it runs only when given arguments:
 //
-//	go test ./benchmarks -run '^TestSuite$' -timeout 0 -v -args -- -n 8 -c 4 -tasks todo-app,fix-bug -out "$PWD/runs"
+//	go test ./eval/benchmarks -run '^TestSuite$' -timeout 0 -v -args -- -n 8 -c 4 -tasks todo-app,fix-bug -out "$PWD/runs"
 //	make bench N=8 C=4 TASKS=todo-app,fix-bug     # the same, from a .env
 //
 // Everything after `--` is this runner's own flags (-list shows the tasks).
