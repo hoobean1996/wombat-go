@@ -201,7 +201,7 @@ wombatd 还会给每个会话的 Agent 提供守护进程自己的工具。任�
 | `daemon` | `poll`、`max_runs`（同时执行的轮数）、`attempts`（每个事件的尝试次数）、`idle` |
 | `outbox` | `webhook`（每条消息 POST 到的地址）及其 `headers` |
 | `model` | `provider`、`name`、`base_url`、`api_key`、`proxy`、`headers`、`stream`、`max_tokens`、`system` |
-| `tools` | `working_dir`、`permission`、`full_access`、`confine`、`confine_network`、`mcp`、`skills_dir`、`media`、`delegate` |
+| `tools` | `working_dir`、`permission`、`full_access`、`confine`、`confine_network`、`deny_read`、`mcp`、`skills_dir`、`media`、`delegate` |
 | `turn` | `budget_usd`、`wall`、`max_iters`、`tool_parallelism`、`context_window`、`compact_at` |
 | `mode` | `build`、`plan` 或 `review` |
 | `done` | `check`（必须通过的命令）、`attempts`、`accept`、`regressions` |
@@ -353,7 +353,7 @@ store:
 |---|---|---|
 | **权限策略** | 根据实际的命令、路径和参数，对每次工具调用做出允许、拒绝或请人审批的决定 | `tools.permission`（wombatd），`permission.Gate`（库） |
 | **环境变量过滤** | Agent 执行的命令只继承白名单内的环境变量，看不到你的 API Key | 默认开启 |
-| **操作系统沙箱** | 命令在 `sandbox-exec`（macOS）或 `bwrap`（Linux）中运行：只能写工作区和临时目录，凭据目录不可读，默认只能访问本机回环网络 | `tools.confine: true` |
+| **操作系统沙箱** | 命令在 `sandbox-exec`（macOS）或 `bwrap`（Linux）中运行：只能写工作区和临时目录；凭据目录、wombatd 自己的配置文件和 `tools.deny_read` 列出的路径不可读；默认只能访问本机回环网络 | `tools.confine: true` |
 
 wombatd 中的权限级别，从最宽松到最严格排列。`tools.permission` 为所有会话设置一个级别；会话在创建时可以要求更严格的级别（`"permission": "readonly"`），但不能要求更宽松的。唯一的例外是运维者开放了的 **Full Access**：
 

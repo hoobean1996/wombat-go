@@ -52,6 +52,9 @@ func main() {
 	}
 
 	cfg, err := loadConfig(*path)
+	if err == nil {
+		cfg, err = cfg.hidingFile(*path)
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "wombatd:", err)
 		os.Exit(2)

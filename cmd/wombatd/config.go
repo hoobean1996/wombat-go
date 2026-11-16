@@ -8,6 +8,7 @@ import (
 	"maps"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -82,15 +83,16 @@ type modelConfig struct {
 }
 
 type toolsConfig struct {
-	WorkingDir     string `yaml:"working_dir"`
-	Permission     string `yaml:"permission"`
-	FullAccess     bool   `yaml:"full_access"`
-	Confine        bool   `yaml:"confine"`
-	ConfineNetwork string `yaml:"confine_network"`
-	MCP            string `yaml:"mcp"`
-	SkillsDir      string `yaml:"skills_dir"`
-	Media          bool   `yaml:"media"`
-	Delegate       bool   `yaml:"delegate"`
+	WorkingDir     string   `yaml:"working_dir"`
+	Permission     string   `yaml:"permission"`
+	FullAccess     bool     `yaml:"full_access"`
+	Confine        bool     `yaml:"confine"`
+	ConfineNetwork string   `yaml:"confine_network"`
+	DenyRead       []string `yaml:"deny_read"`
+	MCP            string   `yaml:"mcp"`
+	SkillsDir      string   `yaml:"skills_dir"`
+	Media          bool     `yaml:"media"`
+	Delegate       bool     `yaml:"delegate"`
 }
 
 type turnConfig struct {
@@ -193,6 +195,20 @@ func loadConfig(path string) (config, error) {
 	return cfg, nil
 }
 
+// hidingFile adds the configuration file itself to tools.deny_read. It can
+// hold model.api_key, server.token and store.dsn, which are this process's to
+// use and no command's to read; the commands an agent runs are this process's
+// user, so the file's permissions cannot keep them out, but under
+// tools.confine they see it empty.
+func (c config) hidingFile(path string) (config, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return config{}, fmt.Errorf("hiding %s from confined commands: %w", path, err)
+	}
+	c.Tools.DenyRead = append(slices.Clone(c.Tools.DenyRead), abs)
+	return c, nil
+}
+
 // validate reports every key that holds what it may not, by its path in the
 // file.
 func (c config) validate() []error {
@@ -254,6 +270,14 @@ func (c config) validate() []error {
 
 	oneOf("tools.permission", c.Tools.Permission, slices.Sorted(maps.Keys(permissions)))
 	oneOf("tools.confine_network", c.Tools.ConfineNetwork, slices.Sorted(maps.Keys(networks)))
+	for _, p := range c.Tools.DenyRead {
+		if !filepath.IsAbs(p) {
+			bad("tools.deny_read", "%q is not an absolute path", p)
+		}
+	}
+	if len(c.Tools.DenyRead) > 0 && !c.Tools.Confine {
+		bad("tools.deny_read", "is applied by tools.confine, which is off")
+	}
 
 	if c.Turn.BudgetUSD < 0 {
 		bad("turn.budget_usd", "is negative; 0 is no cap")

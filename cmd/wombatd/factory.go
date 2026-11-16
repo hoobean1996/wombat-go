@@ -42,10 +42,13 @@ type factory struct {
 	// sandbox is the network mode of a confined runner; nil runs commands
 	// unconfined, with the environment still filtered.
 	sandbox *sandbox.Network
-	mcp     *mcp.Connections // nil without tools.mcp
-	skills  *skill.Registry  // nil without tools.skills_dir
-	tape    *tape.Tape       // nil without record.tape
-	tracer  *trace.Tracer    // nil without record.trace
+	// deny is what a confined command may neither read nor write, beyond the
+	// credential directories: tools.deny_read, and the configuration file.
+	deny   []string
+	mcp    *mcp.Connections // nil without tools.mcp
+	skills *skill.Registry  // nil without tools.skills_dir
+	tape   *tape.Tape       // nil without record.tape
+	tracer *trace.Tracer    // nil without record.trace
 }
 
 // newFactory builds what every session shares, and fails now on anything
@@ -83,6 +86,7 @@ func newFactory(cfg config, rec *recorders, logger *slog.Logger) (*factory, erro
 	if cfg.Tools.Confine {
 		n := networks[cfg.Tools.ConfineNetwork]
 		f.sandbox = &n
+		f.deny = cfg.Tools.DenyRead
 	}
 	if f.skills, err = loadSkills(cfg.Tools.SkillsDir, logger); err != nil {
 		return nil, err

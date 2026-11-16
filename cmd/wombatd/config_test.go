@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -62,6 +63,8 @@ func TestAConfigThatCannotMeanWhatItSaysIsRefused(t *testing.T) {
 		{"an unknown provider", "model:\n  provider: gemini\n", "model.provider"},
 		{"an unknown permission", "tools:\n  permission: read-only\n", "tools.permission"},
 		{"an unknown network", "tools:\n  confine_network: some\n", "tools.confine_network"},
+		{"a relative path to hide", "tools:\n  confine: true\n  deny_read: [secrets]\n", `tools.deny_read: "secrets" is not an absolute path`},
+		{"paths to hide, unconfined", "tools:\n  deny_read: [/etc/wombat]\n", "tools.deny_read: is applied by tools.confine, which is off"},
 		{"an unknown mode", "mode: plan-only\n", `mode: "plan-only" is not one of build, plan, review`},
 		{"compaction without a window", "turn:\n  compact_at: 0.8\n", "turn.context_window, which is not set"},
 		{"compaction past the window", "turn:\n  context_window: 100000\n  compact_at: 1.5\n", "not a fraction"},
@@ -118,6 +121,9 @@ func TestTheExampleConfigShowsEveryKeyAndItsDefault(t *testing.T) {
 	if len(cfg.Outbox.Headers) == 0 {
 		cfg.Outbox.Headers = nil // {} in the file, nil by default
 	}
+	if len(cfg.Tools.DenyRead) == 0 {
+		cfg.Tools.DenyRead = nil // [] in the file, nil by default
+	}
 	if !reflect.DeepEqual(cfg, want) {
 		t.Errorf("the example's values are not the defaults:\nexample  %+v\ndefaults %+v", cfg, want)
 	}
@@ -160,6 +166,35 @@ func has(m map[string]any, dotted string) bool {
 	}
 	sub, ok := v.(map[string]any)
 	return ok && has(sub, rest)
+}
+
+// The file wombatd was configured from is hidden from confined commands,
+// however it was named: it holds what only wombatd may read, and the commands
+// run as wombatd's user, whom its permissions let in.
+func TestTheConfigFileIsHiddenFromCommands(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := defaults()
+	cfg.Tools.DenyRead = []string{"/etc/wombat"}
+	for _, tc := range []struct{ named, want string }{
+		{"wombatd.yaml", filepath.Join(cwd, "wombatd.yaml")},
+		{filepath.Join(dir, "conf", "w.yaml"), filepath.Join(dir, "conf", "w.yaml")},
+	} {
+		got, err := cfg.hidingFile(tc.named)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := []string{"/etc/wombat", tc.want}; !slices.Equal(got.Tools.DenyRead, want) {
+			t.Errorf("hidingFile(%q).Tools.DenyRead = %q, want %q", tc.named, got.Tools.DenyRead, want)
+		}
+	}
+	if len(cfg.Tools.DenyRead) != 1 {
+		t.Errorf("hidingFile changed the config it was called on: %q", cfg.Tools.DenyRead)
+	}
 }
 
 // A secret in a file anyone else can read is said out loud; a file without

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -101,6 +102,7 @@ func TestNewFactory(t *testing.T) {
 	cfg := defaults()
 	cfg.Tools.WorkingDir = t.TempDir()
 	cfg.Tools.Confine, cfg.Tools.ConfineNetwork = true, "none"
+	cfg.Tools.DenyRead = []string{"/etc/wombat", "/srv/wombatd.yaml"}
 	f, err := newFactory(cfg, &recorders{}, logger)
 	if err != nil {
 		t.Fatal(err)
@@ -114,6 +116,9 @@ func TestNewFactory(t *testing.T) {
 	}
 	if f.sandbox == nil || *f.sandbox != sandbox.NetNone {
 		t.Errorf("sandbox = %v, want the none network", f.sandbox)
+	}
+	if !slices.Equal(f.deny, cfg.Tools.DenyRead) {
+		t.Errorf("deny = %q, want tools.deny_read %q", f.deny, cfg.Tools.DenyRead)
 	}
 
 	cfg.Tools.WorkingDir = filepath.Join(t.TempDir(), "missing")

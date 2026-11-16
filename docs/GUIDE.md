@@ -216,7 +216,7 @@ take effect.
 | `daemon` | `poll`, `max_runs` (turns at once), `attempts` (tries per event), `idle` |
 | `outbox` | `webhook` (where each message is POSTed) and its `headers` |
 | `model` | `provider`, `name`, `base_url`, `api_key`, `proxy`, `headers`, `stream`, `max_tokens`, `system` |
-| `tools` | `working_dir`, `permission`, `full_access`, `confine`, `confine_network`, `mcp`, `skills_dir`, `media`, `delegate` |
+| `tools` | `working_dir`, `permission`, `full_access`, `confine`, `confine_network`, `deny_read`, `mcp`, `skills_dir`, `media`, `delegate` |
 | `turn` | `budget_usd`, `wall`, `max_iters`, `tool_parallelism`, `context_window`, `compact_at` |
 | `mode` | `build`, `plan` or `review` |
 | `done` | `check` (a command that must pass), `attempts`, `accept`, `regressions` |
@@ -440,7 +440,7 @@ Three independent layers:
 |---|---|---|
 | **Permission policy** | Allows, denies or asks a human about each tool call, looking at the actual command, path and arguments | `tools.permission` (wombatd), `permission.Gate` (library) |
 | **Environment scrubbing** | Commands the agent runs inherit only an allowlist of environment variables, so your API keys are not visible to them | On by default |
-| **OS sandbox** | Commands run under `sandbox-exec` (macOS) or `bwrap` (Linux): writes only inside the workspace and the temp directory, credential directories unreadable, network loopback-only by default | `tools.confine: true` |
+| **OS sandbox** | Commands run under `sandbox-exec` (macOS) or `bwrap` (Linux): writes only inside the workspace and the temp directory; credential directories, wombatd's own config file and `tools.deny_read` unreadable; network loopback-only by default | `tools.confine: true` |
 
 Permission levels in wombatd, from the loosest to the strictest.
 `tools.permission` sets one for every session; a session may ask for a

@@ -186,6 +186,13 @@ tools:
   # What a confined command may reach: loopback, none or full.
   confine_network: loopback
 
+  # More paths a confined command may neither read nor write: absolute, a
+  # file or a directory — where the host keeps the secrets of the services
+  # beside wombatd, say. This file is always among them: it can hold
+  # model.api_key, server.token and store.dsn, and the commands run as the
+  # user wombatd runs as, so its permissions cannot keep them out.
+  deny_read: []
+
   # A JSON file of MCP servers, in the usual {"mcpServers": {...}} form,
   # whose tools every session is offered — named <server>__<tool>, and held
   # to the same permission as the built-in ones. The servers are started once

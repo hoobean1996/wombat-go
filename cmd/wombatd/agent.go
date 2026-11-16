@@ -97,7 +97,7 @@ func (f *factory) runner(workspace string) (sandbox.Runner, error) {
 	if f.sandbox == nil {
 		return sandbox.Unconfined(workspace), nil
 	}
-	r, err := sandbox.Confined(workspace, sandbox.Config{Network: *f.sandbox})
+	r, err := sandbox.Confined(workspace, sandbox.Config{Network: *f.sandbox, DenyRead: f.deny})
 	if err != nil {
 		return nil, fmt.Errorf("tools.confine: %w", err)
 	}
