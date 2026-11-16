@@ -2,7 +2,8 @@
 
 > This is the long-form design rationale: why the harness is shaped the way it
 > is, and what each mechanism learned from being wrong first. For installation,
-> configuration and usage, start with the [README](../README.md).
+> configuration and usage, start with the [README](../README.md) and the
+> [guide](GUIDE.md).
 
 A ReAct agent harness in Go, and an always-on agent service built on it.
 
