@@ -27,6 +27,11 @@ type TurnStarted struct {
 
 	// Events are the inbox events the turn is for.
 	Events []int64 `json:"events"`
+
+	// Origins are where the message the turn starts with came from, as the
+	// transcript's origins will keep them: who said what, through which
+	// channel. For a turn resuming after decisions, the decisions.
+	Origins []Origin `json:"origins,omitempty"`
 }
 
 // TurnEnded closes one turn and says how.

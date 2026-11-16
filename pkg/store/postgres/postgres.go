@@ -195,11 +195,11 @@ func (s *Store) DeleteSession(ctx context.Context, id string) error {
 
 // ===== The inbox =====
 
-const eventCols = `id, session_id, kind, source, coalesce(dedup_key, ''), payload, status, attempts, error, created, not_before`
+const eventCols = `id, session_id, kind, source, sender, coalesce(dedup_key, ''), payload, status, attempts, error, created, not_before`
 
 func scanEvent(row pgx.CollectableRow) (daemon.Event, error) {
 	var e daemon.Event
-	err := row.Scan(&e.ID, &e.Session, &e.Kind, &e.Source, &e.DedupKey, (*[]byte)(&e.Payload),
+	err := row.Scan(&e.ID, &e.Session, &e.Kind, &e.Source, &e.From, &e.DedupKey, (*[]byte)(&e.Payload),
 		&e.Status, &e.Attempts, &e.Error, &e.Created, &e.NotBefore)
 	e.Created, e.NotBefore = e.Created.UTC(), e.NotBefore.UTC()
 	return e, err
@@ -216,11 +216,11 @@ func enqueue(ctx context.Context, q querier, e daemon.Event) (daemon.Event, bool
 		notBefore = created
 	}
 	rows, err := q.Query(ctx, `
-		INSERT INTO inbox (session_id, kind, source, dedup_key, payload, created, not_before)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		INSERT INTO inbox (session_id, kind, source, sender, dedup_key, payload, created, not_before)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (source, dedup_key) DO NOTHING
 		RETURNING `+eventCols,
-		e.Session, e.Kind, e.Source, nullString(e.DedupKey), nullJSON(e.Payload), created, notBefore)
+		e.Session, e.Kind, e.Source, e.From, nullString(e.DedupKey), nullJSON(e.Payload), created, notBefore)
 	if err != nil {
 		return daemon.Event{}, false, noSession(err, e.Session)
 	}

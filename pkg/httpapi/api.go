@@ -475,13 +475,18 @@ func (a *api) createSession(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, r, fmt.Errorf("%w: prompt is required", daemon.ErrBadRequest))
 		return
 	}
+	// Before the session is made, so a bad name costs nothing to refuse.
+	if err := daemon.CheckFrom(req.From); err != nil {
+		a.fail(w, r, err)
+		return
+	}
 
 	s, err := a.m.Create(r.Context(), req.SessionOptions)
 	if err != nil {
 		a.fail(w, r, err)
 		return
 	}
-	if _, err := s.Send(r.Context(), prompt); err != nil {
+	if _, err := s.SendAs(r.Context(), req.From, prompt); err != nil {
 		// The session never got its message, so it is deleted rather than
 		// left empty: the caller has no id to clean it up with.
 		_ = a.m.Delete(context.WithoutCancel(r.Context()), s.ID())
@@ -530,16 +535,22 @@ func (a *api) getMessages(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, r, err)
 		return
 	}
-	msgs := s.Messages()
+	msgs, origins := s.Transcript()
 	if msgs == nil {
 		msgs = []llm.Message{}
 	}
+	if origins == nil {
+		origins = map[int][]daemon.Origin{}
+	}
 	// An anonymous body rather than a named wire type: the transcript is the
 	// harness's own persistence shape, and a second declaration of it here
-	// would be a fork of a format this package does not own.
+	// would be a fork of a format this package does not own. That is also
+	// why origins sit beside the messages, keyed by index, rather than in
+	// them.
 	writeJSON(w, http.StatusOK, struct {
-		Messages []llm.Message `json:"messages"`
-	}{msgs})
+		Messages []llm.Message           `json:"messages"`
+		Origins  map[int][]daemon.Origin `json:"origins"`
+	}{msgs, origins})
 }
 
 // postMessage puts a message in the session's inbox.
@@ -563,7 +574,7 @@ func (a *api) postMessage(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, r, fmt.Errorf("%w: prompt is required", daemon.ErrBadRequest))
 		return
 	}
-	e, err := s.Send(r.Context(), prompt)
+	e, err := s.SendAs(r.Context(), req.From, prompt)
 	if err != nil {
 		a.fail(w, r, err)
 		return
@@ -579,7 +590,7 @@ func (a *api) steer(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, r, err)
 		return
 	}
-	var req SendRequest
+	var req SteerRequest
 	if err := decodeBody(w, r, &req); err != nil {
 		a.fail(w, r, err)
 		return
@@ -626,7 +637,7 @@ func (a *api) resolveApproval(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, r, fmt.Errorf("%w: allow must be true or false", daemon.ErrBadRequest))
 		return
 	}
-	e, err := s.Resolve(r.Context(), r.PathValue("use_id"), *req.Allow)
+	e, err := s.ResolveAs(r.Context(), req.From, r.PathValue("use_id"), *req.Allow)
 	if err != nil {
 		a.fail(w, r, err)
 		return
@@ -646,7 +657,7 @@ func (a *api) postEvent(w http.ResponseWriter, r *http.Request) {
 	}
 	in := daemon.Inbound{
 		Session: req.SessionID, Thread: req.Thread,
-		Kind: req.Kind, Source: req.Source, DedupKey: req.DedupKey, Payload: req.Payload,
+		Kind: req.Kind, Source: req.Source, From: req.From, DedupKey: req.DedupKey, Payload: req.Payload,
 	}
 	if req.Options != nil {
 		in.Options = *req.Options

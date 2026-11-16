@@ -1455,3 +1455,105 @@ func TestTimersOverTheAPI(t *testing.T) {
 		h.wantErr(h.do(http.MethodPost, "/api/timers", bad), http.StatusBadRequest, "bad_request")
 	}
 }
+
+// ===== who said what =====
+
+// transcriptBody is GET /api/sessions/{id}/messages.
+type transcriptBody struct {
+	Messages []llm.Message           `json:"messages"`
+	Origins  map[int][]daemon.Origin `json:"origins"`
+}
+
+// Who said what goes in with every way a session hears from a person — its
+// first message, a later one, a chat relayed through an event — and comes
+// back out beside the transcript, keyed by the message it made.
+func TestWhoSaidWhat(t *testing.T) {
+	t.Parallel()
+	h := apiServe(t, apiScript(apiText("one"), apiText("two"), apiText("three")), nil, nil)
+
+	info := h.start(`{"prompt":"hello","from":"alice"}`)
+	h.awaitState(info.ID, daemon.Idle)
+
+	var sent httpapi.Accepted
+	h.decode(h.do(http.MethodPost, "/api/sessions/"+info.ID+"/messages", `{"prompt":"and you?","from":"bob"}`),
+		http.StatusAccepted, &sent)
+	if sent.Event.From != "bob" || sent.Event.Source != daemon.SourceAPI {
+		t.Fatalf("accepted = %+v, want bob's message", sent.Event)
+	}
+	h.awaitState(info.ID, daemon.Idle)
+
+	var relayed httpapi.Accepted
+	h.decode(h.do(http.MethodPost, "/api/events",
+		`{"session_id":"`+info.ID+`","kind":"message","source":"slack","from":"carol","payload":{"text":"me too"}}`),
+		http.StatusAccepted, &relayed)
+	if relayed.Event.From != "carol" || relayed.Event.Source != "slack" {
+		t.Fatalf("accepted = %+v, want carol's message", relayed.Event)
+	}
+	h.awaitState(info.ID, daemon.Idle)
+
+	var got transcriptBody
+	h.decode(h.do(http.MethodGet, "/api/sessions/"+info.ID+"/messages", ""), http.StatusOK, &got)
+	if len(got.Messages) != 6 {
+		t.Fatalf("the transcript has %d messages, want 6", len(got.Messages))
+	}
+	for i, want := range map[int]struct{ source, from string }{0: {"api", "alice"}, 2: {"api", "bob"}, 4: {"slack", "carol"}} {
+		o := got.Origins[i]
+		if len(o) != 1 || o[0].Kind != daemon.KindMessage || o[0].Source != want.source || o[0].From != want.from {
+			t.Errorf("origins of message %d = %+v, want a message from %s through %s", i, o, want.from, want.source)
+		}
+	}
+	if o := got.Origins[2]; len(o) == 1 && o[0].Event != sent.Event.ID {
+		t.Errorf("message 2 names event %d, want %d", o[0].Event, sent.Event.ID)
+	}
+	if len(got.Origins) != 3 {
+		t.Errorf("origins = %+v, want three: the model's turns have none", got.Origins)
+	}
+}
+
+// A decision says who made it, and the result of the call it decided keeps
+// that.
+func TestADecisionSaysWhoMadeIt(t *testing.T) {
+	t.Parallel()
+	h := apiServe(t, apiScript(apiToolCall("use-1", "look", `{}`), apiText("done")), []tool.Def{apiTool("look")}, nil)
+	info := h.start(`{"prompt":"look","permission":"ask"}`)
+	h.awaitState(info.ID, daemon.Approving)
+
+	path := "/api/sessions/" + info.ID + "/approvals/use-1"
+	h.wantErr(h.do(http.MethodPost, path, `{"allow":true,"from":"a\tb"}`), http.StatusBadRequest, "bad_request")
+	var accepted httpapi.Accepted
+	h.decode(h.do(http.MethodPost, path, `{"allow":true,"from":"dave"}`), http.StatusAccepted, &accepted)
+	if accepted.Event.From != "dave" || accepted.Event.Kind != daemon.KindApproval {
+		t.Fatalf("accepted = %+v, want dave's decision", accepted.Event)
+	}
+	h.awaitState(info.ID, daemon.Idle)
+
+	var got transcriptBody
+	h.decode(h.do(http.MethodGet, "/api/sessions/"+info.ID+"/messages", ""), http.StatusOK, &got)
+	if o := got.Origins[2]; len(o) != 1 || o[0].Kind != daemon.KindApproval || o[0].From != "dave" || o[0].Event != accepted.Event.ID {
+		t.Fatalf("origins of the call's result = %+v, want dave's decision (all: %+v)", o, got.Origins)
+	}
+}
+
+// A from that is not a short line of text is refused wherever it comes in,
+// before anything is made; steer, which is not an event, takes none at all.
+func TestAFromThatIsNotANameIsRefused(t *testing.T) {
+	t.Parallel()
+	h := apiServe(t, apiScript(apiText("ok")), nil, nil)
+
+	h.wantErr(h.do(http.MethodPost, "/api/sessions", `{"prompt":"hi","from":"two\nlines"}`), http.StatusBadRequest, "bad_request")
+	var list httpapi.SessionList
+	h.decode(h.do(http.MethodGet, "/api/sessions", ""), http.StatusOK, &list)
+	if len(list.Sessions) != 0 {
+		t.Fatalf("a refused create left %d sessions behind", len(list.Sessions))
+	}
+
+	info := h.start(`{"prompt":"hi"}`)
+	h.awaitState(info.ID, daemon.Idle)
+	long := strings.Repeat("x", 200)
+	h.wantErr(h.do(http.MethodPost, "/api/sessions/"+info.ID+"/messages", `{"prompt":"x","from":"`+long+`"}`),
+		http.StatusBadRequest, "bad_request")
+	h.wantErr(h.do(http.MethodPost, "/api/events", `{"session_id":"`+info.ID+`","kind":"ping","from":" padded"}`),
+		http.StatusBadRequest, "bad_request")
+	h.wantErr(h.do(http.MethodPost, "/api/sessions/"+info.ID+"/steer", `{"prompt":"x","from":"bob"}`),
+		http.StatusBadRequest, "bad_request")
+}

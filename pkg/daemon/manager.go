@@ -398,6 +398,7 @@ type Inbound struct {
 
 	Kind     string
 	Source   string
+	From     string // who, at Source, sent it; optional
 	DedupKey string
 	Payload  json.RawMessage
 }
@@ -430,6 +431,9 @@ func (m *Manager) Receive(ctx context.Context, in Inbound) (Event, bool, error) 
 	case len(in.Payload) > 0 && !json.Valid(in.Payload):
 		return Event{}, false, fmt.Errorf("%w: payload is not JSON", ErrBadRequest)
 	}
+	if err := CheckFrom(in.From); err != nil {
+		return Event{}, false, err
+	}
 	if in.Kind == KindMessage {
 		if text, ok := messageText(Event{Payload: in.Payload}); !ok || strings.TrimSpace(text) == "" {
 			return Event{}, false, fmt.Errorf(`%w: a message's payload is {"text": "..."}`, ErrBadRequest)
@@ -455,7 +459,7 @@ func (m *Manager) Receive(ctx context.Context, in Inbound) (Event, bool, error) 
 		return Event{}, false, ErrDone
 	}
 	e, created, err := m.enqueue(ctx, Event{
-		Session: s.id, Kind: in.Kind, Source: in.Source, DedupKey: in.DedupKey, Payload: in.Payload,
+		Session: s.id, Kind: in.Kind, Source: in.Source, From: in.From, DedupKey: in.DedupKey, Payload: in.Payload,
 	})
 	if err == nil && !created && made {
 		// A delivery of an event received before, which went to the session

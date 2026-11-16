@@ -184,6 +184,16 @@ type SessionRecord struct {
 	Messages []llm.Message  `json:"messages"`
 	Spend    Spend          `json:"spend"`
 
+	// Origins are where messages of the transcript came from, keyed by their
+	// index in Messages: for each message a turn's inbox events made — the
+	// one a turn starts with, or the one a decision resumes it with — the
+	// events. Other messages have none: the model's, tools' results, and what
+	// was steered into a running turn, which is not an event. A compaction
+	// renumbers them with the transcript: the messages it folds away take
+	// their origins with them, and the head it folds them into keeps the
+	// first message's.
+	Origins map[int][]Origin `json:"origins,omitempty"`
+
 	Outcome   string        `json:"outcome,omitempty"`
 	Answer    string        `json:"answer,omitempty"`
 	Error     string        `json:"error,omitempty"`
@@ -196,6 +206,11 @@ type SessionRecord struct {
 	Deferred   *core.Deferred         `json:"deferred,omitempty"`
 	Verdicts   map[llm.ToolUseID]bool `json:"verdicts,omitempty"`
 	DeferredAt time.Time              `json:"deferred_at,omitzero"`
+
+	// DecidedBy are the decisions behind Verdicts, as origins: they arrive
+	// one at a time, and become the origins of the message the resumed turn
+	// answers the calls in.
+	DecidedBy []Origin `json:"decided_by,omitempty"`
 
 	// ReplyTo are the messages a stopped turn has not answered yet: when the
 	// turn resumes and answers, that answer is their reply.
@@ -222,6 +237,11 @@ type Event struct {
 
 	// Source is who said so: [SourceAPI], [SourceTimer], or a client's name.
 	Source string `json:"source"`
+
+	// From is who, at Source, sent it, when the sender says: a person's name
+	// or handle in a chat, the account that decided a call. Optional. The
+	// model is told it, and so is whoever reads the transcript; see [Origin].
+	From string `json:"from,omitempty"`
 
 	// DedupKey makes posting the same event twice — a webhook delivered
 	// again — post it once. Unique per Source; optional.
@@ -271,6 +291,27 @@ const (
 	SourceAPI   = "api"
 	SourceTimer = "timer"
 )
+
+// Origin is an inbox event a message of the transcript was made from: what it
+// was, where it came from, who sent it, and when.
+//
+// The transcript is exactly what the model was sent, and says where its
+// messages came from only as prose the model reads. A session keeps origins
+// beside it — see [SessionRecord.Origins] — so a program reading the
+// conversation can tell a person's message from a webhook, a timer or a
+// decision, and one person from another.
+type Origin struct {
+	Event  int64     `json:"event"`
+	Kind   string    `json:"kind"`
+	Source string    `json:"source"`
+	From   string    `json:"from,omitempty"`
+	At     time.Time `json:"at"`
+}
+
+// OriginOf is where e comes from, as a message made from it records it.
+func OriginOf(e Event) Origin {
+	return Origin{Event: e.ID, Kind: e.Kind, Source: e.Source, From: e.From, At: e.Created}
+}
 
 // EventFilter selects inbox events. A zero field selects everything.
 type EventFilter struct {

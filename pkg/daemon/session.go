@@ -72,9 +72,11 @@ type Session struct {
 	cancel context.CancelFunc
 
 	// msgs is the conversation so far, replaced at the end of every turn with
-	// the run's own final transcript.
-	msgs  []llm.Message
-	spend Spend
+	// the run's own final transcript; origins say where its messages came
+	// from, and are replaced with it.
+	msgs    []llm.Message
+	origins map[int][]Origin
+	spend   Spend
 
 	outcome string
 	answer  string
@@ -85,6 +87,7 @@ type Session struct {
 	deferred   *core.Deferred
 	verdicts   map[llm.ToolUseID]bool
 	deferredAt time.Time
+	decidedBy  []Origin
 	replyTo    []int64
 }
 
@@ -93,9 +96,10 @@ func (m *Manager) newSession(rec SessionRecord, agent *core.Agent) *Session {
 		id: rec.ID, thread: rec.Thread, m: m, agent: agent, opts: rec.Options, created: rec.Created,
 		bufCap: m.cfg.BufferSize, changed: make(chan struct{}),
 		state: rec.State, turns: rec.Turns, updated: rec.Updated, base: rec.Events,
-		msgs: rec.Messages, spend: rec.Spend,
+		msgs: rec.Messages, origins: rec.Origins, spend: rec.Spend,
 		outcome: rec.Outcome, answer: rec.Answer, errText: rec.Error, errKind: rec.ErrorKind, pauseID: rec.PauseID,
-		deferred: rec.Deferred, verdicts: rec.Verdicts, deferredAt: rec.DeferredAt, replyTo: rec.ReplyTo,
+		deferred: rec.Deferred, verdicts: rec.Verdicts, deferredAt: rec.DeferredAt, decidedBy: rec.DecidedBy,
+		replyTo: rec.ReplyTo,
 	}
 }
 
@@ -110,11 +114,11 @@ func (s *Session) recordLocked() SessionRecord {
 	return SessionRecord{
 		Version: RecordVersion, ID: s.id, Thread: s.thread, Options: s.opts,
 		Created: s.created, Updated: s.updated,
-		Turns: s.turns, State: s.state, Messages: s.msgs, Spend: s.spend,
+		Turns: s.turns, State: s.state, Messages: s.msgs, Origins: maps.Clone(s.origins), Spend: s.spend,
 		Outcome: s.outcome, Answer: s.answer, Error: s.errText, ErrorKind: s.errKind, PauseID: s.pauseID,
 		Deferred: s.deferred, Verdicts: maps.Clone(s.verdicts), DeferredAt: s.deferredAt,
-		ReplyTo: slices.Clone(s.replyTo),
-		Events:  s.base + len(s.frames),
+		DecidedBy: slices.Clone(s.decidedBy), ReplyTo: slices.Clone(s.replyTo),
+		Events: s.base + len(s.frames),
 	}
 }
 
@@ -151,6 +155,15 @@ func (s *Session) Messages() []llm.Message {
 	return slices.Clone(s.msgs)
 }
 
+// Transcript is [Session.Messages] with where its messages came from: for
+// each message inbox events made, keyed by its index, the events' origins.
+// One call, so the two cannot straddle the end of a turn.
+func (s *Session) Transcript() ([]llm.Message, map[int][]Origin) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.msgs), maps.Clone(s.origins)
+}
+
 // ===== What comes in =====
 
 // MessagePayload is the payload of a [KindMessage] event.
@@ -163,11 +176,21 @@ type MessagePayload struct {
 // if it is not. It returns the event; the reply arrives on the event log, and
 // in the outbox.
 func (s *Session) Send(ctx context.Context, prompt string) (Event, error) {
+	return s.SendAs(ctx, "", prompt)
+}
+
+// SendAs is [Session.Send] from someone named, for a session more than one
+// person talks to: the model is told who said it, and the transcript's
+// origins keep it. An empty from is Send.
+func (s *Session) SendAs(ctx context.Context, from, prompt string) (Event, error) {
+	if err := CheckFrom(from); err != nil {
+		return Event{}, err
+	}
 	if err := s.open(); err != nil {
 		return Event{}, err
 	}
 	payload, _ := json.Marshal(MessagePayload{Text: prompt})
-	e, _, err := s.m.enqueue(ctx, Event{Session: s.id, Kind: KindMessage, Source: SourceAPI, Payload: payload})
+	e, _, err := s.m.enqueue(ctx, Event{Session: s.id, Kind: KindMessage, Source: SourceAPI, From: from, Payload: payload})
 	if err == nil {
 		s.touch()
 	}
@@ -187,6 +210,15 @@ type ApprovalPayload struct {
 // It reports [ErrNoSuchApproval] for a call that is not waiting, and
 // [ErrAlreadyAnswered] for one that has been decided.
 func (s *Session) Resolve(ctx context.Context, useID string, allow bool) (Event, error) {
+	return s.ResolveAs(ctx, "", useID, allow)
+}
+
+// ResolveAs is [Session.Resolve] by someone named: who decided is kept with
+// the call's result in the transcript's origins. An empty from is Resolve.
+func (s *Session) ResolveAs(ctx context.Context, from, useID string, allow bool) (Event, error) {
+	if err := CheckFrom(from); err != nil {
+		return Event{}, err
+	}
 	if err := s.open(); err != nil {
 		return Event{}, err
 	}
@@ -202,7 +234,7 @@ func (s *Session) Resolve(ctx context.Context, useID string, allow bool) (Event,
 	}
 	payload, _ := json.Marshal(ApprovalPayload{UseID: llm.ToolUseID(useID), Allow: allow})
 	e, created, err := s.m.enqueue(ctx, Event{
-		Session: s.id, Kind: KindApproval, Source: SourceAPI, Payload: payload,
+		Session: s.id, Kind: KindApproval, Source: SourceAPI, From: from, Payload: payload,
 		// One decision per call, however many times it is posted.
 		DedupKey: "approval:" + s.id + ":" + useID,
 	})
@@ -314,6 +346,7 @@ func (s *Session) handle(batch []Event) {
 	var in core.Input
 	var prompt string
 	var replyTo []int64
+	prov := provenance{at: -1}
 	handled := batch
 	if s.deferred != nil {
 		for _, e := range decisions {
@@ -323,6 +356,11 @@ func (s *Session) handle(batch []Event) {
 					s.verdicts = map[llm.ToolUseID]bool{}
 				}
 				s.verdicts[v.UseID] = v.Allow
+				// Once, though a resumed turn that is tried again sees its
+				// decisions again.
+				if !slices.ContainsFunc(s.decidedBy, func(o Origin) bool { return o.Event == e.ID }) {
+					s.decidedBy = append(s.decidedBy, OriginOf(e))
+				}
 			}
 		}
 		if len(rest) > 0 {
@@ -340,6 +378,9 @@ func (s *Session) handle(batch []Event) {
 		}
 		in = core.Decide(s.msgs, *s.deferred, maps.Clone(s.verdicts))
 		replyTo = s.replyTo
+		// The resumed run answers every call of the turn it stopped on in one
+		// message, put right after the transcript it stopped with.
+		prov = provenance{at: len(s.msgs), origins: slices.Clone(s.decidedBy)}
 	} else {
 		if len(rest) == 0 {
 			// Decisions on calls nobody is waiting on any more: a race with
@@ -361,6 +402,8 @@ func (s *Session) handle(batch []Event) {
 			// one, and a provider rejects a transcript that still has it.
 			in = core.Then(s.msgs, prompt)
 		}
+		// Each of the three puts what came in at the end of the transcript.
+		prov = provenance{at: len(in.Messages) - 1, origins: originsOf(rest)}
 		for _, e := range rest {
 			if e.Kind == KindMessage {
 				replyTo = append(replyTo, e.ID)
@@ -385,7 +428,7 @@ func (s *Session) handle(batch []Event) {
 	s.state, s.run, s.cancel = Running, buf, cancel
 	s.outcome, s.answer, s.errText, s.errKind = "", "", "", ""
 	ids := eventIDs(handled)
-	s.emitLocked(turn, TurnStarted{Turn: turn, Prompt: prompt, Events: ids})
+	s.emitLocked(turn, TurnStarted{Turn: turn, Prompt: prompt, Events: ids, Origins: prov.origins})
 	// Saved as running, so a daemon that dies mid-turn is found out when the
 	// session is next loaded; the transcript is the one the turn started
 	// from, and the events that make it are in the inbox.
@@ -397,14 +440,17 @@ func (s *Session) handle(batch []Event) {
 	// saying why a cancelled turn stopped included. Follow returns on its own
 	// once the run is over, which cancelling guarantees.
 	for _, ev := range buf.Follow(context.Background(), 0) {
+		if c, ok := ev.(core.TranscriptCompacted); ok {
+			prov.folds = append(prov.folds, c.Folded)
+		}
 		s.append(turn, ev)
 	}
-	s.end(ctx, cancel, turn, buf, handled, replyTo)
+	s.end(ctx, cancel, turn, buf, handled, replyTo, prov)
 }
 
 // end records how a turn ended, says so in the log and the outbox, and
 // settles its events.
-func (s *Session) end(ctx context.Context, cancel context.CancelFunc, turn int, buf *core.Buffered, events []Event, replyTo []int64) {
+func (s *Session) end(ctx context.Context, cancel context.CancelFunc, turn int, buf *core.Buffered, events []Event, replyTo []int64, prov provenance) {
 	defer cancel()
 	now := time.Now()
 	end := TurnEnded{Turn: turn, Events: eventIDs(events), Spend: turnSpend(ctx)}
@@ -481,7 +527,9 @@ func (s *Session) end(ctx context.Context, cancel context.CancelFunc, turn int, 
 		// a conversation does. A turn that will run again starts over from
 		// the transcript it started from, so it is not there twice.
 		next.Messages = buf.Messages()
+		next.Origins = prov.apply(s.origins, next.Messages)
 		next.PauseID, next.Deferred, next.Verdicts, next.DeferredAt, next.ReplyTo = pauseID, deferred, nil, time.Time{}, nil
+		next.DecidedBy = nil
 		if deferred != nil {
 			next.Verdicts, next.DeferredAt, next.ReplyTo = map[llm.ToolUseID]bool{}, now, replyTo
 		}
@@ -509,9 +557,10 @@ func (s *Session) end(ctx context.Context, cancel context.CancelFunc, turn int, 
 	s.settleOrForget(set)
 
 	s.mu.Lock()
-	s.msgs, s.spend, s.state = next.Messages, next.Spend, next.State
+	s.msgs, s.origins, s.spend, s.state = next.Messages, next.Origins, next.Spend, next.State
 	s.outcome, s.answer, s.errText, s.errKind = next.Outcome, next.Answer, next.Error, next.ErrorKind
 	s.pauseID, s.deferred, s.verdicts, s.deferredAt, s.replyTo = next.PauseID, next.Deferred, next.Verdicts, next.DeferredAt, next.ReplyTo
+	s.decidedBy = next.DecidedBy
 	s.run, s.cancel = nil, nil
 	// What was sent with Steer and never reached the model is handed back,
 	// so a client can send it as a message instead of losing it.

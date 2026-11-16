@@ -125,7 +125,12 @@ func sessionRoundTrip(t *testing.T, st daemon.Store) {
 	}
 	rec.Verdicts = map[llm.ToolUseID]bool{"w1": true}
 	rec.DeferredAt = t0.Add(time.Minute)
+	rec.DecidedBy = []daemon.Origin{{Event: 5, Kind: daemon.KindApproval, Source: daemon.SourceAPI, From: "carol", At: t0.Add(time.Second)}}
 	rec.ReplyTo = []int64{3, 4}
+	rec.Origins = map[int][]daemon.Origin{0: {
+		{Event: 3, Kind: daemon.KindMessage, Source: "slack", From: "alice", At: t0},
+		{Event: 4, Kind: "push", Source: "github", At: t0.Add(time.Millisecond)},
+	}}
 	create(t, st, rec)
 
 	got, err := st.LoadSession(ctx, "s1")
@@ -288,11 +293,30 @@ func enqueueAndDedup(t *testing.T, st daemon.Store) {
 		t.Errorf("payload = %s", a.Payload)
 	}
 
-	hook := daemon.Event{Session: "s1", Kind: "push", Source: "github", DedupKey: "delivery-7", Created: t0}
+	hook := daemon.Event{Session: "s1", Kind: "push", Source: "github", From: "octocat", DedupKey: "delivery-7", Created: t0}
 	first := enqueue(t, st, hook)
 	again, created, err := st.Enqueue(ctx, hook)
 	if err != nil || created || again.ID != first.ID {
 		t.Errorf("the same delivery again = %d, %v, %v; want event %d back, not created", again.ID, created, err, first.ID)
+	}
+	if first.From != "octocat" || again.From != "octocat" {
+		t.Errorf("who sent the event came back as %q, then %q", first.From, again.From)
+	}
+	listed, err := st.Events(ctx, daemon.EventFilter{Session: "s1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range listed {
+		if want := map[int64]string{first.ID: "octocat"}[e.ID]; e.From != want {
+			t.Errorf("event %d listed from %q, want %q", e.ID, e.From, want)
+		}
+	}
+	claimed, err := st.Claim(ctx, "s1", t0.Add(time.Hour), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if i := slices.IndexFunc(claimed, func(e daemon.Event) bool { return e.ID == first.ID }); i < 0 || claimed[i].From != "octocat" {
+		t.Errorf("claimed %+v, want event %d from octocat among them", claimed, first.ID)
 	}
 	hook.Source = "gitlab"
 	enqueue(t, st, hook) // a key is unique per source, not across them
