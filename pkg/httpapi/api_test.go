@@ -352,7 +352,7 @@ func TestConfigReportsTheToolsTheBuilderInstalled(t *testing.T) {
 	if !got.Tools[0].ReadOnly || got.Tools[0].Category != "test" {
 		t.Fatalf("tool metadata lost: %+v", got.Tools[0])
 	}
-	if want := []string{"off", "readonly", "workspace", "ask"}; !equalStrings(got.PermissionModes, want) {
+	if want := []string{"off", "readonly", "workspace", "ask", "full"}; !equalStrings(got.PermissionModes, want) {
 		t.Fatalf("permission_modes = %v, want %v", got.PermissionModes, want)
 	}
 }
@@ -377,7 +377,7 @@ func TestUnknownAPIPathIsJSON(t *testing.T) {
 	h.wantErr(h.do(http.MethodGet, "/api/nope", ""), http.StatusNotFound, "not_found")
 	// Including a verb no route claims: the envelope holds for the whole
 	// namespace, which is what lets a client parse failures uniformly.
-	h.wantErr(h.do(http.MethodPatch, "/api/sessions/x", ""), http.StatusNotFound, "not_found")
+	h.wantErr(h.do(http.MethodPut, "/api/sessions/x", ""), http.StatusNotFound, "not_found")
 }
 
 func TestMetricsMount(t *testing.T) {
@@ -788,6 +788,60 @@ func TestApprovalLifecycle(t *testing.T) {
 	h.decode(h.do(http.MethodGet, "/api/outbox?session="+info.ID+"&after="+strconv.FormatInt(out.Messages[0].ID, 10), ""), http.StatusOK, &out)
 	if len(out.Messages) != 1 || out.Messages[0].Kind != daemon.MessageReply || out.Messages[0].Text != "all done" {
 		t.Fatalf("outbox after = %+v, want the reply", out.Messages)
+	}
+}
+
+// Full Access is a switch a UI offers on a session that is waiting: the calls
+// it waits on are allowed, the turn carries on, and the session keeps it.
+func TestFullAccessAllowsWhatIsWaiting(t *testing.T) {
+	t.Parallel()
+	tools := []tool.Def{apiTool("look")}
+	c := apiScript(apiToolCall("use-1", "look", `{"q":"x"}`), apiText("all done"))
+	h := apiServe(t, c, tools, nil, httpapi.WithCapabilities(httpapi.Capabilities{FullAccess: true}))
+
+	info := h.start(`{"prompt":"look at it","permission":"ask"}`)
+	h.awaitState(info.ID, daemon.Approving)
+
+	// The request for a decision answers the message, as the reply will, so
+	// a client can tell it belongs to that conversation.
+	var out httpapi.MessageList
+	h.decode(h.do(http.MethodGet, "/api/outbox?session="+info.ID, ""), http.StatusOK, &out)
+	if len(out.Messages) != 1 || out.Messages[0].Kind != daemon.MessageApproval || len(out.Messages[0].InReplyTo) != 1 {
+		t.Fatalf("outbox = %+v, want the approval, in reply to the message", out.Messages)
+	}
+
+	var patched daemon.SessionInfo
+	h.decode(h.do(http.MethodPatch, "/api/sessions/"+info.ID, `{"permission":"full"}`), http.StatusOK, &patched)
+	if patched.Options.Permission != daemon.PermissionFull {
+		t.Fatalf("patched = %+v, want permission full", patched.Options)
+	}
+	done := h.awaitState(info.ID, daemon.Idle)
+	if done.Answer != "all done" || done.Options.Permission != daemon.PermissionFull {
+		t.Fatalf("after the switch = %+v, want the turn carried to its answer under full access", done)
+	}
+}
+
+// Where the server does not offer full access, asking for it is refused —
+// not clamped to a policy that would go on asking about every call.
+func TestFullAccessIsRefusedWhereNotOffered(t *testing.T) {
+	t.Parallel()
+	h := apiServe(t, apiScript(apiText("hi")), nil, nil)
+
+	h.wantErr(h.do(http.MethodPost, "/api/sessions", `{"prompt":"hi","permission":"full"}`), http.StatusBadRequest, "bad_request")
+	h.wantErr(h.do(http.MethodPost, "/api/events", `{"kind":"note","options":{"permission":"full"}}`), http.StatusBadRequest, "bad_request")
+
+	info := h.start(`{"prompt":"hi"}`)
+	h.awaitState(info.ID, daemon.Idle)
+	path := "/api/sessions/" + info.ID
+	h.wantErr(h.do(http.MethodPatch, path, `{"permission":"full"}`), http.StatusBadRequest, "bad_request")
+	h.wantErr(h.do(http.MethodPatch, path, `{"permission":"root"}`), http.StatusBadRequest, "bad_request")
+	h.wantErr(h.do(http.MethodPatch, path, `{}`), http.StatusBadRequest, "bad_request")
+	h.wantErr(h.do(http.MethodPatch, "/api/sessions/nope", `{"permission":"ask"}`), http.StatusNotFound, "no_such_session")
+
+	var got daemon.SessionInfo
+	h.decode(h.do(http.MethodPatch, path, `{"permission":"ask"}`), http.StatusOK, &got)
+	if got.Options.Permission != "ask" {
+		t.Fatalf("permission = %q, want ask", got.Options.Permission)
 	}
 }
 

@@ -287,13 +287,20 @@ func (f *factory) toolSet(tools []tool.Def) []core.Option {
 
 // policy clamps a session's requested permission against the operator's.
 //
-// Only in the restrictive direction, and "off" is never reachable from a
-// request: a client asking for no gate at all is a client asking for an
-// ungated shell, and the answer is the operator's configuration, not theirs.
+// Only in the restrictive direction, with one exception the operator makes:
+// "full" — everything, asking nobody — is reachable from a request when
+// tools.full_access says so. "off" never is: a client asking for no gate at
+// all is a client asking for an ungated shell, and the answer is the
+// operator's configuration, not theirs. A session that asked for full access
+// on a server that no longer offers it gets the operator's policy, like any
+// other request this server would not grant.
 func (f *factory) policy(requested string) string {
 	want := strings.ToLower(strings.TrimSpace(requested))
 	if want == "" {
 		return f.cfg.Tools.Permission
+	}
+	if want == "full" && f.fullAccess() {
+		return want
 	}
 	if strictness(want) > strictness(f.cfg.Tools.Permission) {
 		return want
@@ -301,17 +308,24 @@ func (f *factory) policy(requested string) string {
 	return f.cfg.Tools.Permission
 }
 
+// fullAccess reports whether a session may ask for the "full" policy.
+func (f *factory) fullAccess() bool {
+	return f.cfg.Tools.FullAccess || f.cfg.Tools.Permission == "full"
+}
+
 // strictness orders the policies so policy can pick the tighter of two.
 func strictness(mode string) int {
 	switch mode {
-	case "off":
+	case "full":
 		return 0
-	case "workspace":
+	case "off":
 		return 1
-	case "ask":
+	case "workspace":
 		return 2
-	case "readonly", "read-only":
+	case "ask":
 		return 3
+	case "readonly", "read-only":
+		return 4
 	default:
 		return -1 // unknown: never wins, and defaultPolicy reports it
 	}
@@ -389,7 +403,9 @@ func confineReads(workspace string) tool.Middleware {
 }
 
 // defaultPolicy turns a permission mode into tool middleware, or nil for
-// "off".
+// "off". "full" is a gate that allows everything: the whole tool surface
+// stays on offer — no gate at all would cut it to the read-only tools — and
+// every verdict is still audited.
 //
 // What the policy wants a person to decide is deferred, with
 // [permission.Defer]: the turn ends with the call waiting, the session is
@@ -409,8 +425,10 @@ func defaultPolicy(mode, root string) (tool.Middleware, error) {
 		p = permission.Workspace(root)
 	case "ask":
 		p = permission.AskEverything()
+	case "full":
+		p = permission.Policy{Default: permission.Allow}
 	default:
-		return nil, fmt.Errorf("bad permission %q (want off, readonly, workspace or ask)", mode)
+		return nil, fmt.Errorf("bad permission %q (want off, readonly, workspace, ask or full)", mode)
 	}
 	p.Rules = append([]permission.Rule{permission.AllowTools(daemon.ToolNames()...)}, p.Rules...)
 	return permission.Gate(p, permission.Defer()), nil

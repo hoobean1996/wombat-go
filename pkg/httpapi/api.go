@@ -248,6 +248,11 @@ type Capabilities struct {
 	// anything in them, and a UI can leave the card out of its layout.
 	Approvals bool `json:"approvals"`
 
+	// FullAccess reports whether a session may be given the "full" policy —
+	// every tool, nobody asked — when it is created or later, with
+	// PATCH /api/sessions/{id}. False, and a request for it is refused.
+	FullAccess bool `json:"full_access"`
+
 	// Tools is the surface the agent builder actually installed.
 	Tools []ToolInfo `json:"tools"`
 }
@@ -270,7 +275,7 @@ type ToolInfo struct {
 // A function rather than a package-level slice so a caller cannot alias and
 // mutate the handler's answer.
 func PermissionModes() []string {
-	return []string{"off", "readonly", "workspace", "ask"}
+	return []string{"off", "readonly", "workspace", "ask", daemon.PermissionFull}
 }
 
 // ToolsOf describes the tool surface an agent was built with.
@@ -363,6 +368,7 @@ func New(m *daemon.Manager, opts ...Option) http.Handler {
 	mux.HandleFunc("POST /api/sessions", a.createSession)
 	mux.HandleFunc("GET /api/sessions", a.listSessions)
 	mux.HandleFunc("GET /api/sessions/{id}", a.getSession)
+	mux.HandleFunc("PATCH /api/sessions/{id}", a.patchSession)
 	mux.HandleFunc("DELETE /api/sessions/{id}", a.deleteSession)
 	mux.HandleFunc("GET /api/sessions/{id}/events", a.events)
 	mux.HandleFunc("GET /api/sessions/{id}/messages", a.getMessages)
@@ -496,6 +502,10 @@ func (a *api) createSession(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, r, err)
 		return
 	}
+	if err := a.checkPermission(req.Permission); err != nil {
+		a.fail(w, r, err)
+		return
+	}
 
 	s, err := a.m.Create(r.Context(), req.SessionOptions)
 	if err != nil {
@@ -535,6 +545,52 @@ func (a *api) getSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.Info())
+}
+
+// patchSession changes what a session may do, from its next turn on. The
+// permission is all there is to change: "full" is the Full Access a UI offers
+// — and the calls the session is waiting on are allowed with it — and ""
+// goes back to the server's default.
+func (a *api) patchSession(w http.ResponseWriter, r *http.Request) {
+	s, err := a.session(r)
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	var req PatchRequest
+	if err := decodeBody(w, r, &req); err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	if req.Permission == nil {
+		a.fail(w, r, fmt.Errorf("%w: nothing to change; permission is what can be", daemon.ErrBadRequest))
+		return
+	}
+	mode := strings.TrimSpace(*req.Permission)
+	if mode != "" && !slices.Contains(a.cfg.caps.PermissionModes, mode) {
+		a.fail(w, r, fmt.Errorf("%w: permission %q is not one of %v", daemon.ErrBadRequest, mode, a.cfg.caps.PermissionModes))
+		return
+	}
+	if err := a.checkPermission(mode); err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	if err := s.SetPermission(r.Context(), mode); err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Info())
+}
+
+// checkPermission refuses full access where this server does not offer it,
+// rather than letting the agent builder clamp it to something the client did
+// not ask for: a person who chose Full Access and still gets asked about
+// every call should be told why.
+func (a *api) checkPermission(mode string) error {
+	if strings.EqualFold(strings.TrimSpace(mode), daemon.PermissionFull) && !a.cfg.caps.FullAccess {
+		return fmt.Errorf("%w: this server does not offer full access", daemon.ErrBadRequest)
+	}
+	return nil
 }
 
 func (a *api) deleteSession(w http.ResponseWriter, r *http.Request) {
@@ -676,6 +732,10 @@ func (a *api) postEvent(w http.ResponseWriter, r *http.Request) {
 		Kind: req.Kind, Source: req.Source, From: req.From, DedupKey: req.DedupKey, Payload: req.Payload,
 	}
 	if req.Options != nil {
+		if err := a.checkPermission(req.Options.Permission); err != nil {
+			a.fail(w, r, err)
+			return
+		}
 		in.Options = *req.Options
 	}
 	e, created, err := a.m.Receive(r.Context(), in)

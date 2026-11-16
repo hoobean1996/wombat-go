@@ -81,6 +81,7 @@ type modelConfig struct {
 type toolsConfig struct {
 	WorkingDir     string `yaml:"working_dir"`
 	Permission     string `yaml:"permission"`
+	FullAccess     bool   `yaml:"full_access"`
 	Confine        bool   `yaml:"confine"`
 	ConfineNetwork string `yaml:"confine_network"`
 	MCP            string `yaml:"mcp"`
@@ -155,7 +156,7 @@ func defaults() config {
 var (
 	drivers     = map[string]bool{driverMemory: true, driverPostgres: true}
 	providers   = map[string]bool{"openai": true, "anthropic": true}
-	permissions = map[string]bool{"off": true, "readonly": true, "workspace": true, "ask": true}
+	permissions = map[string]bool{"off": true, "readonly": true, "workspace": true, "ask": true, "full": true}
 	modes       = map[string]bool{modeBuild: true, modePlan: true, modeReview: true}
 	logLevels   = map[string]slog.Level{"debug": slog.LevelDebug, "info": slog.LevelInfo, "warn": slog.LevelWarn, "error": slog.LevelError}
 	streamModes = map[string]llm.StreamMode{"auto": llm.StreamAuto, "always": llm.StreamAlways, "never": llm.StreamNever}

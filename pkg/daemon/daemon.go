@@ -52,6 +52,12 @@ var (
 	ErrClosed = errors.New("daemon: manager is closed")
 )
 
+// PermissionFull is full access: the whole tool surface, and nobody asked
+// about any of it. A server offers it only when its operator says so, and a
+// session switched to it has the calls it is waiting on allowed; see
+// [Session.SetPermission].
+const PermissionFull = "full"
+
 // SessionOptions is what a client may choose per session.
 //
 // Deliberately small. Everything here is either a policy the server can still
@@ -63,7 +69,8 @@ type SessionOptions struct {
 	Model string `json:"model,omitempty"`
 
 	// Permission is the policy every tool call is checked against:
-	// off, readonly, workspace or ask.
+	// off, readonly, workspace, ask or [PermissionFull]. A session can change
+	// it later; see [Session.SetPermission].
 	Permission string `json:"permission,omitempty"`
 
 	// Workspace roots the file and shell tools. A server is expected to

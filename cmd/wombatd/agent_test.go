@@ -494,3 +494,68 @@ func TestIterationNoticeDoesNotGoNegativeOrPanic(t *testing.T) {
 		t.Error("an unbounded run should get no iteration notice")
 	}
 }
+
+// ===== full access =====
+
+// runAs is runTurn for a session that asked for a permission.
+func runAs(t *testing.T, f *factory, permission, prompt string) turnResult {
+	t.Helper()
+	a, err := f.build(daemon.SessionOptions{Permission: permission})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	r := a.Start(ctx, core.Ask(prompt))
+	defer r.Close()
+	var res turnResult
+	for r.Next() {
+		res.events = append(res.events, r.Event())
+	}
+	res.outcome, res.err = r.Outcome(), r.Err()
+	return res
+}
+
+// Full access is the operator's to offer. Offered, a session that asks for it
+// keeps the whole tool set and is asked about none of it: the command runs.
+// Not offered, the request gets the operator's policy, under which the same
+// command waits for a person. "off" stays out of a client's reach either way.
+func TestFullAccessIsTheOperatorsToOffer(t *testing.T) {
+	touch := func(root string) *scripted {
+		return &scripted{turn: func(i int, _ llm.Request) llm.Response {
+			if i == 0 {
+				return call("c1", "bash", map[string]string{"command": "touch made-it", "exec_dir": root})
+			}
+			return say("done")
+		}}
+	}
+
+	offered, root := testFactory(t, nil, func(c *config) { c.Tools.FullAccess = true })
+	offered.client = touch(root)
+	if got := offered.policy("full"); got != "full" {
+		t.Fatalf("policy(full) with full_access = %q", got)
+	}
+	if got := offered.policy("off"); got != "workspace" {
+		t.Fatalf("policy(off) = %q, want the operator's: off is never a client's to ask for", got)
+	}
+	res := runAs(t, offered, "full", "make the file")
+	if res.err != nil || res.answer() != "done" {
+		t.Fatalf("under full access: outcome %#v, err %v; want the command run and the answer", res.outcome, res.err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "made-it")); err != nil {
+		t.Fatalf("the command did not run under full access: %v", err)
+	}
+
+	refused, root := testFactory(t, nil, nil)
+	refused.client = touch(root)
+	if got := refused.policy("full"); got != "workspace" {
+		t.Fatalf("policy(full) without full_access = %q, want the operator's", got)
+	}
+	res = runAs(t, refused, "full", "make the file")
+	if _, ok := res.outcome.(core.Deferred); !ok {
+		t.Fatalf("without full_access: outcome %#v, err %v; want the command waiting for a person", res.outcome, res.err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "made-it")); err == nil {
+		t.Fatal("the command ran on a server that does not offer full access")
+	}
+}

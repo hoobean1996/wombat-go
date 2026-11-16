@@ -101,7 +101,7 @@ func run(cfg config, logger *slog.Logger) error {
 	defer mgr.Close()
 
 	logger.Info("listening", "addr", cfg.Server.Addr, "provider", cfg.Model.Provider,
-		"mode", cfg.Mode, "permission", cfg.Tools.Permission, "working_dir", f.root,
+		"mode", cfg.Mode, "permission", cfg.Tools.Permission, "full_access", f.fullAccess(), "working_dir", f.root,
 		"store", cfg.Store.Driver, "outbox_webhook", cfg.Outbox.Webhook != "")
 	return serve(cfg.Server.Addr, httpapi.New(mgr, handlerOptions(cfg, f, probe, logger)...), logger)
 }

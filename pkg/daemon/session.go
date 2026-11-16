@@ -48,6 +48,13 @@ type Session struct {
 	// the session is still running when it returns.
 	wg sync.WaitGroup
 
+	// writing orders the record's writes from outside a turn — a permission
+	// changed while the session sits between turns — against the writes of
+	// the turn that may begin meanwhile, so an older snapshot never lands on
+	// top of a newer one. Taken without mu held: a writer that holds it takes
+	// mu only to snapshot. See [Session.SetPermission].
+	writing sync.Mutex
+
 	mu      sync.Mutex
 	state   State
 	turns   int
@@ -264,6 +271,65 @@ func (s *Session) Pending() []Approval {
 	return out
 }
 
+// SetPermission changes the policy the session's tool calls are checked
+// against, for every turn that starts from now on: the agent is built again
+// with it — the server may refuse the mode, or clamp it — and kept with the
+// session. A turn already running carries on under the policy it began with.
+//
+// [PermissionFull] asks nobody, so switching to it also allows every call the
+// session is waiting on, and those the running turn stops on, if it does.
+// The decisions go through the inbox like anyone's, from nobody.
+func (s *Session) SetPermission(ctx context.Context, mode string) error {
+	if err := s.open(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	opts := s.opts
+	s.mu.Unlock()
+	opts.Permission = mode
+	agent, err := s.m.cfg.Build(opts)
+	if err != nil {
+		return fmt.Errorf("daemon: building the agent for this session: %w", err)
+	}
+
+	s.writing.Lock()
+	s.mu.Lock()
+	if s.dropped {
+		s.mu.Unlock()
+		s.writing.Unlock()
+		return fmt.Errorf("%w: %s", ErrNoSuchSession, s.id)
+	}
+	s.opts, s.agent, s.updated = opts, agent, time.Now()
+	// A running turn writes the record when it ends, and end writes it once
+	// more if the options changed after its snapshot: a write from here could
+	// land between the two and undo the first.
+	running := s.run != nil
+	rec := s.recordLocked()
+	s.mu.Unlock()
+	if !running {
+		s.m.save(rec)
+	}
+	s.writing.Unlock()
+	s.m.logger().Info("session permission changed", "session", s.id, "permission", mode)
+
+	if mode == PermissionFull {
+		s.allowPending(ctx)
+	}
+	return nil
+}
+
+// allowPending allows every call the session is waiting on that has no
+// decision yet. One decided meanwhile, or a wait that ended, is not an error:
+// the call is not waiting any more, which is all this wants.
+func (s *Session) allowPending(ctx context.Context) {
+	for _, a := range s.Pending() {
+		if _, err := s.Resolve(ctx, a.UseID, true); err != nil &&
+			!errors.Is(err, ErrAlreadyAnswered) && !errors.Is(err, ErrNoSuchApproval) {
+			s.m.logger().Warn("daemon: allowing a call under full access failed", "session", s.id, "use_id", a.UseID, "err", err)
+		}
+	}
+}
+
 func approvalOf(c core.DeferredCall, since time.Time) Approval {
 	return Approval{UseID: string(c.UseID), Tool: c.Tool, Reason: c.Reason, Input: jsonOrNil(c.Input), Since: since}
 }
@@ -371,9 +437,12 @@ func (s *Session) handle(batch []Event) {
 		}
 		if !s.decidedLocked() {
 			s.updated = time.Now()
-			rec := s.recordLocked()
 			s.mu.Unlock()
-			s.settleOrForget(Settlement{Session: rec, Done: eventIDs(decisions)})
+			// Snapshotted once the write is ours, so a permission changed in
+			// between is in it rather than written over.
+			s.writing.Lock()
+			s.settleOrForget(Settlement{Session: s.record(), Done: eventIDs(decisions)})
+			s.writing.Unlock()
 			return
 		}
 		in = core.Decide(s.msgs, *s.deferred, maps.Clone(s.verdicts))
@@ -434,7 +503,11 @@ func (s *Session) handle(batch []Event) {
 	// from, and the events that make it are in the inbox.
 	rec := s.recordLocked()
 	s.mu.Unlock()
+	// After any write from outside already under way: it snapshotted before
+	// this turn began, so it is the older of the two.
+	s.writing.Lock()
 	s.m.save(rec)
+	s.writing.Unlock()
 
 	// context.Background, not ctx: the log has to get every event, the ones
 	// saying why a cancelled turn stopped included. Follow returns on its own
@@ -488,8 +561,10 @@ func (s *Session) end(ctx context.Context, cancel context.CancelFunc, turn int, 
 		data, _ := json.Marshal(struct {
 			Approvals []Approval `json:"approvals"`
 		}{end.Approvals})
+		// InReplyTo, like a reply: the calls are part of answering those
+		// messages, and a client showing the conversation already shows them.
 		post = append(post, Message{Session: s.id, Thread: s.thread, Kind: MessageApproval,
-			Text: approvalText(end.Approvals), Data: data, Created: now})
+			Text: approvalText(end.Approvals), Data: data, InReplyTo: replyTo, Created: now})
 	default:
 		err := buf.Err()
 		end.State, end.Error, end.ErrorKind = Failed, errText(err), ErrorKind(err)
@@ -566,9 +641,22 @@ func (s *Session) end(ctx context.Context, cancel context.CancelFunc, turn int, 
 	// so a client can send it as a message instead of losing it.
 	end.Undelivered = buf.Undelivered()
 	s.emitLocked(turn, end)
+	// The permission may have changed while the turn ran, after its record
+	// was snapshotted; and a session switched to full access meanwhile asks
+	// nobody, the calls this turn stopped on included.
+	changed := s.opts != next.Options
+	allow := deferred != nil && s.opts.Permission == PermissionFull
 	s.mu.Unlock()
 	s.m.logger().Info("turn ended", "session", s.id, "turn", turn, "events", len(events),
 		"state", string(end.State), "cost_usd", end.Spend.CostUSD, "retry", len(retry) > 0)
+	if changed {
+		s.writing.Lock()
+		s.m.save(s.record())
+		s.writing.Unlock()
+	}
+	if allow {
+		s.allowPending(context.Background())
+	}
 }
 
 // settleOrForget settles, and drops the session from memory if the store

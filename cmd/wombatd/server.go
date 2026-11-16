@@ -33,6 +33,7 @@ func handlerOptions(cfg config, f *factory, probe *core.Agent, logger *slog.Logg
 		httpapi.WithCapabilities(httpapi.Capabilities{
 			DefaultModel: cfg.Model.Name,
 			Approvals:    cfg.Tools.Permission != "off",
+			FullAccess:   f.fullAccess(),
 			Tools:        httpapi.ToolsOf(probe),
 		}),
 	}

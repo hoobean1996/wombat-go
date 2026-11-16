@@ -142,16 +142,24 @@ tools:
   # inside it, and none can get out of it.
   working_dir: .
 
-  # off, readonly, workspace or ask: the policy every tool call is checked
-  # against, and the strictest a session may choose for itself. workspace
+  # off, readonly, workspace, ask or full: the policy every tool call is
+  # checked against, and the loosest a session may choose for itself. workspace
   # gives the agent its full tool set, but puts commands, and anything outside
   # working_dir, in front of a person: the turn stops with the call waiting,
   # the outbox says so, GET .../approvals lists it, and a POST decides it —
   # after which the turn carries on. off offers read-only tools, kept inside
   # the session's workspace, and asks no one: an agent a client can reach
-  # does not get an ungated shell by default. Whatever the policy, the
-  # agent's own send_message and timer tools are never asked about.
+  # does not get an ungated shell by default. full offers every tool and asks
+  # no one. Whatever the policy, the agent's own send_message and timer tools
+  # are never asked about.
   permission: workspace
+
+  # Let a session be given full access — every tool, nobody asked — by
+  # whoever creates it, or later: the web UI's Full Access switch. Switching a
+  # session to it allows the calls it is waiting on. tools.confine still
+  # applies. Off by default: an agent that answers to webhooks and browsers
+  # should not get an unattended shell unless the operator chose that.
+  full_access: false
 
   # Run every command the tools spawn inside the platform sandbox —
   # sandbox-exec on macOS, bwrap on Linux: writes only under the session's

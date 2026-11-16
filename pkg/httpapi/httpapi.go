@@ -12,6 +12,7 @@
 //	POST   /api/sessions                          create, with its first message: {prompt, from, ...}
 //	GET    /api/sessions                          list, newest first
 //	GET    /api/sessions/{id}                     one SessionInfo
+//	PATCH  /api/sessions/{id}                     {"permission": "full"|""|...}: from the next turn on
 //	DELETE /api/sessions/{id}                     cancel and forget, timers and all
 //	GET    /api/sessions/{id}/events              SSE, Last-Event-ID resume
 //	GET    /api/sessions/{id}/messages            the transcript, and where its messages came from
@@ -113,6 +114,13 @@ type SendRequest struct {
 	// session: the model is told, and the transcript's origins keep it.
 	// Optional; a short line of text.
 	From string `json:"from,omitempty"`
+}
+
+// PatchRequest is the body of PATCH /api/sessions/{id}: what to change about
+// a session. Permission is a pointer because "" means something — the
+// server's default — and absent means leave it.
+type PatchRequest struct {
+	Permission *string `json:"permission,omitempty"`
 }
 
 // SteerRequest is the body of POST /api/sessions/{id}/steer: a message for
