@@ -171,6 +171,16 @@ export interface Timer {
 
 // ── the server ───────────────────────────────────────────────────────────
 
+/** pkg/httpapi.FileInfo: a file in a session's workspace, and a URL (no token needed) to read it. */
+export interface FileInfo {
+  path: string
+  name: string
+  size: number
+  modified: string
+  type: string
+  url: string
+}
+
 /** pkg/httpapi.Capabilities: GET /api/config */
 export interface ServerConfig {
   version?: string
@@ -179,6 +189,8 @@ export interface ServerConfig {
   approvals: boolean
   /** Whether a session may be given permission "full": every tool, nobody asked (tools.full_access). */
   full_access?: boolean
+  /** Whether GET /api/sessions/{id}/file shows the files in a session's workspace. */
+  files?: boolean
   tools: { name: string; description?: string; category?: string; read_only: boolean }[]
 }
 

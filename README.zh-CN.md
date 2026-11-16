@@ -37,7 +37,7 @@ Anthropic 在 [Building always-on agents](https://claude.com/resources/articles/
 | 💾 **持久化** | 试用时状态放内存，正式用放 Postgres。一轮跑到一半杀掉 wombatd，下一个实例会接着做完 |
 | 🗣️ **谁说了什么** | 每个事件都记录来源（`source`）和发送者（`from`），模型分得清哪些是 webhook 的内容、哪些是你的指令，也分得清不同的人 |
 | 💸 **预算** | 每一轮都有花费、时间和步数的上限 |
-| 🖥️ **网页界面** | 内置在二进制里：可以聊天、审批调用，还能查看 inbox、outbox 和计时器 |
+| 🖥️ **网页界面** | 内置在二进制里：可以聊天、审批调用，在对话右侧直接打开 Agent 写出的文件（HTML、Markdown、图片、PDF、CSV、代码），还能查看 inbox、outbox 和计时器 |
 
 它是纯 Go 写的：框架本身只用标准库，唯一的依赖是 Postgres 存储用到的 `pgx`。模型、工具和文件系统都是接口，可以随意替换。
 

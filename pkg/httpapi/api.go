@@ -123,6 +123,7 @@ type apiConfig struct {
 	token   string
 	hosts   []string
 	ui      fs.FS
+	files   func(daemon.SessionOptions) (string, error)
 }
 
 // WithBearerToken requires token on every request to the API and to
@@ -248,6 +249,10 @@ type Capabilities struct {
 	// anything in them, and a UI can leave the card out of its layout.
 	Approvals bool `json:"approvals"`
 
+	// Files reports whether GET /api/sessions/{id}/file can show what is in a
+	// session's workspace. Set by the handler, from [WithFiles].
+	Files bool `json:"files"`
+
 	// FullAccess reports whether a session may be given the "full" policy —
 	// every tool, nobody asked — when it is created or later, with
 	// PATCH /api/sessions/{id}. False, and a request for it is refused.
@@ -306,6 +311,9 @@ type api struct {
 	m       *daemon.Manager
 	cfg     apiConfig
 	started time.Time
+
+	// fileSecret signs the keys of the /files/ URLs; see files.go.
+	fileSecret []byte
 }
 
 // New returns the HTTP surface for m.
@@ -347,7 +355,7 @@ func New(m *daemon.Manager, opts ...Option) http.Handler {
 	if m == nil {
 		panic("httpapi: New(nil)")
 	}
-	a := &api{m: m, started: time.Now()}
+	a := &api{m: m, started: time.Now(), fileSecret: newFileSecret()}
 	for _, o := range opts {
 		o(&a.cfg)
 	}
@@ -357,6 +365,7 @@ func New(m *daemon.Manager, opts ...Option) http.Handler {
 	if a.cfg.caps.PermissionModes == nil {
 		a.cfg.caps.PermissionModes = PermissionModes()
 	}
+	a.cfg.caps.Files = a.cfg.files != nil
 
 	mux := http.NewServeMux()
 
@@ -372,6 +381,7 @@ func New(m *daemon.Manager, opts ...Option) http.Handler {
 	mux.HandleFunc("DELETE /api/sessions/{id}", a.deleteSession)
 	mux.HandleFunc("GET /api/sessions/{id}/events", a.events)
 	mux.HandleFunc("GET /api/sessions/{id}/messages", a.getMessages)
+	mux.HandleFunc("GET /api/sessions/{id}/file", a.getFile)
 	mux.HandleFunc("POST /api/sessions/{id}/messages", a.postMessage)
 	mux.HandleFunc("POST /api/sessions/{id}/steer", a.steer)
 	mux.HandleFunc("GET /api/sessions/{id}/approvals", a.listApprovals)
@@ -396,6 +406,9 @@ func New(m *daemon.Manager, opts ...Option) http.Handler {
 	if a.cfg.metrics != nil {
 		mux.Handle("GET /metrics", a.cfg.metrics)
 	}
+	// Outside /api, so the token is not asked for: the key in the path is the
+	// permission. See files.go.
+	mux.HandleFunc("GET /files/{key}/{session}/{path...}", a.serveFile)
 	if a.cfg.ui != nil {
 		mux.Handle("/", a.uiHandler(a.cfg.ui))
 	} else {
@@ -1147,6 +1160,8 @@ func classify(err error) (status int, kind string) {
 		return http.StatusNotFound, kindNoSuchMessage
 	case errors.Is(err, errNotFound):
 		return http.StatusNotFound, kindNotFound
+	case errors.Is(err, errNoSuchFile):
+		return http.StatusNotFound, kindNoSuchFile
 	case errors.Is(err, daemon.ErrNotRunning):
 		return http.StatusConflict, kindNotRunning
 	case errors.Is(err, daemon.ErrDone):

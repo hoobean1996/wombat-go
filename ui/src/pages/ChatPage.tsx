@@ -2,7 +2,9 @@ import { Fragment, useCallback, useLayoutEffect, useMemo, useRef, useState } fro
 import * as api from '../lib/api'
 import { sessionLabel } from '../lib/format'
 import { useClickOutside } from '../lib/hooks'
-import { navigate } from '../lib/router'
+import { navigate, setQuery, useLocation } from '../lib/router'
+import { FileOpenerContext } from '../lib/files'
+import { FilePanel } from '../components/FilePanel'
 import { useSessionView } from '../lib/session'
 import { refreshSessions, useApp } from '../lib/store'
 import { confirmDialog } from '../lib/confirm'
@@ -66,6 +68,10 @@ export function ChatPage({ id }: { id: string }) {
   }, [messages, approvals])
   const [deciding, setDeciding] = useState(false)
   const model = info?.options.model || config?.default_model
+  // The file open beside the conversation, in the URL, so the back button closes it.
+  const { query } = useLocation()
+  const file = config?.files ? query.get('file') : null
+  const openFile = useCallback((p: string) => setQuery('file', p), [])
 
   const threadRef = useRef<HTMLDivElement>(null)
   const stick = useRef(true)
@@ -99,6 +105,7 @@ export function ChatPage({ id }: { id: string }) {
   const lastIdx = list.length - 1
 
   return (
+    <FileOpenerContext.Provider value={config?.files ? openFile : null}>
     <div className="main">
       <div className="topbar">
         <div className="ttl" title={sessionLabel(info)}>{sessionLabel(info)}</div>
@@ -140,5 +147,10 @@ export function ChatPage({ id }: { id: string }) {
         <Composer key={info.id} sessionId={info.id} permission={info.options.permission ?? ''} running={running} up onSent={refresh} />
       </div>
     </div>
+    {file && (
+      // Read again whenever the transcript grows: a turn that ended may have rewritten it.
+      <FilePanel key={file} sessionId={info.id} path={file} stamp={messages.length} onOpen={openFile} onClose={() => setQuery('file', null)} />
+    )}
+    </FileOpenerContext.Provider>
   )
 }

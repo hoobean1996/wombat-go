@@ -35,11 +35,27 @@ it in this browser's localStorage.
 | Path | What it shows | API |
 |---|---|---|
 | `/` | New conversation | `POST /api/sessions` |
-| `/c/:id` | A session: the transcript, the turn in progress as it streams, approval cards, the question it is waiting on | `GET /api/sessions/{id}`, `…/messages`, `…/approvals`, the SSE stream `…/events`; `POST …/messages`, `…/steer`, `…/approvals/{use_id}`; `PATCH /api/sessions/{id}` for the Normal / Full Access switch |
+| `/c/:id` | A session: the transcript, the turn in progress as it streams, approval cards, the question it is waiting on | `GET /api/sessions/{id}`, `…/messages`, `…/approvals`, the SSE stream `…/events`; `POST …/messages`, `…/steer`, `…/approvals/{use_id}`; `PATCH /api/sessions/{id}` for the Normal / Full Access switch; `GET …/file` for the file panel |
 | `/inbox` | The events that wake sessions — webhooks, timers, relayed chats, decisions — but not what was typed into a chat, which is on its page; send one by hand | `GET /api/inbox`, `POST /api/events` |
 | `/outbox` | What the agents said, less their replies to a chat; mark it handled | `GET /api/outbox` (long-polled for the badge and notifications), `POST /api/outbox/{id}/ack` |
 | `/timers` | Timers, set by an agent or by hand; set and cancel them | `GET/POST /api/timers`, `DELETE /api/timers/{id}` |
 | `/settings` | The token, what the server reports about itself, its tools | `GET /api/health`, `GET /api/config` |
+
+## The file panel
+
+A path the agent names opens beside the conversation (`components/FilePanel.tsx`).
+That covers a path in backticks in a reply, a link to a path, and the file a
+`write_file`, `str_replace` or `view_file` call touched. The open file is in
+the URL (`?file=`), so the back button closes it.
+
+`GET /api/sessions/{id}/file` finds the file in the session's workspace and
+returns a URL under `/files/`, which the iframe, the `<img>` and the text fetch
+read without the token. HTML runs in an iframe without `allow-same-origin`, and
+wombatd serves it with a sandboxing CSP too. The page loads its scripts and
+fonts from anywhere, but it has no origin, so it can reach neither this page's
+storage, where the token is kept, nor the API. Markdown, CSV, JSON and code are
+fetched and drawn here. Links inside a Markdown file are resolved relative to
+it. The file is read again whenever a turn ends.
 
 ## What the Inbox and Outbox leave out
 

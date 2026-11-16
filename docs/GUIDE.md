@@ -351,6 +351,7 @@ store:
 | `GET /api/sessions` / `GET /api/sessions/{id}` | List sessions, newest first / one session |
 | `PATCH /api/sessions/{id}` | Change a session's permission from its next turn on: `{"permission": "full"}` (Full Access, which also allows what it is waiting on) or `""` (the server's default) |
 | `DELETE /api/sessions/{id}` | Cancel and forget a session, its timers and messages included |
+| `GET /api/sessions/{id}/file?path=` | A file in the session's workspace, by its path there or the absolute path the agent printed: its name, size, type and a `url` to read it. The URL, under `/files/`, needs no token: it carries a key good for that file's folder in that session until wombatd restarts, and serves everything sandboxed, so a page the agent wrote runs in no origin of this server's |
 | `GET /api/sessions/{id}/events` | Server-Sent Events across every turn. Reconnect with `Last-Event-ID` to resume |
 | `GET /api/sessions/{id}/messages` | The transcript, and beside it `origins`: for each message inbox events made, keyed by its index, the events' `kind`, `source` and `from` |
 | `POST /api/sessions/{id}/messages` | A message, for the next turn: `{"prompt": "...", "from": "..."}` — `from`, optional, names who said it |

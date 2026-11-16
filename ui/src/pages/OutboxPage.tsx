@@ -75,7 +75,7 @@ export function OutboxPage() {
                   <span className="sub" title={m.created}>#{m.id} · {relTime(Date.parse(m.created), now)}</span>
                   <span className="grow" />
                   {m.status === 'pending'
-                    ? <button className="btn sm" onClick={() => void ackOne(m)}><Icon name="check" cls="sm" />已处理</button>
+                    ? <button className="btn sm" title="告诉 outbox 这条已经处理过了" onClick={() => void ackOne(m)}><Icon name="check" cls="sm" />标为已处理</button>
                     : <span className={`pill s-${m.status}`}>{STATUS_LABEL[m.status] ?? m.status}</span>}
                 </div>
                 <div className="ob-body"><Markdown text={m.text} /></div>

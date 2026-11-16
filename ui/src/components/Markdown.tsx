@@ -1,5 +1,6 @@
 import { Fragment, useMemo, type CSSProperties, type ReactNode } from 'react'
 import { Lexer, type Token, type Tokens } from 'marked'
+import { looksLikeFile, useFileOpener } from '../lib/files'
 import { Icon } from './ui'
 
 /*
@@ -11,6 +12,36 @@ import { Icon } from './ui'
  */
 
 const OPTIONS = { gfm: true, breaks: true } // a single newline is a line break, as people mean it in chat
+
+/*
+ * A file the agent names — `diagrams/page.html` in backticks, or a link to a
+ * path — opens in the panel beside the conversation, where there is one
+ * (lib/files.ts). Components rather than plain elements, for the context.
+ */
+
+/** A path in backticks: clickable where a file panel can show it. */
+function FileCode({ path }: { path: string }) {
+  const open = useFileOpener()
+  if (!open) return <code>{path}</code>
+  return (
+    <code
+      className="file-link" role="button" tabIndex={0} title="在右侧打开"
+      onClick={() => open(path)} onKeyDown={e => { if (e.key === 'Enter') open(path) }}
+    >{path}</code>
+  )
+}
+
+/** A link to a path rather than to the web: it opens in the file panel, or stays text. */
+function FileAnchor({ path, children }: { path: string; children: ReactNode }) {
+  const open = useFileOpener()
+  if (!open) return <>{children}</>
+  return <a href="#" className="file-a" title={`在右侧打开 ${path}`} onClick={e => { e.preventDefault(); open(path) }}>{children}</a>
+}
+
+/** A link that is a path in the workspace: not the web, not mail, not an anchor on the page. */
+const isPathLink = (href: string) => !/^(https?:|mailto:|#)/i.test(href)
+
+const unescapePath = (href: string) => { try { return decodeURI(href) } catch { return href } }
 
 /** A link the page may follow: web, mail and relative ones, not javascript: or data:. */
 function safeHref(href: string): string | null {
@@ -35,8 +66,10 @@ function inline(t: Token, k: string): ReactNode {
       return <em key={k}>{inlines(t.tokens, k)}</em>
     case 'del':
       return <del key={k}>{inlines(t.tokens, k)}</del>
-    case 'codespan':
-      return <code key={k}>{t.text}</code>
+    case 'codespan': {
+      const text = decode(t.text)
+      return looksLikeFile(text) ? <FileCode key={k} path={text} /> : <code key={k}>{text}</code>
+    }
     case 'br':
       return <br key={k} />
     case 'link':
@@ -61,6 +94,7 @@ function link(t: Tokens.Link, k: string): ReactNode {
 function anchor(url: string, label: ReactNode, k: string, title?: string | null): ReactNode {
   const href = safeHref(url)
   if (!href) return <Fragment key={k}>{label}</Fragment>
+  if (isPathLink(href)) return <FileAnchor key={k} path={unescapePath(href)}>{label}</FileAnchor>
   return <a key={k} href={href} target="_blank" rel="noreferrer" title={title ?? undefined}>{label}</a>
 }
 
@@ -95,7 +129,9 @@ function image(t: Tokens.Image, k: string): ReactNode {
   // choosing. A link instead, which the browser only follows when clicked.
   const href = safeHref(t.href)
   if (!href) return t.text
-  return <a key={k} href={href} target="_blank" rel="noreferrer"><Icon name="image" cls="sm" />{t.text || href}</a>
+  const label = <><Icon name="image" cls="sm" />{t.text || href}</>
+  if (isPathLink(href)) return <FileAnchor key={k} path={unescapePath(href)}>{label}</FileAnchor>
+  return <a key={k} href={href} target="_blank" rel="noreferrer">{label}</a>
 }
 
 /** Renders block tokens; tail (the streaming cursor) goes at the end of the last one. */

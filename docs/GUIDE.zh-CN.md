@@ -289,6 +289,7 @@ store:
 | `GET /api/sessions` / `GET /api/sessions/{id}` | 列出会话（最新的在前）/ 查看单个会话 |
 | `PATCH /api/sessions/{id}` | 修改会话的权限，从下一轮开始生效：`{"permission": "full"}`（Full Access，同时允许正在等待的调用）或 `""`（服务器默认值） |
 | `DELETE /api/sessions/{id}` | 取消并删除会话，连同它的计时器和消息 |
+| `GET /api/sessions/{id}/file?path=` | 会话工作区里的一个文件（用工作区内的路径，或 Agent 打印出来的绝对路径）：名称、大小、类型，以及读取它的 `url`。这个 `/files/` 下的 URL 不需要 token：它自带一个只对该文件所在目录、该会话有效的密钥，wombatd 重启后失效；返回的内容一律放进沙箱，Agent 写的网页拿不到本服务的任何源 |
 | `GET /api/sessions/{id}/events` | 跨越所有轮次的 Server-Sent Events 事件流。断线后带 `Last-Event-ID` 重连即可续传 |
 | `GET /api/sessions/{id}/messages` | 对话记录，以及旁边的 `origins`：对每条由收件箱事件产生的消息，按其下标给出这些事件的 `kind`、`source` 和 `from` |
 | `POST /api/sessions/{id}/messages` | 发送一条消息，留给下一轮处理：`{"prompt": "...", "from": "..."}`——`from` 可选，写明是谁说的 |

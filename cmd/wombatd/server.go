@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"wombat/pkg/core"
+	"wombat/pkg/daemon"
 	"wombat/pkg/httpapi"
 	"wombat/ui"
 )
@@ -30,6 +31,9 @@ const shutdownGrace = 5 * time.Second
 func handlerOptions(cfg config, f *factory, probe *core.Agent, logger *slog.Logger) []httpapi.Option {
 	opts := []httpapi.Option{
 		httpapi.WithVersion(version()),
+		// The files a session works on, from the same directory its tools are
+		// rooted at, for the web UI to show beside the conversation.
+		httpapi.WithFiles(func(o daemon.SessionOptions) (string, error) { return f.workspace(o.Workspace) }),
 		httpapi.WithCapabilities(httpapi.Capabilities{
 			DefaultModel: cfg.Model.Name,
 			Approvals:    cfg.Tools.Permission != "off",

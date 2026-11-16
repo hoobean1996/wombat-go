@@ -44,7 +44,7 @@ is that plumbing, ready to run:
 | 💾 **Durable** | Keep state in memory to try it out, or in Postgres for real use. Kill wombatd mid-turn and the next one finishes the work |
 | 🗣️ **Who said what** | Every event records its `source` and its sender (`from`), so the model can tell a webhook payload from your instruction, and one person from another |
 | 💸 **Budgets** | Each turn is capped in dollars, wall-clock time and steps |
-| 🖥️ **Web UI** | A browser UI built into the binary: chat, approve calls, and watch the inbox, outbox and timers |
+| 🖥️ **Web UI** | A browser UI built into the binary: chat, approve calls, open the files the agent writes (HTML, Markdown, images, PDF, CSV, code) in a panel beside the conversation, and watch the inbox, outbox and timers |
 
 It is plain Go. The harness uses only the standard library, and the one
 dependency is `pgx`, for the Postgres store. The model, the tools and the

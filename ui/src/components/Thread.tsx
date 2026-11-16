@@ -1,4 +1,5 @@
 import { useState, type ReactNode } from 'react'
+import { looksLikeFile, useFileOpener } from '../lib/files'
 import { fmtDuration, fmtTokens, oneLine } from '../lib/format'
 import type { LiveTurn } from '../lib/session'
 import type { Exchange, Step } from '../lib/transcript'
@@ -31,8 +32,17 @@ const STEP_ICON: Record<Step['status'], [string, string]> = {
 }
 const STEP_NOTE: Partial<Record<Step['status'], string>> = { waiting: '等待确认', denied: '已拒绝', pending: '未执行' }
 
+/** The file a tool call wrote or read, when it names one the file panel can show. */
+function fileOf(st: Step): string | null {
+  if (!['write_file', 'str_replace', 'view_file', 'view_media'].includes(st.name)) return null
+  const p = (st.input && typeof st.input === 'object' ? (st.input as Record<string, unknown>).path : undefined)
+  return typeof p === 'string' && looksLikeFile(p) ? p : null
+}
+
 function StepRow({ st }: { st: Step }) {
   const [open, setOpen] = useState(false)
+  const openFile = useFileOpener()
+  const file = openFile && st.status !== 'denied' ? fileOf(st) : null
   const line = summary(st.name, st.input)
   const [icon, cls] = STEP_ICON[st.status]
   const detail = st.input !== undefined || st.output || st.error
@@ -43,6 +53,9 @@ function StepRow({ st }: { st: Step }) {
         <span className="step-name">{st.name}</span>
         {line && <code title={line}>{line}</code>}
         <span className="m2">{STEP_NOTE[st.status] ?? (st.ms !== undefined ? fmtDuration(st.ms) : '')}</span>
+        {file && openFile && (
+          <button className="step-open" title="在右侧打开这个文件" onClick={e => { e.stopPropagation(); openFile(file) }}><Icon name="panel" cls="sm" /></button>
+        )}
         {detail && <Icon name="chev" cls={`sm chev ${open ? 'open' : ''}`} />}
       </div>
       {open && (

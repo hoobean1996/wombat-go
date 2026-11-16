@@ -1,4 +1,4 @@
-import type { Approval, Health, InboxEvent, Message, OutboxMessage, ServerConfig, SessionInfo, SessionOptions, Timer } from '../types'
+import type { Approval, FileInfo, Health, InboxEvent, Message, OutboxMessage, ServerConfig, SessionInfo, SessionOptions, Timer } from '../types'
 
 /*
  * wombatd's HTTP API. The page is served by wombatd itself, so every path is
@@ -81,6 +81,8 @@ export const deleteSession = (id: string) => call<void>('DELETE', `/api/sessions
 /** From the session's next turn on; "full" also allows what it is waiting on, "" is the server's default. */
 export const setPermission = (id: string, permission: string) => call<SessionInfo>('PATCH', `/api/sessions/${enc(id)}`, { permission })
 export const getMessages = (id: string) => call<{ messages: Message[] }>('GET', `/api/sessions/${enc(id)}/messages`).then(r => r.messages ?? [])
+/** A file in the session's workspace: by its path there, or the absolute path the agent printed. */
+export const fileInfo = (id: string, path: string) => call<FileInfo>('GET', `/api/sessions/${enc(id)}/file${qs({ path })}`)
 /** A message for the session's next turn (queued if a turn is running). */
 export const sendMessage = (id: string, prompt: string) => call<unknown>('POST', `/api/sessions/${enc(id)}/messages`, { prompt })
 /** A message for the turn that is running now. */

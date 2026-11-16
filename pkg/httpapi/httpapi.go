@@ -16,6 +16,7 @@
 //	DELETE /api/sessions/{id}                     cancel and forget, timers and all
 //	GET    /api/sessions/{id}/events              SSE, Last-Event-ID resume
 //	GET    /api/sessions/{id}/messages            the transcript, and where its messages came from
+//	GET    /api/sessions/{id}/file?path=          a file in its workspace, and a /files/ URL to read it
 //	POST   /api/sessions/{id}/messages            a message, for the next turn: {prompt, from}
 //	POST   /api/sessions/{id}/steer               a message for the turn in progress
 //	GET    /api/sessions/{id}/approvals           what is waiting for a decision

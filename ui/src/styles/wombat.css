@@ -107,3 +107,37 @@
 
 /* The permission menu's note names config keys. */
 .dd-note code { font-family: var(--mono); font-size: 11.5px; background: #f2f2f0; padding: 1px 4px; border-radius: 4px; }
+
+/* ── the file panel beside a conversation ───────────────────────────────── */
+
+.pv.files { min-width: 360px; max-width: calc(100vw - 420px); }
+.pv-resize { position: absolute; left: -3px; top: 0; bottom: 0; width: 6px; cursor: col-resize; z-index: 5; }
+.pv-resize:hover, .pv.files.dragging .pv-resize { background: rgba(154, 100, 64, .22); }
+.pv.files.dragging { user-select: none; }
+.pv.files.dragging iframe { pointer-events: none; } /* an iframe would swallow the drag */
+.pv-h > .ic { flex: none; color: var(--a-muted); }
+.pv-acts a.ibtn { color: inherit; }
+.pv-body .pdf-frame { flex: 1; width: 100%; min-height: 0; border: 0; }
+.pv-body > .mdv, .pv-body > .tblv { border-radius: 0; box-shadow: none; }
+.pv-body > .codev { border-radius: 0; }
+.tblv-scroll { overflow: auto; }
+.mediav { padding: 18px; display: flex; justify-content: center; }
+.mediav video, .mediav audio { max-width: 100%; }
+.nofile-why { font-size: 12px; margin-top: 4px; color: var(--a-faint); word-break: break-all; }
+.nofile .btn { margin-top: 12px; display: inline-flex; align-items: center; gap: 6px; }
+.pv-cut { font-size: 12px; color: #b56a06; background: #fdf6ea; padding: 6px 14px; }
+
+/* What opens there: a path in a reply, a link to one, the file a tool call wrote. */
+code.file-link { cursor: pointer; text-decoration: underline dashed #c9a27f; text-underline-offset: 3px; }
+code.file-link:hover { background: #f3e9df; color: #7a4a26; }
+a.file-a { color: #7a4a26; text-decoration: underline dashed #c9a27f; text-underline-offset: 3px; }
+.step-open { flex: none; display: inline-flex; padding: 3px; border-radius: 6px; color: var(--a-faint); }
+.step-open:hover { background: #ececea; color: var(--a-text); }
+
+@media (max-width: 900px) {
+  .pv.files { position: absolute; top: 0; right: 0; bottom: 0; z-index: 50; width: 100% !important; max-width: none; min-width: 0; box-shadow: -24px 0 48px -24px rgba(0, 0, 0, .28); }
+  .pv-resize { display: none; }
+}
+
+/* A long path in a message wraps instead of running out of its bubble. */
+.m-user, .md p, .md li { overflow-wrap: anywhere; }
