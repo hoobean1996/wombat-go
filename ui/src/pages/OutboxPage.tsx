@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import * as api from '../lib/api'
+import { withoutChat } from '../lib/chat'
 import { relTime, sessionLabel } from '../lib/format'
 import { useNow } from '../lib/hooks'
 import { setQuery, useLocation } from '../lib/router'
@@ -21,7 +22,8 @@ export function OutboxPage() {
   const now = useNow(10_000)
 
   const load = useCallback(() => {
-    api.listOutbox({ after: 0, status: status === 'all' ? undefined : status, limit: 500 })
+    api.listOutboxAll({ status: status === 'all' ? undefined : status })
+      .then(list => withoutChat(list))
       .then(list => setMessages([...list].reverse()), e => toast(api.errorText(e)))
   }, [status])
   useEffect(load, [load, tick])
@@ -54,7 +56,7 @@ export function OutboxPage() {
         <div className="right">{pending > 0 && <button className="btn sm" onClick={() => void ackAll()}><Icon name="check" cls="sm" />全部标为已处理</button>}</div>
       </div>
       <div className="page">
-        <p className="page-intro">Agent 说的一切都进 outbox：对消息的回复、它提的问题、等待确认的调用，以及它用 <code>send_message</code> 主动发的消息（计时器触发的那一轮只有调用它才会出声）。客户端读到后 ack；配置了 <code>outbox.webhook</code> 时，wombatd 会自己把每条 POST 出去。</p>
+        <p className="page-intro">Agent 要对外说的话都进 outbox：对外部消息的回复、它提的问题、等待确认的调用，以及它用 <code>send_message</code> 主动发的消息（计时器触发的那一轮只有调用它才会出声）。客户端读到后 ack；配置了 <code>outbox.webhook</code> 时，wombatd 会自己把每条 POST 出去。对话里直接聊天引起的回复和确认请求不列在这里，它们就在各自的对话里。</p>
         <div className="filters">
           <div className="seg">
             {(['pending', 'delivered', 'failed', 'all'] as const).map(s => (

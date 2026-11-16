@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import * as api from '../lib/api'
+import { isChatEvent } from '../lib/chat'
 import { oneLine, relTime, sessionLabel } from '../lib/format'
 import { useNow } from '../lib/hooks'
 import { setQuery, useLocation } from '../lib/router'
@@ -19,6 +20,7 @@ function NewEventModal({ onClose, onSent }: { onClose: () => void; onSent: () =>
   const [thread, setThread] = useState('')
   const [kind, setKind] = useState('note')
   const [source, setSource] = useState('ui')
+  const [from, setFrom] = useState('')
   const [dedup, setDedup] = useState('')
   const [payload, setPayload] = useState('{\n  "text": ""\n}')
   const [busy, setBusy] = useState(false)
@@ -28,7 +30,7 @@ function NewEventModal({ onClose, onSent }: { onClose: () => void; onSent: () =>
     setBusy(true)
     try {
       const r = await api.postEvent({
-        kind: kind.trim(), source: source.trim() || undefined, dedup_key: dedup.trim() || undefined, payload: parsed,
+        kind: kind.trim(), source: source.trim() || undefined, from: from.trim() || undefined, dedup_key: dedup.trim() || undefined, payload: parsed,
         ...(target === 'session' ? { session_id: sessionId } : { thread: thread.trim() }),
       })
       toast(r.duplicate ? `重复的事件：dedup_key 已经收到过（事件 #${r.event.id}）` : `已放进 inbox：事件 #${r.event.id} → ${sessionLabel(r.session)}`)
@@ -65,6 +67,7 @@ function NewEventModal({ onClose, onSent }: { onClose: () => void; onSent: () =>
         )}
         <div className="form-row"><label>kind</label><input className="inp" value={kind} onChange={e => setKind(e.target.value)} placeholder="issue_comment" /></div>
         <div className="form-row"><label>source</label><input className="inp" value={source} onChange={e => setSource(e.target.value)} placeholder="github" /></div>
+        <div className="form-row"><label>from</label><input className="inp" value={from} onChange={e => setFrom(e.target.value)} placeholder="可选：来源那边是谁发的，比如 octocat" /></div>
         <div className="form-row"><label>dedup_key</label><input className="inp" value={dedup} onChange={e => setDedup(e.target.value)} placeholder="可选：同一个 key 只会收一次" /></div>
         <div className="form-row top"><label>payload</label><textarea className="inp mono" rows={6} value={payload} onChange={e => setPayload(e.target.value)} /></div>
       </div>
@@ -82,8 +85,10 @@ export function InboxPage() {
   const now = useNow(10_000)
 
   const load = useCallback(() => {
-    api.listInbox({ session: session || undefined, status: status || undefined, limit: 200 })
-      .then(setEvents, e => toast(api.errorText(e)))
+    // The newest 1000, the most the endpoint gives at once, less the chat:
+    // see lib/chat.ts.
+    api.listInbox({ session: session || undefined, status: status || undefined, limit: 1000 })
+      .then(list => setEvents(list.filter(e => !isChatEvent(e))), e => toast(api.errorText(e)))
   }, [session, status])
   useEffect(() => {
     load()
@@ -100,7 +105,7 @@ export function InboxPage() {
         <div className="right"><button className="btn sm dark" onClick={() => setAdding(true)}><Icon name="plus" cls="sm" />发送事件</button></div>
       </div>
       <div className="page">
-        <p className="page-intro">唤醒会话的一切都是 inbox 里的一个事件：人发的消息、对调用的决定、到期的计时器、外部系统 POST 的 webhook。一个会话一次取走它所有等待中的事件，作为一轮来处理。</p>
+        <p className="page-intro">唤醒会话的一切都是 inbox 里的一个事件：外部系统 POST 的 webhook、从别处转发来的消息、到期的计时器、对调用的决定。一个会话一次取走它所有等待中的事件，作为一轮来处理。在对话里直接发的消息、在对话里做的确认不列在这里，它们就在各自的对话里。</p>
         <div className="filters">
           <div className="seg">
             {STATUSES.map(s => <button key={s} className={status === s ? 'on' : ''} onClick={() => setQuery('status', s || null, { replace: true })}>{STATUS_LABEL[s]}</button>)}
@@ -118,7 +123,7 @@ export function InboxPage() {
                   <td title={e.created}>{relTime(Date.parse(e.created), now)}</td>
                   <td><Link to={`/c/${e.session_id}`}>{name(e.session_id)}</Link></td>
                   <td><span className="tag">{e.kind}</span></td>
-                  <td>{e.source}{e.dedup_key && <div className="sub" title="dedup_key">{e.dedup_key}</div>}</td>
+                  <td>{e.source}{e.from && <span className="sub"> · {e.from}</span>}{e.dedup_key && <div className="sub" title="dedup_key">{e.dedup_key}</div>}</td>
                   <td className="cell-text" title={JSON.stringify(e.payload)}>{oneLine(e.payload)}</td>
                   <td>
                     <span className={`pill s-${e.status}`}>{STATUS_LABEL[e.status] ?? e.status}</span>

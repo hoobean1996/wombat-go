@@ -56,12 +56,8 @@ export function sessionLabel(s: { id: string; title?: string; thread?: string })
 }
 
 /** A Go time.Duration (nanoseconds) the way Go prints it: 1h30m, 10m, 45s. */
-export function fmtGoDuration(ns: number) {
-  let s = Math.round(ns / 1e9)
-  const h = Math.floor(s / 3600); s -= h * 3600
-  const m = Math.floor(s / 60); s -= m * 60
-  return `${h ? `${h}h` : ''}${m ? `${m}m` : ''}${s || (!h && !m) ? `${s}s` : ''}`
-}
+/** A Go duration as time.Duration.String writes it, without its zero units: "24h0m0s" → "24h", "1h30m0s" → "1h30m". */
+export const fmtGoDuration = (d: string) => d.replace(/(\D)0s$/, '$1').replace(/(\D)0m$/, '$1')
 
 /** "in 5 分钟" / "5 分钟前" for a time that may be in the future. */
 export function relTime(t: number, now = Date.now()) {

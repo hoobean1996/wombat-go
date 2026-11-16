@@ -35,11 +35,22 @@ it in this browser's localStorage.
 | Path | What it shows | API |
 |---|---|---|
 | `/` | New conversation | `POST /api/sessions` |
-| `/c/:id` | A session: the transcript, the turn in progress as it streams, approval cards, the question it is waiting on | `GET /api/sessions/{id}`, `…/messages`, `…/approvals`, the SSE stream `…/events`; `POST …/messages`, `…/steer`, `…/approvals/{use_id}` |
-| `/inbox` | The events that wake sessions; send one by hand | `GET /api/inbox`, `POST /api/events` |
-| `/outbox` | What the agents said; mark it handled | `GET /api/outbox` (long-polled for the badge and notifications), `POST /api/outbox/{id}/ack` |
+| `/c/:id` | A session: the transcript, the turn in progress as it streams, approval cards, the question it is waiting on | `GET /api/sessions/{id}`, `…/messages`, `…/approvals`, the SSE stream `…/events`; `POST …/messages`, `…/steer`, `…/approvals/{use_id}`; `PATCH /api/sessions/{id}` for the Normal / Full Access switch |
+| `/inbox` | The events that wake sessions — webhooks, timers, relayed chats, decisions — but not what was typed into a chat, which is on its page; send one by hand | `GET /api/inbox`, `POST /api/events` |
+| `/outbox` | What the agents said, less their replies to a chat; mark it handled | `GET /api/outbox` (long-polled for the badge and notifications), `POST /api/outbox/{id}/ack` |
 | `/timers` | Timers, set by an agent or by hand; set and cancel them | `GET/POST /api/timers`, `DELETE /api/timers/{id}` |
 | `/settings` | The token, what the server reports about itself, its tools | `GET /api/health`, `GET /api/config` |
+
+## What the Inbox and Outbox leave out
+
+A message typed into a conversation is an inbox event too (kind `message`,
+source `api`), and the agent's answer to it is an outbox message. Both are
+already on the conversation's page, so the Inbox and Outbox pages, the outbox
+badge and its notifications leave them out (`src/lib/chat.ts`). An outbox
+message is left out when every event in its `in_reply_to` is such a message.
+Events from anywhere else are listed, relayed chats with a `from` among them.
+Only the UI filters: the outbox still holds every message, pending until acked,
+for any other client reading it.
 
 ## How a session is drawn
 
@@ -69,6 +80,7 @@ src/
   lib/store.ts         shared state: connection, config, sessions (polled), outbox (long-polled)
   lib/session.ts       one session: transcript + live turn from the event stream
   lib/transcript.ts    transcript → exchanges
+  lib/chat.ts          what the Inbox and Outbox pages leave out: the chat itself
   lib/router.ts        a 30-line history router
   components/          Sidebar, Thread, Composer, Markdown, ui primitives
   pages/               Home, Chat, Inbox, Outbox, Timers, Settings

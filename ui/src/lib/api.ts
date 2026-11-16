@@ -78,6 +78,8 @@ export const listSessions = () => call<{ sessions: SessionInfo[] }>('GET', '/api
 export const getSession = (id: string) => call<SessionInfo>('GET', `/api/sessions/${enc(id)}`)
 export const createSession = (prompt: string, opts: SessionOptions = {}) => call<SessionInfo>('POST', '/api/sessions', { prompt, ...opts })
 export const deleteSession = (id: string) => call<void>('DELETE', `/api/sessions/${enc(id)}`)
+/** From the session's next turn on; "full" also allows what it is waiting on, "" is the server's default. */
+export const setPermission = (id: string, permission: string) => call<SessionInfo>('PATCH', `/api/sessions/${enc(id)}`, { permission })
 export const getMessages = (id: string) => call<{ messages: Message[] }>('GET', `/api/sessions/${enc(id)}/messages`).then(r => r.messages ?? [])
 /** A message for the session's next turn (queued if a turn is running). */
 export const sendMessage = (id: string, prompt: string) => call<unknown>('POST', `/api/sessions/${enc(id)}/messages`, { prompt })
@@ -93,14 +95,24 @@ export function eventsURL(id: string, from: number): string {
 }
 
 // ── the inbox ────────────────────────────────────────────────────────────
-export const listInbox = (q: { session?: string; status?: string; limit?: number } = {}) =>
-  call<{ events: InboxEvent[] }>('GET', `/api/inbox${qs(q)}`).then(r => r.events ?? [])
-export interface NewEvent { session_id?: string; thread?: string; kind: string; source?: string; dedup_key?: string; payload?: unknown }
+export const listInbox = (q: { session?: string; status?: string; limit?: number } = {}, signal?: AbortSignal) =>
+  call<{ events: InboxEvent[] }>('GET', `/api/inbox${qs(q)}`, undefined, signal).then(r => r.events ?? [])
+export interface NewEvent { session_id?: string; thread?: string; kind: string; source?: string; from?: string; dedup_key?: string; payload?: unknown }
 export const postEvent = (e: NewEvent) => call<{ event: InboxEvent; session: SessionInfo; duplicate?: boolean }>('POST', '/api/events', e)
 
 // ── the outbox ───────────────────────────────────────────────────────────
 export const listOutbox = (q: { after?: number; wait?: string; session?: string; status?: string; limit?: number } = {}, signal?: AbortSignal) =>
   call<{ messages: OutboxMessage[] }>('GET', `/api/outbox${qs(q)}`, undefined, signal).then(r => r.messages ?? [])
+/** Every message a filter selects, oldest first. The endpoint pages by id, at most 1000 a page. */
+export async function listOutboxAll(q: { session?: string; status?: string } = {}, signal?: AbortSignal) {
+  const all: OutboxMessage[] = []
+  for (let after = 0; ;) {
+    const page = await listOutbox({ ...q, after, limit: 1000 }, signal)
+    all.push(...page)
+    if (page.length < 1000) return all
+    after = page[page.length - 1].id
+  }
+}
 export const ack = (id: number) => call<void>('POST', `/api/outbox/${id}/ack`)
 
 // ── timers ───────────────────────────────────────────────────────────────

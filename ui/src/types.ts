@@ -124,6 +124,8 @@ export interface InboxEvent {
   session_id: string
   kind: string
   source: string
+  /** Who, at the source, sent it: a person in a relayed chat, whoever decided a call. */
+  from?: string
   dedup_key?: string
   payload?: unknown
   status: InboxStatus
@@ -154,13 +156,13 @@ export interface OutboxMessage {
 
 export type TimerStatus = 'active' | 'fired' | 'cancelled'
 
-/** pkg/daemon.Timer. `every` is a Go time.Duration: nanoseconds. */
+/** pkg/daemon.Timer. `every` is a Go duration as Timer.MarshalJSON writes it: "24h0m0s". */
 export interface Timer {
   id: number
   session_id: string
   note: string
   due: string
-  every?: number
+  every?: string
   status: TimerStatus
   created_by: string
   created: string
@@ -175,6 +177,8 @@ export interface ServerConfig {
   default_model?: string
   permission_modes: string[]
   approvals: boolean
+  /** Whether a session may be given permission "full": every tool, nobody asked (tools.full_access). */
+  full_access?: boolean
   tools: { name: string; description?: string; category?: string; read_only: boolean }[]
 }
 

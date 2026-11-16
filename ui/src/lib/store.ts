@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from 'react'
 import * as api from './api'
+import { withoutChat } from './chat'
 import { toast } from './toast'
 import type { Health, ServerConfig, SessionInfo } from '../types'
 
@@ -10,7 +11,8 @@ import type { Health, ServerConfig, SessionInfo } from '../types'
  * The session list is polled — wombatd has no stream across sessions, and a
  * list of a few dozen rows every few seconds costs nothing. The outbox is
  * long-polled, which is what GET /api/outbox?wait= is for, so a new reply or
- * question shows up at once wherever the user is.
+ * question shows up at once wherever the user is — except a chat's own, which
+ * its page shows (lib/chat.ts).
  */
 
 export type Conn = 'connecting' | 'ok' | 'down' | 'unauthorized'
@@ -24,7 +26,7 @@ export interface AppState {
   config: ServerConfig | null
   sessions: SessionInfo[]
   sessionsLoaded: boolean
-  /** Outbox messages still pending: not acknowledged, not delivered by a webhook. */
+  /** Outbox messages still pending — not acknowledged, not delivered by a webhook — leaving out chat replies (lib/chat.ts). */
   outboxPending: number
   /** Changes whenever new outbox messages arrive, so pages showing the outbox refetch. */
   outboxTick: number
@@ -101,7 +103,7 @@ export async function refreshSessions() {
 
 async function refreshPending() {
   try {
-    const pending = await api.listOutbox({ status: 'pending', limit: 500 })
+    const pending = await withoutChat(await api.listOutboxAll({ status: 'pending' }))
     set({ outboxPending: pending.length })
   } catch { /* shown on the next tick */ }
 }
@@ -126,7 +128,8 @@ async function outboxLoop(gen: number, signal: AbortSignal) {
       void refreshPending()
       void refreshSessions()
       const viewing = location.pathname.match(/^\/c\/([^/]+)/)?.[1]
-      for (const m of fresh) {
+      // A chat's own replies are on its page, not news.
+      for (const m of await withoutChat(fresh, signal)) {
         if (Date.parse(m.created) < since || m.session_id === viewing) continue
         toast(`${KIND_LABEL[m.kind] ?? m.kind}：${m.text.replace(/\s+/g, ' ').slice(0, 60)}`)
       }

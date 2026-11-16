@@ -137,7 +137,7 @@ export function ChatPage({ id }: { id: string }) {
       </div>
       <div className="dock">
         {info.state === 'approving' && !live && <div className="offline-bar"><Icon name="lock" /><span><b>有 {approvals.length} 个调用在等你确认。</b>全部决定之后这一轮会继续；在那之前，新消息会排队。</span></div>}
-        <Composer key={info.id} sessionId={info.id} running={running} up onSent={refresh} />
+        <Composer key={info.id} sessionId={info.id} permission={info.options.permission ?? ''} running={running} up onSent={refresh} />
       </div>
     </div>
   )
