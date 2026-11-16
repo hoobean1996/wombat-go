@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -225,5 +227,82 @@ func TestHTTPRefusalNamesTheProblem(t *testing.T) {
 	}
 	if _, err := Connect(context.Background(), Server{Name: "x", URL: "ftp://example.com"}); err == nil {
 		t.Error("Connect accepted an ftp URL")
+	}
+}
+
+// The calling session reaches a server configured to be told it, in each tool
+// call's _meta, and no other server; and nothing is sent outside a session.
+func TestSessionReachesOnlyTheServersThatAskForIt(t *testing.T) {
+	var mu sync.Mutex
+	var got []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		var m message
+		if err := json.NewDecoder(r.Body).Decode(&m); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		switch m.Method {
+		case "initialize":
+			writeJSON(w, message{JSONRPC: "2.0", ID: m.ID, Result: json.RawMessage(
+				`{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"meta","version":"0"}}`)})
+		case "tools/list":
+			writeJSON(w, message{JSONRPC: "2.0", ID: m.ID, Result: json.RawMessage(
+				`{"tools":[{"name":"whoami","inputSchema":{"type":"object"}}]}`)})
+		case "tools/call":
+			var p struct {
+				Meta json.RawMessage `json:"_meta"`
+			}
+			_ = json.Unmarshal(m.Params, &p)
+			mu.Lock()
+			got = append(got, string(p.Meta))
+			mu.Unlock()
+			res, _ := json.Marshal(textResult("ok"))
+			writeJSON(w, message{JSONRPC: "2.0", ID: m.ID, Result: res})
+		default: // notifications
+			w.WriteHeader(http.StatusAccepted)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name    string
+		session bool
+		ctx     context.Context
+		want    string
+	}{
+		{"a server that asks, in a session", true, WithSession(ctx, "sess-1"), `{"wombat/session":"sess-1"}`},
+		{"a server that asks, outside a session", true, ctx, ""},
+		{"a server that does not ask", false, WithSession(ctx, "sess-1"), ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, err := Connect(ctx, Server{Name: "meta", URL: srv.URL, Session: tc.session})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			if _, err := c.CallTool(tc.ctx, "whoami", nil); err != nil {
+				t.Fatal(err)
+			}
+			mu.Lock()
+			last := got[len(got)-1]
+			mu.Unlock()
+			if last != tc.want {
+				t.Errorf("_meta = %q, want %q", last, tc.want)
+			}
+		})
+	}
+
+	path := filepath.Join(t.TempDir(), "mcp.json")
+	if err := os.WriteFile(path, []byte(`{"mcpServers":{"oda":{"type":"http","url":"https://example.com/mcp","session":true}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	servers, err := LoadConfig(path)
+	if err != nil || len(servers) != 1 || !servers[0].Session {
+		t.Errorf("LoadConfig with \"session\": true = %+v, %v; want one server with Session set", servers, err)
 	}
 }

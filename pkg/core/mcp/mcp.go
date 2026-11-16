@@ -80,6 +80,13 @@ type Server struct {
 	// annotations say; see the package doc.
 	IgnoreHints bool
 
+	// Session passes the calling session's id to the server in every tool
+	// call's _meta, as MetaSession, when the call's context carries one
+	// (WithSession). For a server that acts for whoever owns the session and
+	// has to know which session that is without taking the model's word for
+	// it. Off by default: no other server is told.
+	Session bool
+
 	// Timeout bounds one tool call, and the handshake. 0 leaves calls to the
 	// agent's per-call fallback and gives the handshake thirty seconds.
 	Timeout time.Duration

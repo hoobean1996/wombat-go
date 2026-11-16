@@ -26,7 +26,8 @@ import (
 // with no fallback is an error rather than an empty string, since a server
 // started without its token fails later and less clearly. A server with
 // "disabled": true is skipped, "ignoreHints": true sets [Server.IgnoreHints],
-// and "timeout" sets [Server.Timeout] as a Go duration ("90s", "10m").
+// "session": true sets [Server.Session] (the server is told the calling
+// session), and "timeout" sets [Server.Timeout] as a Go duration ("90s", "10m").
 func LoadConfig(path string) ([]Server, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -78,6 +79,7 @@ type serverConfig struct {
 	Headers     map[string]string `json:"headers"`
 	Disabled    bool              `json:"disabled"`
 	IgnoreHints bool              `json:"ignoreHints"`
+	Session     bool              `json:"session"`
 	Timeout     string            `json:"timeout"`
 }
 
@@ -122,6 +124,7 @@ func (sc serverConfig) server(name string) (Server, error) {
 		Dir:         e.expand(sc.Cwd),
 		URL:         e.expand(sc.URL),
 		IgnoreHints: sc.IgnoreHints,
+		Session:     sc.Session,
 	}
 	for _, a := range sc.Args {
 		s.Args = append(s.Args, e.expand(a))

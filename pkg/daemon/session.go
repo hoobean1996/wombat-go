@@ -15,6 +15,7 @@ import (
 	"wombat/pkg/core"
 	"wombat/pkg/core/governor"
 	"wombat/pkg/core/llm"
+	"wombat/pkg/core/mcp"
 	"wombat/pkg/core/permission"
 	"wombat/pkg/core/tool"
 )
@@ -490,6 +491,8 @@ func (s *Session) handle(batch []Event) {
 	// person now, not a standing licence for every later exchange.
 	ctx = permission.WithGrants(ctx, permission.NewGrants())
 	ctx = withScope(ctx, &scope{m: s.m, session: s.id, thread: s.thread})
+	// For the MCP servers that act for a session's owner (Server.Session).
+	ctx = mcp.WithSession(ctx, s.id)
 
 	// Under the lock, and deliberately: Start and Buffer only spawn
 	// goroutines, and doing them here is what keeps Cancel and Steer from

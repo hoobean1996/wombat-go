@@ -72,7 +72,11 @@ func (c *Client) CallTool(ctx context.Context, name string, args json.RawMessage
 		args = json.RawMessage(`{}`)
 	}
 	var res callResult
-	err := c.call(ctx, "tools/call", map[string]any{"name": name, "arguments": args}, &res)
+	params := map[string]any{"name": name, "arguments": args}
+	if id := sessionFrom(ctx); c.server.Session && id != "" {
+		params["_meta"] = map[string]any{MetaSession: id}
+	}
+	err := c.call(ctx, "tools/call", params, &res)
 	if err != nil {
 		var re *rpcError
 		if errors.As(err, &re) && re.Code == errInvalidParams {
