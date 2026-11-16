@@ -1027,21 +1027,26 @@ func TestCloseHandsTheTurnToTheNextDaemon(t *testing.T) {
 }
 
 // A daemon that died mid-turn left its events running and its session saved
-// as running. The next one puts the events back, runs them, and numbers the
-// log past anything the dead one might have handed out.
+// as running, under a lease that has run out. The next one takes the session
+// over, puts the events back, runs them, and numbers the log past anything
+// the dead one might have handed out.
 func TestACrashedTurnRunsAgain(t *testing.T) {
 	st := MemoryStore()
 	ctx := testCtx(t)
 	rec := SessionRecord{Version: RecordVersion, ID: newID(), State: Running, Turns: 1, Events: 7,
-		Created: time.Now(), Updated: time.Now()}
+		Created: time.Now(), Updated: time.Now(), Lease: Lease{Owner: "dead", Until: time.Now().Add(time.Second)}}
 	if err := st.CreateSession(ctx, rec); err != nil {
 		t.Fatal(err)
 	}
 	payload, _ := json.Marshal(MessagePayload{Text: "do it"})
 	e, _, _ := st.Enqueue(ctx, Event{Session: rec.ID, Kind: KindMessage, Source: SourceAPI, Payload: payload})
-	if got, _ := st.Claim(ctx, rec.ID, time.Now(), 10); len(got) != 1 {
+	if got, _ := st.Claim(ctx, rec.ID, "dead", time.Now(), 10); len(got) != 1 {
 		t.Fatal("the fixture did not claim the event")
 	}
+	if _, err := st.Acquire(ctx, rec.ID, Lease{Owner: "early"}, time.Now(), 3); !errors.Is(err, ErrOwned) {
+		t.Fatalf("Acquire while the dead daemon's lease runs = %v, want ErrOwned", err)
+	}
+	time.Sleep(time.Second) // the lease runs out
 
 	m := newManager(t, ManagerConfig{Build: builder(script(textTurn("done now"))), Store: st})
 	s, err := m.Get(ctx, rec.ID)

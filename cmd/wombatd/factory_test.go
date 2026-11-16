@@ -164,7 +164,7 @@ func TestTheHandlerDoesWhatTheServerSectionSays(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mgr, err := newManager(f.cfg, daemon.MemoryStore(), f.build, f.logger)
+	mgr, err := newManager(f.cfg, daemon.MemoryStore(), "test", "", f.build, f.logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +207,7 @@ func TestATurnStopsAtItsBudget(t *testing.T) {
 	}}
 	f, _ := testFactory(t, nil, func(c *config) { c.Turn.BudgetUSD = 0.5 })
 	f.client = llm.Chain(cl, core.TrackCost(llm.DefaultPricing))
-	mgr, err := newManager(f.cfg, daemon.MemoryStore(), f.build, f.logger)
+	mgr, err := newManager(f.cfg, daemon.MemoryStore(), "test", "", f.build, f.logger)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +251,7 @@ func TestACommandWaitsForADecisionAndTheAgentsOwnToolsDoNot(t *testing.T) {
 		}
 	}}
 	f.client = cl
-	mgr, err := newManager(f.cfg, daemon.MemoryStore(), f.build, f.logger)
+	mgr, err := newManager(f.cfg, daemon.MemoryStore(), "test", "", f.build, f.logger)
 	if err != nil {
 		t.Fatal(err)
 	}

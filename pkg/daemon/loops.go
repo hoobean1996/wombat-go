@@ -8,9 +8,10 @@ import (
 	"time"
 )
 
-// The four loops a Manager runs: the worker, which turns events into turns;
+// The five loops a Manager runs: the worker, which turns events into turns;
 // the timers, which turn time into events; the dispatcher, which sends the
-// outbox; and the sweeper, which drops what memory no longer needs.
+// outbox; the sweeper, which drops what memory no longer needs; and the
+// renewer, which keeps this daemon's hold on the sessions it has.
 
 // work claims what is ready, whenever it is told there is something and at
 // every poll.
@@ -30,8 +31,9 @@ func (m *Manager) work() {
 }
 
 // claim starts a turn for every session with events ready, as many as there
-// is room for. One goroutine does this, so a session is claimed once: busy is
-// how the sessions already running are left out.
+// is room for. One goroutine does this, so a session is claimed once by this
+// daemon — busy is how the sessions already running are left out — and the
+// store's leases see that no other daemon claims it meanwhile.
 func (m *Manager) claim() {
 	m.mu.Lock()
 	free := m.cfg.MaxRuns - len(m.busy)
@@ -41,7 +43,7 @@ func (m *Manager) claim() {
 		return
 	}
 	now := time.Now()
-	ready, err := m.store.Ready(m.ctx, now, busy, free)
+	ready, err := m.store.Ready(m.ctx, now, m.cfg.Name, busy, free)
 	if err != nil {
 		if m.ctx.Err() == nil {
 			m.cfg.Logger.Warn("daemon: reading the inbox failed", "err", err)
@@ -49,7 +51,16 @@ func (m *Manager) claim() {
 		return
 	}
 	for _, id := range ready {
-		batch, err := m.store.Claim(m.ctx, id, now, MaxBatch)
+		// Taken before it is claimed: Claim takes events only for the
+		// session's owner, and taking one a dead daemon left puts back what it
+		// was running, to be claimed here.
+		if _, err := m.Get(m.ctx, id); err != nil {
+			if !errors.Is(err, ErrOwned) && m.ctx.Err() == nil {
+				m.cfg.Logger.Warn("daemon: taking a session failed", "session", id, "err", err)
+			}
+			continue
+		}
+		batch, err := m.store.Claim(m.ctx, id, m.cfg.Name, now, MaxBatch)
 		if err != nil {
 			if m.ctx.Err() == nil {
 				m.cfg.Logger.Warn("daemon: claiming events failed", "session", id, "err", err)
@@ -140,6 +151,14 @@ func (m *Manager) deliver() {
 // holds back the ones behind it until it is sent or given up on: a reply that
 // arrives before the question it answers is worse than one that is late.
 func (m *Manager) deliverPending() {
+	// One dispatcher among the daemons sharing the store, so a message goes
+	// out once, and in order.
+	if lead, err := m.store.Lead(m.ctx, "deliver", m.cfg.Name, time.Now().Add(m.cfg.Lease)); err != nil || !lead {
+		if err != nil && m.ctx.Err() == nil {
+			m.cfg.Logger.Warn("daemon: asking to lead the dispatcher failed", "err", err)
+		}
+		return
+	}
 	const page = 32
 	for {
 		msgs, err := m.store.Outbox(m.ctx, OutboxFilter{Status: MessagePending, Limit: page})
@@ -220,8 +239,62 @@ func (m *Manager) unload(now time.Time) {
 		}
 	}
 	m.mu.Unlock()
+	ids := make([]string, 0, len(idle))
 	for _, s := range idle {
 		s.close()
+		ids = append(ids, s.id)
 		m.cfg.Logger.Debug("session unloaded", "session", s.id)
+	}
+	// Out of memory, and so free for any daemon to take.
+	m.release(ids...)
+}
+
+// renew keeps this daemon's hold on the sessions in its memory, every third
+// of a lease. One it has lost — deleted, or taken over after a lease ran out
+// while this process could not reach the store — is dropped: another daemon
+// runs it now, and a turn still running here would only be refused when it
+// settles.
+func (m *Manager) renew() {
+	defer m.loops.Done()
+	t := time.NewTicker(m.cfg.Lease / 3)
+	defer t.Stop()
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case now := <-t.C:
+			m.renewAt(now)
+		}
+	}
+}
+
+func (m *Manager) renewAt(now time.Time) {
+	m.mu.Lock()
+	ids := slices.Collect(maps.Keys(m.sessions))
+	m.mu.Unlock()
+	if len(ids) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(m.ctx, storeTimeout)
+	kept, err := m.store.Renew(ctx, m.cfg.Name, ids, now.Add(m.cfg.Lease))
+	cancel()
+	if err != nil {
+		if m.ctx.Err() == nil {
+			m.cfg.Logger.Warn("daemon: renewing leases failed", "sessions", len(ids), "err", err)
+		}
+		return
+	}
+	var lost []*Session
+	m.mu.Lock()
+	for _, id := range ids {
+		if s, ok := m.sessions[id]; ok && !slices.Contains(kept, id) {
+			delete(m.sessions, id)
+			lost = append(lost, s)
+		}
+	}
+	m.mu.Unlock()
+	for _, s := range lost {
+		m.cfg.Logger.Warn("daemon: lost a session to another daemon, or to a deletion", "session", s.id)
+		go s.close() // it waits for the turn to stop; the renewer does not
 	}
 }

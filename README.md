@@ -42,6 +42,7 @@ is that plumbing, ready to run:
 | 🛡️ **Approvals** | A risky tool call waits for a person's decision without holding a turn open, however long that takes. Trust the task? Switch the session to **Full Access** and nothing asks. Commands run with a scrubbed environment, and can be confined to an OS sandbox |
 | 📤 **Outbox** | Replies, questions and approval requests go to an outbox. Your app long-polls it, or wombatd POSTs each message to your webhook |
 | 💾 **Durable** | Keep state in memory to try it out, or in Postgres for real use. Kill wombatd mid-turn and the next one finishes the work |
+| 🧩 **Scales out** | Run as many wombatd as you like on one Postgres. Each session (each inbox) is run by one of them at a time, any of them answers any request, and a dead one's sessions are taken over |
 | 🗣️ **Who said what** | Every event records its `source` and its sender (`from`), so the model can tell a webhook payload from your instruction, and one person from another |
 | 💸 **Budgets** | Each turn is capped in dollars, wall-clock time and steps |
 | 🖥️ **Web UI** | A browser UI built into the binary: chat, approve calls, open the files the agent writes (HTML, Markdown, images, PDF, CSV, code) in a panel beside the conversation, and watch the inbox, outbox and timers |

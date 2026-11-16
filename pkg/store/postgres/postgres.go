@@ -4,12 +4,17 @@
 //	st, err := postgres.Open(ctx, "postgres://wombat:wombat@127.0.0.1:5432/wombat")
 //	...
 //	defer st.Close()
-//	if err := st.Lock(ctx); err != nil { ... } // one daemon per schema
+//	if err := st.Lock(ctx, "wombatd-1"); err != nil { ... } // one daemon per name
 //
 // Open creates the tables it needs, in the schema the connection's
-// search_path names — add ?search_path=name to the DSN to keep one daemon's
-// tables apart from another's — and is safe to run against a database that
-// has them already, from any number of processes at once.
+// search_path names — add ?search_path=name to the DSN to keep one
+// deployment's tables apart from another's — and is safe to run against a
+// database that has them already, from any number of processes at once.
+//
+// Any number of daemons may share the schema, each under a name of its own:
+// a session is run by the one holding its lease (daemon.Store.Acquire), a
+// timer is fired by the first to lock it, and the outbox is sent by the one
+// that holds the dispatcher's lock (Store.Lead).
 //
 // A transcript is kept as json, not jsonb, on purpose: jsonb reorders an
 // object's keys, a tool call's input would come back different from what the
@@ -33,16 +38,24 @@ import (
 	"wombat/pkg/daemon"
 )
 
-// ErrLocked reports a schema another daemon is running on.
-var ErrLocked = errors.New("postgres: another daemon is running on this schema")
+// ErrLocked reports a daemon name another daemon on the schema is running
+// under.
+var ErrLocked = errors.New("postgres: another daemon is running on this schema under that name")
 
 // Store is a [daemon.Store] in Postgres.
 type Store struct {
 	pool *pgxpool.Pool
 	cfg  *pgxpool.Config
 
-	mu   sync.Mutex
-	lock *pgx.Conn // holds the advisory lock Lock took
+	mu    sync.Mutex
+	lock  *pgx.Conn            // holds the advisory lock Lock took
+	roles map[string]*leadConn // by role: the connections Lead asks on
+}
+
+// leadConn is a connection of Lead's, and whether it holds its role's lock.
+type leadConn struct {
+	conn *pgx.Conn
+	held bool
 }
 
 // Open connects to the database dsn names and brings its schema up to date.
@@ -55,7 +68,7 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("postgres: %w", err)
 	}
-	st := &Store{pool: pool, cfg: cfg}
+	st := &Store{pool: pool, cfg: cfg, roles: map[string]*leadConn{}}
 	if err := st.migrate(ctx); err != nil {
 		pool.Close()
 		return nil, err
@@ -63,14 +76,15 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 	return st, nil
 }
 
-// Lock makes this the only daemon on the schema, for as long as the store is
-// open: a second one's Lock is [ErrLocked]. A daemon puts the events a dead
-// one left running back in the inbox when it starts, and two at once would
-// each run the other's.
+// Lock makes this the only daemon on the schema running under name, for as
+// long as the store is open: a second one's Lock is [ErrLocked]. Sessions are
+// held by name, and a daemon starting again under a name takes back the
+// sessions it held — puts back what it left running (daemon.Store.Recover) —
+// so two under one name would each run the other's.
 //
 // The lock is Postgres's, held by a connection of its own, and goes when that
 // connection does — when the store is closed, or the process dies.
-func (s *Store) Lock(ctx context.Context) error {
+func (s *Store) Lock(ctx context.Context, name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.lock != nil {
@@ -81,7 +95,7 @@ func (s *Store) Lock(ctx context.Context) error {
 		return fmt.Errorf("postgres: %w", err)
 	}
 	var got bool
-	err = conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtext('wombatd:' || current_schema()))`).Scan(&got)
+	err = conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtext('wombatd:' || current_schema() || ':' || $1))`, name).Scan(&got)
 	if err == nil && !got {
 		err = ErrLocked
 	}
@@ -93,12 +107,16 @@ func (s *Store) Lock(ctx context.Context) error {
 	return nil
 }
 
-// Close releases the lock, if this store holds it, and the connections.
+// Close releases the locks this store holds, and the connections.
 func (s *Store) Close() error {
 	s.mu.Lock()
 	if s.lock != nil {
 		s.lock.Close(context.Background())
 		s.lock = nil
+	}
+	for role, lc := range s.roles {
+		lc.conn.Close(context.Background())
+		delete(s.roles, role)
 	}
 	s.mu.Unlock()
 	s.pool.Close()
@@ -112,9 +130,11 @@ func (s *Store) CreateSession(ctx context.Context, rec daemon.SessionRecord) err
 	if err != nil {
 		return err
 	}
-	_, err = s.pool.Exec(ctx,
-		`INSERT INTO sessions (id, thread, created, awaiting, meta, messages) VALUES ($1, $2, $3, $4, $5, $6)`,
-		rec.ID, nullString(rec.Thread), rec.Created, rec.Deferred != nil, meta, msgs)
+	_, err = s.pool.Exec(ctx, `
+		INSERT INTO sessions (id, thread, created, awaiting, meta, messages, owner, owner_addr, lease_until)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		rec.ID, nullString(rec.Thread), rec.Created, rec.Deferred != nil, meta, msgs,
+		nullString(rec.Lease.Owner), rec.Lease.Addr, nullTime(rec.Lease.Until))
 	if isUnique(err, "sessions_thread_key") {
 		return fmt.Errorf("%w: %q", daemon.ErrThreadTaken, rec.Thread)
 	}
@@ -130,27 +150,64 @@ func saveSession(ctx context.Context, q querier, rec daemon.SessionRecord) error
 	if err != nil {
 		return err
 	}
-	tag, err := q.Exec(ctx, `UPDATE sessions SET awaiting = $2, meta = $3, messages = $4 WHERE id = $1`,
-		rec.ID, rec.Deferred != nil, meta, msgs)
+	// With an owner named, written only while that daemon holds it.
+	tag, err := q.Exec(ctx, `
+		UPDATE sessions SET awaiting = $2, meta = $3, messages = $4
+		WHERE id = $1 AND ($5 = '' OR owner = $5)`,
+		rec.ID, rec.Deferred != nil, meta, msgs, rec.Lease.Owner)
 	if err != nil {
 		return wrap(err)
 	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("%w: %s", daemon.ErrNoSuchSession, rec.ID)
+	if tag.RowsAffected() > 0 {
+		return nil
 	}
-	return nil
+	l, err := leaseOf(ctx, q, rec.ID)
+	if err != nil {
+		return err
+	}
+	return &daemon.OwnedError{Session: rec.ID, Lease: l}
+}
+
+// leaseCols read a session's lease, as scanLease takes it.
+const leaseCols = `coalesce(owner, ''), owner_addr, lease_until`
+
+func scanLease(owner, addr string, until *time.Time) daemon.Lease {
+	l := daemon.Lease{Owner: owner, Addr: addr}
+	if until != nil {
+		l.Until = until.UTC()
+	}
+	return l
+}
+
+// leaseOf is who holds a session, or ErrNoSuchSession.
+func leaseOf(ctx context.Context, q querier, id string) (daemon.Lease, error) {
+	var owner, addr string
+	var until *time.Time
+	err := q.QueryRow(ctx, `SELECT `+leaseCols+` FROM sessions WHERE id = $1`, id).Scan(&owner, &addr, &until)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return daemon.Lease{}, fmt.Errorf("%w: %s", daemon.ErrNoSuchSession, id)
+	}
+	if err != nil {
+		return daemon.Lease{}, wrap(err)
+	}
+	return scanLease(owner, addr, until), nil
 }
 
 func (s *Store) LoadSession(ctx context.Context, id string) (daemon.SessionRecord, error) {
 	var meta, msgs []byte
-	err := s.pool.QueryRow(ctx, `SELECT meta, messages FROM sessions WHERE id = $1`, id).Scan(&meta, &msgs)
+	var owner, addr string
+	var until *time.Time
+	err := s.pool.QueryRow(ctx, `SELECT meta, messages, `+leaseCols+` FROM sessions WHERE id = $1`, id).
+		Scan(&meta, &msgs, &owner, &addr, &until)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return daemon.SessionRecord{}, fmt.Errorf("%w: %s", daemon.ErrNoSuchSession, id)
 	}
 	if err != nil {
 		return daemon.SessionRecord{}, wrap(err)
 	}
-	return daemon.DecodeRecord(meta, msgs)
+	rec, err := daemon.DecodeRecord(meta, msgs)
+	rec.Lease = scanLease(owner, addr, until)
+	return rec, err
 }
 
 func (s *Store) SessionByThread(ctx context.Context, thread string) (string, error) {
@@ -163,20 +220,27 @@ func (s *Store) SessionByThread(ctx context.Context, thread string) (string, err
 }
 
 func (s *Store) ListSessions(ctx context.Context) ([]daemon.SessionRecord, error) {
-	rows, err := s.pool.Query(ctx, `SELECT meta FROM sessions ORDER BY created, id`)
+	rows, err := s.pool.Query(ctx, `SELECT meta, `+leaseCols+` FROM sessions ORDER BY created, id`)
 	if err != nil {
 		return nil, wrap(err)
 	}
-	metas, err := pgx.CollectRows(rows, pgx.RowTo[[]byte])
+	type row struct {
+		Meta  []byte
+		Owner string
+		Addr  string
+		Until *time.Time
+	}
+	all, err := pgx.CollectRows(rows, pgx.RowToStructByPos[row])
 	if err != nil {
 		return nil, wrap(err)
 	}
-	out := make([]daemon.SessionRecord, 0, len(metas))
-	for _, meta := range metas {
-		rec, err := daemon.DecodeRecord(meta, nil)
+	out := make([]daemon.SessionRecord, 0, len(all))
+	for _, r := range all {
+		rec, err := daemon.DecodeRecord(r.Meta, nil)
 		if err != nil {
 			return nil, err
 		}
+		rec.Lease = scanLease(r.Owner, r.Addr, r.Until)
 		out = append(out, rec)
 	}
 	return out, nil
@@ -243,14 +307,21 @@ func enqueue(ctx context.Context, q querier, e daemon.Event) (daemon.Event, bool
 // sessions s; $1 is now.
 const claimable = `e.status = 'pending' AND e.not_before <= $1 AND (NOT s.awaiting OR e.kind = 'approval')`
 
-func (s *Store) Ready(ctx context.Context, now time.Time, busy []string, limit int) ([]string, error) {
+// takeable is a session that owner, $4, holds or could take at now, $1.
+const takeable = `(s.owner IS NULL OR s.owner = $4 OR s.lease_until <= $1)`
+
+// orphaned is a running event whose session nobody holds any more: its turn
+// died with the daemon that ran it.
+const orphaned = `(e.status = 'running' AND s.owner IS DISTINCT FROM $4 AND (s.owner IS NULL OR s.lease_until <= $1))`
+
+func (s *Store) Ready(ctx context.Context, now time.Time, owner string, busy []string, limit int) ([]string, error) {
 	if busy == nil {
 		busy = []string{} // NULL would make the whole condition NULL
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT e.session_id FROM inbox e JOIN sessions s ON s.id = e.session_id
-		WHERE `+claimable+` AND NOT (e.session_id = ANY($2))
-		GROUP BY e.session_id ORDER BY min(e.id) LIMIT $3`, now, busy, limit)
+		WHERE (`+claimable+` OR `+orphaned+`) AND `+takeable+` AND NOT (e.session_id = ANY($2))
+		GROUP BY e.session_id ORDER BY min(e.id) LIMIT $3`, now, busy, limit, owner)
 	if err != nil {
 		return nil, wrap(err)
 	}
@@ -258,15 +329,15 @@ func (s *Store) Ready(ctx context.Context, now time.Time, busy []string, limit i
 	return ids, wrap(err)
 }
 
-func (s *Store) Claim(ctx context.Context, session string, now time.Time, limit int) ([]daemon.Event, error) {
+func (s *Store) Claim(ctx context.Context, session, owner string, now time.Time, limit int) ([]daemon.Event, error) {
 	rows, err := s.pool.Query(ctx, `
 		UPDATE inbox SET status = 'running', attempts = attempts + 1, claimed_at = $1
 		WHERE id IN (
 			SELECT e.id FROM inbox e JOIN sessions s ON s.id = e.session_id
-			WHERE e.session_id = $2 AND `+claimable+`
+			WHERE e.session_id = $2 AND s.owner = $4 AND `+claimable+`
 			ORDER BY e.id LIMIT $3
 			FOR UPDATE OF e SKIP LOCKED)
-		RETURNING `+eventCols, now, session, limit)
+		RETURNING `+eventCols, now, session, limit, owner)
 	if err != nil {
 		return nil, wrap(err)
 	}
@@ -308,37 +379,129 @@ func (s *Store) Settle(ctx context.Context, set daemon.Settlement) error {
 	})
 }
 
-func (s *Store) Recover(ctx context.Context, attempts int) (int, error) {
+// recoverWhere puts the running events of the sessions where names back to
+// pending, or fails those tried attempts times already, and says how many
+// went back. where is a condition on session_id, with $1 its argument.
+func recoverWhere(ctx context.Context, tx pgx.Tx, where string, arg any, attempts int) (int, error) {
+	rows, err := tx.Query(ctx, `SELECT id, attempts FROM inbox WHERE status = 'running' AND `+where+` FOR UPDATE`, arg)
+	if err != nil {
+		return 0, wrap(err)
+	}
+	type running struct {
+		ID       int64
+		Attempts int
+	}
+	all, err := pgx.CollectRows(rows, pgx.RowToStructByPos[running])
+	if err != nil {
+		return 0, wrap(err)
+	}
+	n := 0
+	for _, r := range all {
+		if r.Attempts >= attempts {
+			_, err = tx.Exec(ctx, `UPDATE inbox SET status = 'failed', error = $2 WHERE id = $1`,
+				r.ID, daemon.RecoverError(r.Attempts))
+		} else {
+			_, err = tx.Exec(ctx, `UPDATE inbox SET status = 'pending' WHERE id = $1`, r.ID)
+			n++
+		}
+		if err != nil {
+			return 0, wrap(err)
+		}
+	}
+	return n, nil
+}
+
+func (s *Store) Recover(ctx context.Context, owner string, attempts int) (int, error) {
+	n := 0
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		var err error
+		if n, err = recoverWhere(ctx, tx, `session_id IN (SELECT id FROM sessions WHERE owner = $1)`, owner, attempts); err != nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, `UPDATE sessions SET owner = NULL, owner_addr = '', lease_until = NULL WHERE owner = $1`, owner)
+		return wrap(err)
+	})
+	return n, err
+}
+
+func (s *Store) Acquire(ctx context.Context, session string, l daemon.Lease, now time.Time, attempts int) (int, error) {
 	n := 0
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		n = 0
-		rows, err := tx.Query(ctx, `SELECT id, attempts FROM inbox WHERE status = 'running' FOR UPDATE`)
+		var owner, addr string
+		var until *time.Time
+		err := tx.QueryRow(ctx, `SELECT `+leaseCols+` FROM sessions WHERE id = $1 FOR UPDATE`, session).Scan(&owner, &addr, &until)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("%w: %s", daemon.ErrNoSuchSession, session)
+		}
 		if err != nil {
 			return wrap(err)
 		}
-		type running struct {
-			ID       int64
-			Attempts int
+		held := scanLease(owner, addr, until)
+		if held.Owner != "" && held.Owner != l.Owner && held.Until.After(now) {
+			return &daemon.OwnedError{Session: session, Lease: held}
 		}
-		all, err := pgx.CollectRows(rows, pgx.RowToStructByPos[running])
-		if err != nil {
-			return wrap(err)
-		}
-		for _, r := range all {
-			if r.Attempts >= attempts {
-				_, err = tx.Exec(ctx, `UPDATE inbox SET status = 'failed', error = $2 WHERE id = $1`,
-					r.ID, daemon.RecoverError(r.Attempts))
-			} else {
-				_, err = tx.Exec(ctx, `UPDATE inbox SET status = 'pending' WHERE id = $1`, r.ID)
-				n++
-			}
-			if err != nil {
-				return wrap(err)
+		if held.Owner != l.Owner {
+			// Whatever the last owner left running died with it.
+			if n, err = recoverWhere(ctx, tx, `session_id = $1`, session, attempts); err != nil {
+				return err
 			}
 		}
-		return nil
+		_, err = tx.Exec(ctx, `UPDATE sessions SET owner = $2, owner_addr = $3, lease_until = $4 WHERE id = $1`,
+			session, l.Owner, l.Addr, l.Until)
+		return wrap(err)
 	})
 	return n, err
+}
+
+func (s *Store) Renew(ctx context.Context, owner string, sessions []string, until time.Time) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `UPDATE sessions SET lease_until = $3 WHERE owner = $1 AND id = ANY($2) RETURNING id`,
+		owner, sessions, until)
+	if err != nil {
+		return nil, wrap(err)
+	}
+	kept, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	return kept, wrap(err)
+}
+
+func (s *Store) Release(ctx context.Context, owner string, sessions []string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE sessions SET owner = NULL, owner_addr = '', lease_until = NULL
+		WHERE owner = $1 AND id = ANY($2)`, owner, sessions)
+	return wrap(err)
+}
+
+// Lead holds role's lock on a connection of its own: owner and until are for
+// stores without one, and are not needed here. The lock goes with the
+// connection, so a leader that dies, or whose connection drops, hands it to
+// the next to ask; a connection that has dropped is replaced on the next ask.
+func (s *Store) Lead(ctx context.Context, role, _ string, _ time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lc := s.roles[role]
+	if lc != nil && lc.conn.Ping(ctx) != nil {
+		lc.conn.Close(context.Background())
+		delete(s.roles, role)
+		lc = nil
+	}
+	if lc == nil {
+		conn, err := pgx.ConnectConfig(ctx, s.cfg.ConnConfig.Copy())
+		if err != nil {
+			return false, fmt.Errorf("postgres: %w", err)
+		}
+		lc = &leadConn{conn: conn}
+		s.roles[role] = lc
+	}
+	if lc.held {
+		return true, nil
+	}
+	err := lc.conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtext('wombat-lead:' || current_schema() || ':' || $1))`, role).Scan(&lc.held)
+	if err != nil {
+		lc.conn.Close(context.Background())
+		delete(s.roles, role)
+		return false, fmt.Errorf("postgres: %w", err)
+	}
+	return lc.held, nil
 }
 
 func (s *Store) Events(ctx context.Context, f daemon.EventFilter) ([]daemon.Event, error) {
@@ -553,6 +716,7 @@ func (s *Store) Undelivered(ctx context.Context, id int64, reason string, retry 
 type querier interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
 func wrap(err error) error {

@@ -29,10 +29,13 @@
 package main
 
 import (
+	"cmp"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
+	"strings"
 
 	"wombat/pkg/core"
 	"wombat/pkg/core/governor"
@@ -74,7 +77,8 @@ func run(cfg config, logger *slog.Logger) error {
 	}
 	defer rec.close()
 
-	st, err := openStore(cfg.Store, logger)
+	name, addr := identity(cfg.Server, cfg.Daemon)
+	st, err := openStore(cfg.Store, name, logger)
 	if err != nil {
 		return err
 	}
@@ -94,24 +98,47 @@ func run(cfg config, logger *slog.Logger) error {
 		return fmt.Errorf("building the reference agent: %w", err)
 	}
 
-	mgr, err := newManager(cfg, st, f.build, logger)
+	mgr, err := newManager(cfg, st, name, addr, f.build, logger)
 	if err != nil {
 		return err
 	}
 	defer mgr.Close()
 
-	logger.Info("listening", "addr", cfg.Server.Addr, "provider", cfg.Model.Provider,
+	logger.Info("listening", "addr", cfg.Server.Addr, "daemon", name, "advertise", addr, "provider", cfg.Model.Provider,
 		"mode", cfg.Mode, "permission", cfg.Tools.Permission, "full_access", f.fullAccess(), "working_dir", f.root,
 		"store", cfg.Store.Driver, "outbox_webhook", cfg.Outbox.Webhook != "")
+	if cfg.Store.Driver == driverPostgres && addr == "" {
+		logger.Warn("server.advertise is empty and cannot be worked out from server.addr: other daemons on this store cannot forward this one the requests for the sessions it runs")
+	}
 	return serve(cfg.Server.Addr, httpapi.New(mgr, handlerOptions(cfg, f, probe, logger)...), logger)
+}
+
+// identity is who this daemon is among those sharing its store: its name —
+// daemon.name, or this host and port, the same each time it starts so that it
+// takes its sessions back at once — and the address another daemon forwards
+// it requests at: server.advertise, or server.addr when that names a host.
+func identity(srv serverConfig, d daemonConfig) (name, addr string) {
+	host, port, err := net.SplitHostPort(srv.Addr)
+	name = d.Name
+	if name == "" {
+		h, _ := os.Hostname()
+		name = cmp.Or(h, "wombatd") + ":" + cmp.Or(port, "0")
+	}
+	addr = srv.Advertise
+	if addr == "" && err == nil && host != "" && host != "0.0.0.0" && host != "::" {
+		addr = "http://" + net.JoinHostPort(host, port)
+	}
+	return name, strings.TrimSuffix(addr, "/")
 }
 
 // newManager runs the sessions: where they are kept, how each one's agent is
 // built, how the inbox is worked, and what one turn may spend.
-func newManager(cfg config, st daemon.Store, build func(daemon.SessionOptions) (*core.Agent, error), logger *slog.Logger) (*daemon.Manager, error) {
+func newManager(cfg config, st daemon.Store, name, addr string, build func(daemon.SessionOptions) (*core.Agent, error), logger *slog.Logger) (*daemon.Manager, error) {
 	mc := daemon.ManagerConfig{
 		Store: st,
 		Build: build,
+		Name:  name,
+		Addr:  addr,
 		// No Steps limit. Each agent's own iteration cap bounds it, and Steps
 		// counts the whole tree: a delegated task's iterations and every
 		// review sweep's are charged to the turn. Set to max_iters+1 it never

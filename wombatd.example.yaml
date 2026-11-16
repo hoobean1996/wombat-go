@@ -21,6 +21,12 @@ server:
   # transcript.
   addr: 127.0.0.1:8080
 
+  # Where other wombatd sharing the store reach this one — http://10.0.0.5:8080
+  # — to forward it the requests for the sessions it runs. Empty is
+  # server.addr, when that names a host; set it when addr is 0.0.0.0, or
+  # behind TLS. Not needed for one wombatd on its own.
+  advertise: ""
+
   # A bearer token every API request must carry, as Authorization: Bearer.
   # Beyond loopback, a server without one logs that anyone who can reach it
   # can drive it.
@@ -54,9 +60,10 @@ store:
 
   # For postgres: postgres://user:password@host:5432/db. The tables are made
   # on the first start, in the schema search_path names — add
-  # ?search_path=name to keep two daemons' tables apart in one database. One
-  # wombatd to a schema: a second one is refused at the start. `make pg-up`
-  # starts one in podman.
+  # ?search_path=name to keep two deployments apart in one database. Any
+  # number of wombatd can share a schema: each session is run by one of them
+  # at a time, and a request reaching another is forwarded to it (see
+  # server.advertise and daemon.name). `make pg-up` starts one in podman.
   dsn: ""
 
 # ── how the inbox is worked ──────────────────────────────────────────────
@@ -64,6 +71,13 @@ store:
 # A session takes every event waiting for it at once, as one turn, and never
 # has two turns at once.
 daemon:
+  # This wombatd's name among those sharing the store: unique, and the same
+  # each time it starts, so it takes back at once the sessions it was running
+  # when it stopped. Empty is this host's name and server.addr's port. A
+  # second wombatd under a name in use is refused at the start; the sessions
+  # of one that died are taken over by the others once its leases run out.
+  name: ""
+
   # How often the store is looked at for timers that are due and events to
   # try again. An event posted to this wombatd starts its turn at once.
   poll: 1s

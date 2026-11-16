@@ -78,6 +78,7 @@ const (
 	kindNotJSON         = "unsupported_media_type"
 	kindUnauthorized    = "unauthorized"
 	kindWrongHost       = "misdirected"
+	kindElsewhere       = "elsewhere"
 )
 
 const (
@@ -376,16 +377,19 @@ func New(m *daemon.Manager, opts ...Option) http.Handler {
 	mux.HandleFunc("GET /api/config", a.config)
 	mux.HandleFunc("POST /api/sessions", a.createSession)
 	mux.HandleFunc("GET /api/sessions", a.listSessions)
-	mux.HandleFunc("GET /api/sessions/{id}", a.getSession)
-	mux.HandleFunc("PATCH /api/sessions/{id}", a.patchSession)
-	mux.HandleFunc("DELETE /api/sessions/{id}", a.deleteSession)
-	mux.HandleFunc("GET /api/sessions/{id}/events", a.events)
-	mux.HandleFunc("GET /api/sessions/{id}/messages", a.getMessages)
-	mux.HandleFunc("GET /api/sessions/{id}/file", a.getFile)
+	// A request about one session is served where the session runs: here,
+	// or forwarded to the daemon that holds it. See forward.go.
+	mux.HandleFunc("GET /api/sessions/{id}", a.placed("id", a.getSession))
+	mux.HandleFunc("PATCH /api/sessions/{id}", a.placed("id", a.patchSession))
+	mux.HandleFunc("DELETE /api/sessions/{id}", a.placed("id", a.deleteSession))
+	mux.HandleFunc("GET /api/sessions/{id}/events", a.placed("id", a.events))
+	mux.HandleFunc("GET /api/sessions/{id}/messages", a.placed("id", a.getMessages))
+	mux.HandleFunc("GET /api/sessions/{id}/file", a.placed("id", a.getFile))
+	// Not placed: a message goes in the inbox, wherever the session runs.
 	mux.HandleFunc("POST /api/sessions/{id}/messages", a.postMessage)
-	mux.HandleFunc("POST /api/sessions/{id}/steer", a.steer)
-	mux.HandleFunc("GET /api/sessions/{id}/approvals", a.listApprovals)
-	mux.HandleFunc("POST /api/sessions/{id}/approvals/{use_id}", a.resolveApproval)
+	mux.HandleFunc("POST /api/sessions/{id}/steer", a.placed("id", a.steer))
+	mux.HandleFunc("GET /api/sessions/{id}/approvals", a.placed("id", a.listApprovals))
+	mux.HandleFunc("POST /api/sessions/{id}/approvals/{use_id}", a.placed("id", a.resolveApproval))
 	mux.HandleFunc("POST /api/events", a.postEvent)
 	mux.HandleFunc("GET /api/inbox", a.listInbox)
 	mux.HandleFunc("GET /api/outbox", a.listOutbox)
@@ -408,7 +412,7 @@ func New(m *daemon.Manager, opts ...Option) http.Handler {
 	}
 	// Outside /api, so the token is not asked for: the key in the path is the
 	// permission. See files.go.
-	mux.HandleFunc("GET /files/{key}/{session}/{path...}", a.serveFile)
+	mux.HandleFunc("GET /files/{key}/{session}/{path...}", a.placed("session", a.serveFile))
 	if a.cfg.ui != nil {
 		mux.Handle("/", a.uiHandler(a.cfg.ui))
 	} else {
@@ -643,9 +647,13 @@ func (a *api) getMessages(w http.ResponseWriter, r *http.Request) {
 // 202 rather than 200: the message is queued for the session's next turn —
 // at once if it is at rest, after the one running if it is not — and what it
 // leads to arrives on the event stream and in the outbox.
+//
+// It needs nothing of the session's memory, so it is not forwarded to the
+// daemon that runs the session: it goes in the inbox from here, and is taken
+// there — even while that daemon is down, by whichever takes it over.
 func (a *api) postMessage(w http.ResponseWriter, r *http.Request) {
-	s, err := a.session(r)
-	if err != nil {
+	id := r.PathValue("id")
+	if _, err := a.m.Peek(r.Context(), id); err != nil {
 		a.fail(w, r, err)
 		return
 	}
@@ -659,12 +667,17 @@ func (a *api) postMessage(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, r, fmt.Errorf("%w: prompt is required", daemon.ErrBadRequest))
 		return
 	}
-	e, err := s.SendAs(r.Context(), req.From, prompt)
+	e, err := a.m.SendAs(r.Context(), id, req.From, prompt)
 	if err != nil {
 		a.fail(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, Accepted{Event: e, Session: s.Info()})
+	info, err := a.m.Peek(r.Context(), id)
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, Accepted{Event: e, Session: info})
 }
 
 // steer passes a message to the turn in progress; see core.Run.Steer. 202
@@ -1162,6 +1175,11 @@ func classify(err error) (status int, kind string) {
 		return http.StatusNotFound, kindNotFound
 	case errors.Is(err, errNoSuchFile):
 		return http.StatusNotFound, kindNoSuchFile
+	case errors.Is(err, daemon.ErrOwned):
+		// Another daemon runs the session, and this one could not forward
+		// the request to it — no address, or it moved meanwhile. Passing:
+		// the client tries again, here or anywhere.
+		return http.StatusServiceUnavailable, kindElsewhere
 	case errors.Is(err, daemon.ErrNotRunning):
 		return http.StatusConflict, kindNotRunning
 	case errors.Is(err, daemon.ErrDone):

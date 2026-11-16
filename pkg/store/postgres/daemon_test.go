@@ -19,17 +19,23 @@ import (
 	"wombat/pkg/store/postgres"
 )
 
-// replies answers each model call with the next response, across daemons.
+// replies answers each model call with the next response, across daemons,
+// and then with always, if set.
 type replies struct {
-	mu   sync.Mutex
-	next []llm.Response
+	mu     sync.Mutex
+	next   []llm.Response
+	always string
 }
 
 func (r *replies) Complete(context.Context, llm.Request) (llm.Response, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if len(r.next) == 0 {
-		return llm.Response{Content: []llm.ContentBlock{llm.Text{Text: "out of replies"}}, StopReason: llm.StopEndTurn}, nil
+		text := r.always
+		if text == "" {
+			text = "out of replies"
+		}
+		return say(text), nil
 	}
 	out := r.next[0]
 	r.next = r.next[1:]
@@ -75,10 +81,12 @@ func TestADaemonOnPostgresCarriesOnAfterARestart(t *testing.T) {
 	}
 	start := func() (*postgres.Store, *daemon.Manager) {
 		st := open(t, where)
-		if err := st.Lock(ctx); err != nil {
+		if err := st.Lock(ctx, "d1"); err != nil {
 			t.Fatal(err)
 		}
-		m, err := daemon.NewManager(daemon.ManagerConfig{Store: st, Build: build, Poll: 5 * time.Millisecond,
+		// The same name each time, so the daemon that starts again takes back
+		// at once what the one before it held.
+		m, err := daemon.NewManager(daemon.ManagerConfig{Store: st, Build: build, Name: "d1", Poll: 5 * time.Millisecond,
 			Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 		if err != nil {
 			t.Fatal(err)

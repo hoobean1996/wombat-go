@@ -87,6 +87,16 @@ var migrations = []string{
 	`
 	ALTER TABLE inbox ADD COLUMN sender text NOT NULL DEFAULT '';
 	`,
+
+	// 3: which daemon runs a session, and until when, so that any number of
+	// daemons can share the schema: daemon.Store.Acquire.
+	`
+	ALTER TABLE sessions
+		ADD COLUMN owner       text,
+		ADD COLUMN owner_addr  text NOT NULL DEFAULT '',
+		ADD COLUMN lease_until timestamptz;
+	CREATE INDEX sessions_owner ON sessions (owner) WHERE owner IS NOT NULL;
+	`,
 }
 
 // migrate brings the schema up to date. A transaction-scoped advisory lock

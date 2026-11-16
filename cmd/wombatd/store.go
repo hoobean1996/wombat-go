@@ -15,10 +15,10 @@ import (
 const openTimeout = 30 * time.Second
 
 // openStore opens where the sessions and their inbox, timers and outbox are
-// kept. Postgres is locked to this daemon for as long as it runs: a second
-// wombatd on the same schema would run the first one's events, and is
-// refused at the start instead.
-func openStore(cfg storeConfig, logger *slog.Logger) (daemon.Store, error) {
+// kept. Any number of wombatd may share a Postgres schema, each under a name
+// of its own; a second one under this one's name would take its sessions for
+// its own, and is refused at the start instead.
+func openStore(cfg storeConfig, name string, logger *slog.Logger) (daemon.Store, error) {
 	if cfg.Driver != driverPostgres {
 		logger.Warn("store.driver is memory: sessions, timers and the outbox are gone when wombatd stops")
 		return daemon.MemoryStore(), nil
@@ -29,9 +29,9 @@ func openStore(cfg storeConfig, logger *slog.Logger) (daemon.Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store: %w", err)
 	}
-	if err := st.Lock(ctx); err != nil {
+	if err := st.Lock(ctx, name); err != nil {
 		st.Close()
-		return nil, fmt.Errorf("store: %w", err)
+		return nil, fmt.Errorf("store: daemon %q: %w", name, err)
 	}
 	return st, nil
 }

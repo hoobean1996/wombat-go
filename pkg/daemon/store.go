@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"wombat/pkg/core"
@@ -20,26 +21,34 @@ import (
 // the specification: what a test of a [Manager] proves against the one holds
 // for the other.
 //
-// A Store serves one Manager at a time — [Store.Recover] assumes that nobody
-// else is running the events it puts back — and its methods are safe for
-// concurrent use. Times are kept to the microsecond, in UTC.
+// Any number of Managers may share a store — daemons on as many machines as
+// one Postgres serves. What must happen once happens once all the same: each
+// session is run by one daemon at a time, the one holding its lease (see
+// [Store.Acquire]); a timer fires once; a message is delivered by one
+// dispatcher (see [Store.Lead]). Its methods are safe for concurrent use.
+// Times are kept to the microsecond, in UTC.
 type Store interface {
-	// CreateSession records a new session. A Thread another session already
-	// has is [ErrThreadTaken].
+	// CreateSession records a new session, held by rec.Lease when it names an
+	// owner. A Thread another session already has is [ErrThreadTaken].
 	CreateSession(ctx context.Context, rec SessionRecord) error
 
 	// SaveSession replaces a session's record. One that is not there —
 	// deleted while its turn ran — is [ErrNoSuchSession], and stays deleted.
+	// With rec.Lease.Owner set, it is written only while that daemon holds the
+	// session, and is an *[OwnedError] otherwise: a daemon whose lease ran out
+	// does not write over the one that took the session over.
 	SaveSession(ctx context.Context, rec SessionRecord) error
 
-	// LoadSession returns a session's record, or [ErrNoSuchSession].
+	// LoadSession returns a session's record, its Lease included, or
+	// [ErrNoSuchSession].
 	LoadSession(ctx context.Context, id string) (SessionRecord, error)
 
 	// SessionByThread returns the id of the session tied to an external
 	// thread, or [ErrNoSuchSession].
 	SessionByThread(ctx context.Context, thread string) (string, error)
 
-	// ListSessions returns every session, oldest first, without its Messages.
+	// ListSessions returns every session, oldest first, without its Messages
+	// but with its Lease.
 	ListSessions(ctx context.Context) ([]SessionRecord, error)
 
 	// DeleteSession forgets a session, and its events, timers and messages
@@ -51,24 +60,62 @@ type Store interface {
 	// one is returned instead, with false. The session must exist.
 	Enqueue(ctx context.Context, e Event) (Event, bool, error)
 
-	// Ready lists up to limit sessions with events to claim at now, the one
-	// that has waited longest first, leaving out those in busy. An event is
-	// there to claim when it is pending and not held back past now; a session
-	// waiting on a decision takes nothing but approvals.
-	Ready(ctx context.Context, now time.Time, busy []string, limit int) ([]string, error)
+	// Ready lists up to limit sessions with events to claim at now that owner
+	// holds or could take — with no owner, or one whose lease ran out — the
+	// one that has waited longest first, leaving out those in busy. An event
+	// is there to claim when it is pending and not held back past now; a
+	// session waiting on a decision takes nothing but approvals. A session
+	// whose owner's lease ran out with events still running counts too:
+	// taking it puts them back (see [Store.Acquire]).
+	Ready(ctx context.Context, now time.Time, owner string, busy []string, limit int) ([]string, error)
 
 	// Claim takes up to limit of the events Ready counts for the session, in
-	// the order they arrived: each becomes running, and has one more attempt.
-	Claim(ctx context.Context, session string, now time.Time, limit int) ([]Event, error)
+	// the order they arrived, if owner holds it — none otherwise: each becomes
+	// running, and has one more attempt.
+	Claim(ctx context.Context, session, owner string, now time.Time, limit int) ([]Event, error)
 
-	// Settle records what a turn did, all at once or not at all.
+	// Settle records what a turn did, all at once or not at all. A Session
+	// with Lease.Owner set is written as SaveSession writes it, and a refusal
+	// leaves everything as it was.
 	Settle(ctx context.Context, s Settlement) error
 
-	// Recover puts every running event back to pending, for a manager
-	// starting after one that did not stop cleanly: their turns died with it.
-	// One tried attempts times already is failed instead. It reports how many
-	// events it put back.
-	Recover(ctx context.Context, attempts int) (int, error)
+	// ===== Who runs a session =====
+	//
+	// A session's turns are run by one daemon at a time: the one holding its
+	// lease, its owner — the only one that claims its events, writes its
+	// record and keeps it in memory. The owner renews the lease while it has
+	// the session; a lease that runs out with nobody renewing it is a daemon
+	// that died, and any other may take the session over.
+
+	// Acquire makes l.Owner the owner of a session until l.Until, if nobody
+	// else holds a live lease on it at now: it has no owner, l.Owner holds it
+	// already, or its owner's lease ran out. Taking it from another daemon puts
+	// the events that daemon left running back in the inbox — failing those
+	// tried attempts times already — and reports how many it put back. A
+	// session another daemon holds is an *[OwnedError] naming it.
+	Acquire(ctx context.Context, session string, l Lease, now time.Time, attempts int) (int, error)
+
+	// Renew extends owner's lease on those of sessions it still holds to
+	// until, and returns them: one missing from the answer was deleted, or
+	// taken over after the lease ran out.
+	Renew(ctx context.Context, owner string, sessions []string, until time.Time) ([]string, error)
+
+	// Release gives up owner's leases on sessions.
+	Release(ctx context.Context, owner string, sessions []string) error
+
+	// Recover is for a daemon starting again under the name it had: the turns
+	// its sessions were running died with it. It puts their events back in the
+	// inbox — failing those tried attempts times already — gives the sessions
+	// up, and reports how many events it put back. No other daemon's sessions
+	// are touched.
+	Recover(ctx context.Context, owner string, attempts int) (int, error)
+
+	// Lead reports whether owner leads role: "deliver", the outbox's
+	// dispatcher, which has to be one daemon so that a message is sent once and
+	// in order. The first to ask leads, and asking again keeps it leading, at
+	// least until until; then — or once its store is closed, or its process
+	// dies — the next to ask does.
+	Lead(ctx context.Context, role, owner string, until time.Time) (bool, error)
 
 	// Events lists inbox events, newest first.
 	Events(ctx context.Context, f EventFilter) ([]Event, error)
@@ -143,7 +190,35 @@ var (
 
 	// ErrNoSuchMessage reports an outbox id that names nothing.
 	ErrNoSuchMessage = errors.New("daemon: no such message")
+
+	// ErrOwned reports a session another daemon holds; see [OwnedError].
+	ErrOwned = errors.New("daemon: another daemon runs that session")
 )
+
+// Lease is a daemon's hold on a session; see [Store.Acquire].
+type Lease struct {
+	// Owner names the daemon: unique among those sharing a store.
+	Owner string `json:"owner,omitempty"`
+
+	// Addr is where the daemon answers HTTP, for another to forward the
+	// session's requests to. Optional.
+	Addr string `json:"addr,omitempty"`
+
+	Until time.Time `json:"until,omitzero"`
+}
+
+// OwnedError is [ErrOwned]: the session, and the lease another daemon holds
+// on it — whose Addr a server can forward the request to.
+type OwnedError struct {
+	Session string
+	Lease   Lease
+}
+
+func (e *OwnedError) Error() string {
+	return fmt.Sprintf("daemon: session %s runs on daemon %q", e.Session, e.Lease.Owner)
+}
+
+func (e *OwnedError) Unwrap() error { return ErrOwned }
 
 // RecordVersion is the layout of [SessionRecord] this package writes, and
 // the newest it reads.
@@ -176,13 +251,20 @@ type SessionRecord struct {
 	// chat thread — so the events about it find it. Optional, and unique.
 	Thread string `json:"thread,omitempty"`
 
-	Options  SessionOptions `json:"options"`
-	Created  time.Time      `json:"created"`
-	Updated  time.Time      `json:"updated"`
-	Turns    int            `json:"turns"`
-	State    State          `json:"state"`
-	Messages []llm.Message  `json:"messages"`
-	Spend    Spend          `json:"spend"`
+	Options SessionOptions `json:"options"`
+
+	// Lease is who runs the session, as the store has it, beside the record
+	// rather than in it: LoadSession and ListSessions fill it in,
+	// CreateSession sets it, and SaveSession and Settle write a record only
+	// while its Lease.Owner, when set, holds the session.
+	Lease Lease `json:"-"`
+
+	Created  time.Time     `json:"created"`
+	Updated  time.Time     `json:"updated"`
+	Turns    int           `json:"turns"`
+	State    State         `json:"state"`
+	Messages []llm.Message `json:"messages"`
+	Spend    Spend         `json:"spend"`
 
 	// Origins are where messages of the transcript came from, keyed by their
 	// index in Messages: for each message a turn's inbox events made — the

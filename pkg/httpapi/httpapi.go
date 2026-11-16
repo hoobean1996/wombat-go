@@ -36,6 +36,14 @@
 // which a client long-polls — GET /api/outbox?after=<last id>&wait=30s — and
 // acks.
 //
+// # Several daemons
+//
+// Daemons sharing one store each run the sessions they hold, and a request
+// about a session reaching one that does not hold it is forwarded to the one
+// that does, at the address its lease names (daemon.ManagerConfig.Addr). It
+// is answered 503 "elsewhere" when it cannot be: no address, or the session
+// moved while the request was on its way.
+//
 // # Who said what
 //
 // Every event in the inbox says what it is, where it came from and, when the

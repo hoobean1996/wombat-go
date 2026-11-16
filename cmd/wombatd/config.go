@@ -8,6 +8,7 @@ import (
 	"maps"
 	"net/url"
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -42,11 +43,12 @@ type config struct {
 }
 
 type serverConfig struct {
-	Addr    string   `yaml:"addr"`
-	Token   string   `yaml:"token"`
-	CORS    []string `yaml:"cors"`
-	Metrics bool     `yaml:"metrics"`
-	Log     string   `yaml:"log"`
+	Addr      string   `yaml:"addr"`
+	Advertise string   `yaml:"advertise"`
+	Token     string   `yaml:"token"`
+	CORS      []string `yaml:"cors"`
+	Metrics   bool     `yaml:"metrics"`
+	Log       string   `yaml:"log"`
 }
 
 type storeConfig struct {
@@ -55,6 +57,7 @@ type storeConfig struct {
 }
 
 type daemonConfig struct {
+	Name     string        `yaml:"name"`
 	Poll     time.Duration `yaml:"poll"`
 	MaxRuns  int           `yaml:"max_runs"`
 	Attempts int           `yaml:"attempts"`
@@ -152,6 +155,9 @@ func defaults() config {
 	}
 }
 
+// daemonName is what daemon.name may look like.
+var daemonName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:/@-]{0,127}$`)
+
 // The words a key may hold, and what each one means.
 var (
 	drivers     = map[string]bool{driverMemory: true, driverPostgres: true}
@@ -207,6 +213,14 @@ func (c config) validate() []error {
 
 	if c.Server.Addr == "" {
 		bad("server.addr", "is empty")
+	}
+	if a := c.Server.Advertise; a != "" {
+		if u, err := url.Parse(a); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || (u.Path != "" && u.Path != "/") {
+			bad("server.advertise", "%q is not an http(s)://host:port address", a)
+		}
+	}
+	if n := c.Daemon.Name; n != "" && !daemonName.MatchString(n) {
+		bad("daemon.name", "%q is not a name: letters, digits and . _ : / @ -, at most 128", n)
 	}
 	oneOf("server.log", c.Server.Log, slices.Sorted(maps.Keys(logLevels)))
 

@@ -178,3 +178,24 @@ func TestAccess(t *testing.T) {
 		srv.Close()
 	}
 }
+
+// A daemon is named after its host and port unless daemon.name says, and
+// advertises server.addr unless that names no host.
+func TestIdentity(t *testing.T) {
+	host, _ := os.Hostname()
+	for _, tc := range []struct {
+		srv        serverConfig
+		d          daemonConfig
+		name, addr string
+	}{
+		{serverConfig{Addr: "127.0.0.1:8080"}, daemonConfig{}, host + ":8080", "http://127.0.0.1:8080"},
+		{serverConfig{Addr: "0.0.0.0:9000"}, daemonConfig{Name: "w1"}, "w1", ""},
+		{serverConfig{Addr: ":9000", Advertise: "https://w2.internal:443/"}, daemonConfig{}, host + ":9000", "https://w2.internal:443"},
+		{serverConfig{Addr: "[::1]:8080"}, daemonConfig{}, host + ":8080", "http://[::1]:8080"},
+	} {
+		name, addr := identity(tc.srv, tc.d)
+		if name != tc.name || addr != tc.addr {
+			t.Errorf("identity(%+v, %+v) = %q, %q; want %q, %q", tc.srv, tc.d, name, addr, tc.name, tc.addr)
+		}
+	}
+}

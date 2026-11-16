@@ -119,6 +119,9 @@ func (s *Session) record() SessionRecord {
 
 func (s *Session) recordLocked() SessionRecord {
 	return SessionRecord{
+		// The owner, so the store writes the record only while this daemon
+		// still holds the session.
+		Lease:   Lease{Owner: s.m.cfg.Name},
 		Version: RecordVersion, ID: s.id, Thread: s.thread, Options: s.opts,
 		Created: s.created, Updated: s.updated,
 		Turns: s.turns, State: s.state, Messages: s.msgs, Origins: maps.Clone(s.origins), Spend: s.spend,
@@ -662,9 +665,12 @@ func (s *Session) end(ctx context.Context, cancel context.CancelFunc, turn int, 
 // settleOrForget settles, and drops the session from memory if the store
 // says it is gone: deleted while its turn ran.
 func (s *Session) settleOrForget(set Settlement) {
-	if err := s.m.settle(set); errors.Is(err, ErrNoSuchSession) {
+	// Deleted, or taken over by another daemon after this one's lease ran
+	// out: either way it is not this daemon's any more.
+	if err := s.m.settle(set); errors.Is(err, ErrNoSuchSession) || errors.Is(err, ErrOwned) {
 		s.m.forget(s)
-		s.close()
+		// Not waited for: close waits for the turn, and this is the turn.
+		go s.close()
 	}
 }
 

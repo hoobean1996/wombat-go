@@ -15,14 +15,15 @@ import (
 // does not need to outlive itself. It behaves as the Postgres store does —
 // both pass the same suite — so a test against one is a test of the other.
 func MemoryStore() Store {
-	return &memStore{sessions: map[string]*memSession{}}
+	return &memStore{sessions: map[string]*memSession{}, leaders: map[string]Lease{}}
 }
 
 type memStore struct {
 	mu       sync.Mutex
 	sessions map[string]*memSession
-	events   []Event // in id order
-	timers   []Timer // in id order
+	leaders  map[string]Lease // by role
+	events   []Event          // in id order
+	timers   []Timer          // in id order
 	outbox   []Message
 	lastID   struct{ event, timer, message int64 }
 }
@@ -35,6 +36,12 @@ type memSession struct {
 	awaiting bool
 	meta     []byte
 	messages []byte
+	lease    Lease
+}
+
+// ownedBy reports the session held, at now, by a daemon other than owner.
+func (s *memSession) ownedBy(owner string, now time.Time) bool {
+	return s.lease.Owner != "" && s.lease.Owner != owner && s.lease.Until.After(now)
 }
 
 // micro is a time as a store keeps it.
@@ -100,9 +107,11 @@ func (m *memStore) CreateSession(_ context.Context, rec SessionRecord) error {
 			}
 		}
 	}
+	lease := rec.Lease
+	lease.Until = micro(lease.Until)
 	m.sessions[rec.ID] = &memSession{
 		thread: rec.Thread, created: micro(rec.Created), awaiting: rec.Deferred != nil,
-		meta: meta, messages: msgs,
+		meta: meta, messages: msgs, lease: lease,
 	}
 	return nil
 }
@@ -118,11 +127,24 @@ func (m *memStore) SaveSession(_ context.Context, rec SessionRecord) error {
 }
 
 func (m *memStore) saveLocked(rec SessionRecord, meta, msgs []byte) error {
-	s, ok := m.sessions[rec.ID]
-	if !ok {
-		return fmt.Errorf("%w: %s", ErrNoSuchSession, rec.ID)
+	if err := m.writableLocked(rec); err != nil {
+		return err
 	}
+	s := m.sessions[rec.ID]
 	s.awaiting, s.meta, s.messages = rec.Deferred != nil, meta, msgs
+	return nil
+}
+
+// writableLocked is whether rec may be written: the session is there, and
+// held by rec.Lease.Owner when that is set.
+func (m *memStore) writableLocked(rec SessionRecord) error {
+	s, ok := m.sessions[rec.ID]
+	switch {
+	case !ok:
+		return fmt.Errorf("%w: %s", ErrNoSuchSession, rec.ID)
+	case rec.Lease.Owner != "" && s.lease.Owner != rec.Lease.Owner:
+		return &OwnedError{Session: rec.ID, Lease: s.lease}
+	}
 	return nil
 }
 
@@ -130,14 +152,17 @@ func (m *memStore) LoadSession(_ context.Context, id string) (SessionRecord, err
 	m.mu.Lock()
 	s, ok := m.sessions[id]
 	var meta, msgs []byte
+	var lease Lease
 	if ok {
-		meta, msgs = s.meta, s.messages
+		meta, msgs, lease = s.meta, s.messages, s.lease
 	}
 	m.mu.Unlock()
 	if !ok {
 		return SessionRecord{}, fmt.Errorf("%w: %s", ErrNoSuchSession, id)
 	}
-	return DecodeRecord(meta, msgs)
+	rec, err := DecodeRecord(meta, msgs)
+	rec.Lease = lease
+	return rec, err
 }
 
 func (m *memStore) SessionByThread(_ context.Context, thread string) (string, error) {
@@ -159,10 +184,11 @@ func (m *memStore) ListSessions(context.Context) ([]SessionRecord, error) {
 		id      string
 		created time.Time
 		meta    []byte
+		lease   Lease
 	}
 	all := make([]entry, 0, len(m.sessions))
 	for id, s := range m.sessions {
-		all = append(all, entry{id, s.created, s.meta})
+		all = append(all, entry{id, s.created, s.meta, s.lease})
 	}
 	m.mu.Unlock()
 	slices.SortFunc(all, func(a, b entry) int {
@@ -174,6 +200,7 @@ func (m *memStore) ListSessions(context.Context) ([]SessionRecord, error) {
 		if err != nil {
 			return nil, err
 		}
+		rec.Lease = e.lease
 		out = append(out, rec)
 	}
 	return out, nil
@@ -230,7 +257,14 @@ func (m *memStore) claimable(e Event, now time.Time) bool {
 	return ok && (!s.awaiting || e.Kind == KindApproval)
 }
 
-func (m *memStore) Ready(_ context.Context, now time.Time, busy []string, limit int) ([]string, error) {
+// orphaned is a running event whose session nobody holds any more, at now:
+// its turn died with the daemon that ran it.
+func (m *memStore) orphaned(e Event, owner string, now time.Time) bool {
+	s, ok := m.sessions[e.Session]
+	return ok && e.Status == EventRunning && s.lease.Owner != owner && !s.lease.Until.After(now)
+}
+
+func (m *memStore) Ready(_ context.Context, now time.Time, owner string, busy []string, limit int) ([]string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now = micro(now)
@@ -239,17 +273,24 @@ func (m *memStore) Ready(_ context.Context, now time.Time, busy []string, limit 
 		if len(out) >= limit {
 			break
 		}
-		if m.claimable(e, now) && !slices.Contains(busy, e.Session) && !slices.Contains(out, e.Session) {
+		s, ok := m.sessions[e.Session]
+		if !ok || s.ownedBy(owner, now) || slices.Contains(busy, e.Session) || slices.Contains(out, e.Session) {
+			continue
+		}
+		if m.claimable(e, now) || m.orphaned(e, owner, now) {
 			out = append(out, e.Session)
 		}
 	}
 	return out, nil
 }
 
-func (m *memStore) Claim(_ context.Context, session string, now time.Time, limit int) ([]Event, error) {
+func (m *memStore) Claim(_ context.Context, session, owner string, now time.Time, limit int) ([]Event, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now = micro(now)
+	if s, ok := m.sessions[session]; !ok || s.lease.Owner != owner {
+		return nil, nil
+	}
 	var out []Event
 	for i := range m.events {
 		if len(out) >= limit {
@@ -278,8 +319,8 @@ func (m *memStore) Settle(_ context.Context, s Settlement) error {
 	defer m.mu.Unlock()
 	// Everything that can refuse is checked before anything is changed.
 	if s.Session.ID != "" {
-		if _, ok := m.sessions[s.Session.ID]; !ok {
-			return fmt.Errorf("%w: %s", ErrNoSuchSession, s.Session.ID)
+		if err := m.writableLocked(s.Session); err != nil {
+			return err
 		}
 	}
 	for _, msg := range s.Outbox {
@@ -313,13 +354,13 @@ func (m *memStore) setStatus(ids []int64, status EventStatus, why string, notBef
 	}
 }
 
-func (m *memStore) Recover(_ context.Context, attempts int) (int, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+// recoverLocked puts the running events of the sessions in back to pending,
+// or fails those tried attempts times already, and says how many went back.
+func (m *memStore) recoverLocked(in func(session string) bool, attempts int) int {
 	n := 0
 	for i := range m.events {
 		e := &m.events[i]
-		if e.Status != EventRunning {
+		if e.Status != EventRunning || !in(e.Session) {
 			continue
 		}
 		if e.Attempts >= attempts {
@@ -329,11 +370,81 @@ func (m *memStore) Recover(_ context.Context, attempts int) (int, error) {
 		e.Status = EventPending
 		n++
 	}
+	return n
+}
+
+func (m *memStore) Acquire(_ context.Context, session string, l Lease, now time.Time, attempts int) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[session]
+	if !ok {
+		return 0, fmt.Errorf("%w: %s", ErrNoSuchSession, session)
+	}
+	if s.ownedBy(l.Owner, micro(now)) {
+		return 0, &OwnedError{Session: session, Lease: s.lease}
+	}
+	n := 0
+	if s.lease.Owner != l.Owner {
+		// Whatever the last owner left running died with it.
+		n = m.recoverLocked(func(id string) bool { return id == session }, attempts)
+	}
+	l.Until = micro(l.Until)
+	s.lease = l
 	return n, nil
 }
 
-// RecoverError is what an event [Store.Recover] gives up on says. For a
-// [Store] implementation, so both say the same.
+func (m *memStore) Renew(_ context.Context, owner string, sessions []string, until time.Time) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var kept []string
+	for _, id := range sessions {
+		if s, ok := m.sessions[id]; ok && s.lease.Owner == owner {
+			s.lease.Until = micro(until)
+			kept = append(kept, id)
+		}
+	}
+	return kept, nil
+}
+
+func (m *memStore) Release(_ context.Context, owner string, sessions []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, id := range sessions {
+		if s, ok := m.sessions[id]; ok && s.lease.Owner == owner {
+			s.lease = Lease{}
+		}
+	}
+	return nil
+}
+
+func (m *memStore) Recover(_ context.Context, owner string, attempts int) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	mine := func(id string) bool { s, ok := m.sessions[id]; return ok && s.lease.Owner == owner }
+	n := m.recoverLocked(mine, attempts)
+	for _, s := range m.sessions {
+		if s.lease.Owner == owner {
+			s.lease = Lease{}
+		}
+	}
+	return n, nil
+}
+
+// Lead: a lease on the role, as on a session, so that Managers sharing one
+// memory store — in one process — have one dispatcher too.
+func (m *memStore) Lead(_ context.Context, role, owner string, until time.Time) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	l := m.leaders[role]
+	if l.Owner != "" && l.Owner != owner && l.Until.After(time.Now()) {
+		return false, nil
+	}
+	m.leaders[role] = Lease{Owner: owner, Until: until}
+	return true, nil
+}
+
+// RecoverError is what an event [Store.Recover] or [Store.Acquire] gives up
+// on says. For a [Store] implementation, so both say the same.
 func RecoverError(attempts int) string {
 	return fmt.Sprintf("the daemon stopped while this event's turn was running, %d times", attempts)
 }

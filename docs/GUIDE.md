@@ -324,9 +324,7 @@ curl -s localhost:8080/api/timers -H 'Content-Type: application/json' -d '{
 **Keeping it.** With the default `store.driver: memory`, everything is gone
 when wombatd stops. With `postgres`, it is kept in four tables — `sessions`,
 `inbox`, `timers` and `outbox` — which wombatd creates on its first start, and
-a restart carries on where it stopped. One wombatd to a schema: a second one
-on the same schema is refused at the start (add `?search_path=name` to the DSN
-to give each its own). For a local database:
+a restart carries on where it stopped. For a local database:
 
 ```bash
 make pg-up        # Postgres 17 in podman, on 127.0.0.1:55432
@@ -337,6 +335,36 @@ store:
   driver: postgres
   dsn: postgres://wombat:wombat@127.0.0.1:55432/wombat
 ```
+
+**Several wombatd, one Postgres.** Any number of wombatd can share a schema,
+behind one load balancer or none. The rule is the article's: one active worker
+per inbox, not one daemon per database.
+
+- **Each session has an owner.** The daemon that created or first loaded it
+  holds its lease, renews it while the session is in memory, and is the only
+  one that runs its turns. A turn in flight, its live event stream, a steer or
+  a cancel live in that daemon's memory.
+- **Any daemon takes any request.** A request about a session reaching a
+  daemon that does not hold it is forwarded to the one that does, stream
+  included, at the address it advertises (`server.advertise`; by default
+  `server.addr` when that names a host). A message is not even forwarded: it
+  goes into the session's inbox from wherever it arrives.
+- **A daemon that dies is taken over.** Its leases run out after 30 seconds.
+  Then whichever daemon is next asked about one of its sessions, or finds
+  events waiting for it, takes the session over, puts back what the dead one
+  was running, and runs it. The dead daemon's late writes, should it come back
+  to life mid-turn, are refused. A request for such a session meanwhile is
+  answered `503` with the kind `elsewhere`.
+- **Names.** Each daemon runs under `daemon.name` (by default this host and
+  port). Restarted under the same name, it takes back at once the sessions it
+  held. A second daemon under a name already in use is refused at the start.
+- **Once is once.** A timer fires once, and the outbox webhook is sent by one
+  daemon at a time, in order, whichever holds the dispatcher's lock.
+
+A session can move from one daemon to another: when the one holding it goes
+idle and lets it go, or dies. So a deployment of several needs
+`tools.working_dir` on storage they all see, or an agent finds the files it
+wrote somewhere else.
 
 <a id="en-http"></a>
 
@@ -680,5 +708,6 @@ the binary carries the built files and needs none of them.
 | A session sits in `approving` | It is waiting for a decision: answer the card in the web UI, or `GET /api/sessions/{id}/approvals` and POST one. It takes nothing else until then |
 | `/` says "built without its web UI" | Run `make ui`, then `make bin` (or just `make serve`). The UI needs npm to build; the binary does not |
 | The web UI asks for a token | `server.token` is set in `wombatd.yaml`; enter it once, it is kept in that browser |
-| `another daemon is running on this schema` | Another wombatd uses that Postgres schema. Stop it, or give this one its own with `?search_path=name` in `store.dsn` |
+| `another daemon is running on this schema under that name` | Another wombatd on that schema runs under the same `daemon.name`. Give each its own name; by default it is the host and port |
+| `503` with the kind `elsewhere` | Another wombatd runs the session and could not be reached: it died (its sessions are taken over once its 30-second leases run out), or it has no address (`server.advertise`) |
 | Messages pile up in the inbox | Look at `GET /api/inbox?session=…` and the log: a session waiting on a decision runs nothing else, and `daemon.max_runs` caps turns at once |

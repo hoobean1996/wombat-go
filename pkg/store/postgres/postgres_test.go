@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -91,26 +92,46 @@ func TestOpenIsIdempotent(t *testing.T) {
 	}
 }
 
-// One daemon to a schema: the second is told, and gets its turn once the
-// first is gone. Another schema is another daemon's.
-func TestLockIsOneDaemonPerSchema(t *testing.T) {
+// One daemon to a name: a second under the same name is told, and gets its
+// turn once the first is gone. Daemons under other names share the schema.
+func TestLockIsOneDaemonPerName(t *testing.T) {
 	ctx := context.Background()
 	where := schema(t)
 	first, second := open(t, where), open(t, where)
-	if err := first.Lock(ctx); err != nil {
+	if err := first.Lock(ctx, "d1"); err != nil {
 		t.Fatal(err)
 	}
-	if err := first.Lock(ctx); err != nil {
+	if err := first.Lock(ctx, "d1"); err != nil {
 		t.Errorf("locking twice from one store = %v", err)
 	}
-	if err := second.Lock(ctx); !errors.Is(err, postgres.ErrLocked) {
-		t.Fatalf("a second daemon's Lock = %v, want ErrLocked", err)
+	if err := second.Lock(ctx, "d1"); !errors.Is(err, postgres.ErrLocked) {
+		t.Fatalf("a second daemon's Lock under the same name = %v, want ErrLocked", err)
 	}
-	if err := open(t, schema(t)).Lock(ctx); err != nil {
-		t.Errorf("a daemon on another schema = %v, want the lock", err)
+	if err := open(t, where).Lock(ctx, "d2"); err != nil {
+		t.Errorf("a daemon under another name on the same schema = %v, want the lock", err)
 	}
 	first.Close()
-	if err := second.Lock(ctx); err != nil {
+	if err := second.Lock(ctx, "d1"); err != nil {
 		t.Errorf("once the first is closed = %v, want the lock", err)
+	}
+}
+
+// Lead: one store leads a role; the next to ask leads once it is closed.
+func TestLeadIsOneAtATime(t *testing.T) {
+	ctx := context.Background()
+	where := schema(t)
+	first, second := open(t, where), open(t, where)
+	if ok, err := first.Lead(ctx, "deliver", "d1", time.Time{}); err != nil || !ok {
+		t.Fatalf("the first Lead = %v, %v", ok, err)
+	}
+	if ok, err := second.Lead(ctx, "deliver", "d2", time.Time{}); err != nil || ok {
+		t.Fatalf("a second store's Lead = %v, %v; want false", ok, err)
+	}
+	if ok, err := second.Lead(ctx, "other", "d2", time.Time{}); err != nil || !ok {
+		t.Fatalf("another role = %v, %v; want it led", ok, err)
+	}
+	first.Close()
+	if ok, err := second.Lead(ctx, "deliver", "d2", time.Time{}); err != nil || !ok {
+		t.Fatalf("once the leader is closed = %v, %v; want the second to lead", ok, err)
 	}
 }

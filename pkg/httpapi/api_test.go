@@ -50,6 +50,10 @@ type apiClient struct {
 	// stream.
 	gate chan struct{}
 
+	// free is how many calls go through before gate holds the rest, and
+	// started how many have begun.
+	free, started int
+
 	// entered reports that a model call has started. Buffered and sent to
 	// without blocking, so a test can wait for the turn to reach the provider
 	// without the client depending on anyone reading.
@@ -58,6 +62,12 @@ type apiClient struct {
 
 func apiScript(turns ...llm.Response) *apiClient {
 	return &apiClient{turns: turns, entered: make(chan struct{}, 64)}
+}
+
+// heldAfter is held for every call after the first n.
+func (c *apiClient) heldAfter(n int) (*apiClient, func()) {
+	c.free = n
+	return c.held()
 }
 
 // held returns the same client with every call parked until release is called.
@@ -73,7 +83,11 @@ func (c *apiClient) Complete(ctx context.Context, req llm.Request) (llm.Response
 	case c.entered <- struct{}{}:
 	default:
 	}
-	if c.gate != nil {
+	c.mu.Lock()
+	n := c.started
+	c.started++
+	c.mu.Unlock()
+	if c.gate != nil && n >= c.free {
 		select {
 		case <-c.gate:
 		case <-ctx.Done():
@@ -739,7 +753,11 @@ func TestSendToAFinishedConversation(t *testing.T) {
 func TestApprovalLifecycle(t *testing.T) {
 	t.Parallel()
 	tools := []tool.Def{apiTool("look")}
-	c := apiScript(apiToolCall("use-1", "look", `{"q":"x"}`), apiText("all done"))
+	// The turn the decision resumes is held at its model call, so the double
+	// click below lands while the decision is being acted on — and not after
+	// the turn it resumed has ended, when nothing waits on the call at all.
+	c, release := apiScript(apiToolCall("use-1", "look", `{"q":"x"}`), apiText("all done")).heldAfter(1)
+	t.Cleanup(release)
 	h := apiServe(t, c, tools, nil)
 
 	info := h.start(`{"prompt":"look at it","permission":"ask"}`)
@@ -781,6 +799,7 @@ func TestApprovalLifecycle(t *testing.T) {
 	// A double click on a slow network is ordinary, not exceptional.
 	h.wantErr(h.do(http.MethodPost, path, `{"allow":true}`), http.StatusConflict, "already_answered")
 
+	release()
 	done := h.awaitState(info.ID, daemon.Idle)
 	if done.Answer != "all done" {
 		t.Fatalf("the approved call did not carry the run to the end: %+v", done)

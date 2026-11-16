@@ -37,6 +37,9 @@ func Run(t *testing.T, open func(t *testing.T) daemon.Store) {
 		{"AnAwaitingSessionTakesOnlyApprovals", awaitingTakesOnlyApprovals},
 		{"SettleIsAllOrNothing", settleIsAllOrNothing},
 		{"Recover", recoverRunning},
+		{"Leases", leases},
+		{"WritesAreFenced", writesAreFenced},
+		{"Lead", lead},
 		{"EventsNewestFirst", eventsNewestFirst},
 		{"TimersAndCancel", timersAndCancel},
 		{"FireOnceAndRepeat", fireOnceAndRepeat},
@@ -52,11 +55,19 @@ var (
 	t0  = time.Date(2026, 11, 15, 9, 0, 0, 0, time.UTC)
 )
 
+// owner is the daemon the suite's sessions are held by, unless a test says
+// otherwise; its lease runs well past anything a test does at t0.
+const owner = "d1"
+
+func lease(name string, until time.Time) daemon.Lease {
+	return daemon.Lease{Owner: name, Addr: "http://" + name + ":8080", Until: until}
+}
+
 func record(id string) daemon.SessionRecord {
 	return daemon.SessionRecord{
 		Version: daemon.RecordVersion, ID: id, State: daemon.Idle,
 		Options: daemon.SessionOptions{Title: "t " + id},
-		Created: t0, Updated: t0,
+		Created: t0, Updated: t0, Lease: lease(owner, t0.Add(24*time.Hour)),
 	}
 }
 
@@ -311,7 +322,7 @@ func enqueueAndDedup(t *testing.T, st daemon.Store) {
 			t.Errorf("event %d listed from %q, want %q", e.ID, e.From, want)
 		}
 	}
-	claimed, err := st.Claim(ctx, "s1", t0.Add(time.Hour), 10)
+	claimed, err := st.Claim(ctx, "s1", owner, t0.Add(time.Hour), 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,38 +344,38 @@ func readyAndClaim(t *testing.T, st daemon.Store) {
 	later.NotBefore = t0.Add(time.Hour)
 	enqueue(t, st, later)
 
-	ready, err := st.Ready(ctx, t0, nil, 10)
+	ready, err := st.Ready(ctx, t0, owner, nil, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Equal(ready, []string{"b", "a"}) {
 		t.Errorf("Ready = %v, want [b a]: longest waiting first, and c's event held back", ready)
 	}
-	if ready, _ := st.Ready(ctx, t0, []string{"b"}, 10); !slices.Equal(ready, []string{"a"}) {
+	if ready, _ := st.Ready(ctx, t0, owner, []string{"b"}, 10); !slices.Equal(ready, []string{"a"}) {
 		t.Errorf("Ready with b busy = %v, want [a]", ready)
 	}
-	if ready, _ := st.Ready(ctx, t0, nil, 1); !slices.Equal(ready, []string{"b"}) {
+	if ready, _ := st.Ready(ctx, t0, owner, nil, 1); !slices.Equal(ready, []string{"b"}) {
 		t.Errorf("Ready(limit 1) = %v, want [b]", ready)
 	}
-	if ready, _ := st.Ready(ctx, t0.Add(time.Hour), nil, 10); !slices.Equal(ready, []string{"b", "a", "c"}) {
+	if ready, _ := st.Ready(ctx, t0.Add(time.Hour), owner, nil, 10); !slices.Equal(ready, []string{"b", "a", "c"}) {
 		t.Errorf("Ready an hour later = %v, want c too", ready)
 	}
 
-	got, err := st.Claim(ctx, "a", t0, 1)
+	got, err := st.Claim(ctx, "a", owner, t0, 1)
 	if err != nil || !slices.Equal(ids(got), []int64{a1.ID}) {
 		t.Fatalf("Claim(limit 1) = %v, %v; want [%d]", ids(got), err, a1.ID)
 	}
 	if got[0].Status != daemon.EventRunning || got[0].Attempts != 1 {
 		t.Errorf("a claimed event: %+v", got[0])
 	}
-	got, _ = st.Claim(ctx, "a", t0, 10)
+	got, _ = st.Claim(ctx, "a", owner, t0, 10)
 	if !slices.Equal(ids(got), []int64{a2.ID}) {
 		t.Errorf("the rest of a = %v, want [%d]", ids(got), a2.ID)
 	}
-	if got, _ := st.Claim(ctx, "a", t0, 10); len(got) != 0 {
+	if got, _ := st.Claim(ctx, "a", owner, t0, 10); len(got) != 0 {
 		t.Errorf("claimed %v twice", ids(got))
 	}
-	if ready, _ := st.Ready(ctx, t0, nil, 10); !slices.Equal(ready, []string{"b"}) {
+	if ready, _ := st.Ready(ctx, t0, owner, nil, 10); !slices.Equal(ready, []string{"b"}) {
 		t.Errorf("Ready once a is claimed = %v, want [b]", ready)
 	}
 	_ = b1
@@ -376,15 +387,15 @@ func awaitingTakesOnlyApprovals(t *testing.T, st daemon.Store) {
 	rec.Deferred = &core.Deferred{Calls: []core.DeferredCall{{UseID: "w1", Tool: "write"}}}
 	create(t, st, rec)
 	msg := enqueue(t, st, message("s1", "never mind", t0))
-	if ready, _ := st.Ready(ctx, t0, nil, 10); len(ready) != 0 {
+	if ready, _ := st.Ready(ctx, t0, owner, nil, 10); len(ready) != 0 {
 		t.Fatalf("Ready = %v; a session waiting on a decision took a message", ready)
 	}
 	ok := enqueue(t, st, daemon.Event{Session: "s1", Kind: daemon.KindApproval, Source: daemon.SourceAPI,
 		Payload: json.RawMessage(`{"use_id":"w1","allow":true}`), Created: t0})
-	if ready, _ := st.Ready(ctx, t0, nil, 10); !slices.Equal(ready, []string{"s1"}) {
+	if ready, _ := st.Ready(ctx, t0, owner, nil, 10); !slices.Equal(ready, []string{"s1"}) {
 		t.Fatalf("Ready = %v, want the session, for its approval", ready)
 	}
-	if got, _ := st.Claim(ctx, "s1", t0, 10); !slices.Equal(ids(got), []int64{ok.ID}) {
+	if got, _ := st.Claim(ctx, "s1", owner, t0, 10); !slices.Equal(ids(got), []int64{ok.ID}) {
 		t.Fatalf("Claim = %v, want only the approval %d", ids(got), ok.ID)
 	}
 
@@ -393,7 +404,7 @@ func awaitingTakesOnlyApprovals(t *testing.T, st daemon.Store) {
 	if err := st.Settle(ctx, daemon.Settlement{Session: rec, Done: []int64{ok.ID}}); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := st.Claim(ctx, "s1", t0, 10); !slices.Equal(ids(got), []int64{msg.ID}) {
+	if got, _ := st.Claim(ctx, "s1", owner, t0, 10); !slices.Equal(ids(got), []int64{msg.ID}) {
 		t.Errorf("Claim after the decision = %v, want the message %d", ids(got), msg.ID)
 	}
 }
@@ -404,7 +415,7 @@ func settleIsAllOrNothing(t *testing.T, st daemon.Store) {
 	for _, text := range []string{"done", "retry", "fail"} {
 		enqueue(t, st, message("s1", text, t0))
 	}
-	claimed, _ = st.Claim(ctx, "s1", t0, 10)
+	claimed, _ = st.Claim(ctx, "s1", owner, t0, 10)
 	if len(claimed) != 3 {
 		t.Fatalf("claimed %d", len(claimed))
 	}
@@ -453,16 +464,16 @@ func settleIsAllOrNothing(t *testing.T, st daemon.Store) {
 	if len(msgs) != 1 || msgs[0].Text != "the answer" || !slices.Equal(msgs[0].InReplyTo, []int64{claimed[0].ID}) {
 		t.Errorf("outbox = %+v", msgs)
 	}
-	if ready, _ := st.Ready(ctx, t0, nil, 10); len(ready) != 0 {
+	if ready, _ := st.Ready(ctx, t0, owner, nil, 10); len(ready) != 0 {
 		t.Errorf("the retry was ready before its time: %v", ready)
 	}
-	if got, _ := st.Claim(ctx, "s1", retryAt, 10); len(got) != 1 || got[0].Attempts != 2 {
+	if got, _ := st.Claim(ctx, "s1", owner, retryAt, 10); len(got) != 1 || got[0].Attempts != 2 {
 		t.Errorf("the retry, claimed at its time: %+v", got)
 	}
 
 	// No session: only the events.
 	enqueue(t, st, message("s1", "x", t0))
-	got, _ := st.Claim(ctx, "s1", t0, 10)
+	got, _ := st.Claim(ctx, "s1", owner, t0, 10)
 	if err := st.Settle(ctx, daemon.Settlement{Failed: ids(got), Error: "cannot build"}); err != nil {
 		t.Fatal(err)
 	}
@@ -473,27 +484,167 @@ func settleIsAllOrNothing(t *testing.T, st daemon.Store) {
 
 func recoverRunning(t *testing.T, st daemon.Store) {
 	create(t, st, record("s1"))
+	theirs := record("s2")
+	theirs.Lease = lease("d2", t0.Add(24*time.Hour))
+	create(t, st, theirs)
 	enqueue(t, st, message("s1", "once", t0))
-	first, _ := st.Claim(ctx, "s1", t0, 10)
+	enqueue(t, st, message("s2", "theirs", t0))
+	first, _ := st.Claim(ctx, "s1", owner, t0, 10)
+	other, _ := st.Claim(ctx, "s2", "d2", t0, 10)
 	enqueue(t, st, message("s1", "pending", t0))
 
-	n, err := st.Recover(ctx, 3)
+	n, err := st.Recover(ctx, owner, 3)
 	if err != nil || n != 1 {
 		t.Fatalf("Recover = %d, %v; want the one running event back", n, err)
 	}
 	if e := statusOf(t, st, first[0].ID); e.Status != daemon.EventPending || e.Attempts != 1 {
 		t.Errorf("recovered: %+v", e)
 	}
+	if e := statusOf(t, st, other[0].ID); e.Status != daemon.EventRunning {
+		t.Errorf("another daemon's running event was touched: %+v", e)
+	}
+	if got, _ := st.LoadSession(ctx, "s1"); got.Lease.Owner != "" {
+		t.Errorf("after Recover the session is held by %q, want nobody", got.Lease.Owner)
+	}
 
-	got, _ := st.Claim(ctx, "s1", t0, 10)
+	if _, err := st.Acquire(ctx, "s1", lease(owner, t0.Add(time.Hour)), t0, 3); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := st.Claim(ctx, "s1", owner, t0, 10)
 	if len(got) != 2 {
 		t.Fatalf("claimed %d", len(got))
 	}
-	if n, err := st.Recover(ctx, 2); err != nil || n != 1 {
+	if n, err := st.Recover(ctx, owner, 2); err != nil || n != 1 {
 		t.Fatalf("Recover(2) = %d, %v; want one back and the twice-tried one failed", n, err)
 	}
 	if e := statusOf(t, st, first[0].ID); e.Status != daemon.EventFailed || e.Error == "" {
 		t.Errorf("tried twice: %+v", e)
+	}
+}
+
+// A session is held by one daemon at a time: another is refused while the
+// lease runs, renewing keeps it, releasing frees it, and one that runs out is
+// anyone's — whoever takes it puts back what the last owner left running.
+func leases(t *testing.T, st daemon.Store) {
+	create(t, st, record("s1")) // held by d1 until t0+24h
+	enqueue(t, st, message("s1", "hi", t0))
+	running, _ := st.Claim(ctx, "s1", owner, t0, 10)
+	if len(running) != 1 {
+		t.Fatalf("the owner claimed %d", len(running))
+	}
+
+	_, err := st.Acquire(ctx, "s1", lease("d2", t0.Add(time.Hour)), t0, 3)
+	var owned *daemon.OwnedError
+	if !errors.As(err, &owned) || owned.Session != "s1" || owned.Lease.Owner != owner || owned.Lease.Addr != "http://d1:8080" {
+		t.Fatalf("Acquire by another daemon = %v, want an OwnedError naming d1 and where it is", err)
+	}
+	if got, _ := st.Claim(ctx, "s1", "d2", t0, 10); len(got) != 0 {
+		t.Fatalf("a daemon that does not hold the session claimed %d", len(got))
+	}
+	if n, err := st.Acquire(ctx, "s1", lease(owner, t0.Add(time.Hour)), t0, 3); err != nil || n != 0 {
+		t.Fatalf("Acquire by the owner = %d, %v; want it kept, nothing put back", n, err)
+	}
+	if _, err := st.Acquire(ctx, "nope", lease(owner, t0), t0, 3); !errors.Is(err, daemon.ErrNoSuchSession) {
+		t.Errorf("Acquire(unknown) = %v, want ErrNoSuchSession", err)
+	}
+
+	// Renewing: only what the daemon holds, and the answer says which.
+	kept, err := st.Renew(ctx, owner, []string{"s1", "nope"}, t0.Add(2*time.Hour))
+	if err != nil || !slices.Equal(kept, []string{"s1"}) {
+		t.Fatalf("Renew = %v, %v; want [s1]", kept, err)
+	}
+	if kept, _ := st.Renew(ctx, "d2", []string{"s1"}, t0.Add(time.Hour)); len(kept) != 0 {
+		t.Fatalf("another daemon renewed %v", kept)
+	}
+	if got, _ := st.LoadSession(ctx, "s1"); got.Lease.Owner != owner || !got.Lease.Until.Equal(t0.Add(2*time.Hour)) {
+		t.Fatalf("lease = %+v, want d1's, until t0+2h", got.Lease)
+	}
+
+	// Run out, it is anyone's, and the running event goes back.
+	later := t0.Add(3 * time.Hour)
+	if ready, _ := st.Ready(ctx, later, "d2", nil, 10); !slices.Equal(ready, []string{"s1"}) {
+		t.Fatalf("Ready for d2 once the lease ran out = %v, want the session left running", ready)
+	}
+	n, err := st.Acquire(ctx, "s1", lease("d2", later.Add(time.Hour)), later, 3)
+	if err != nil || n != 1 {
+		t.Fatalf("Acquire after the lease ran out = %d, %v; want it taken and the running event back", n, err)
+	}
+	if e := statusOf(t, st, running[0].ID); e.Status != daemon.EventPending {
+		t.Fatalf("the dead owner's event = %+v, want pending", e)
+	}
+	if got, _ := st.Claim(ctx, "s1", "d2", later, 10); len(got) != 1 || got[0].Attempts != 2 {
+		t.Fatalf("the new owner claimed %+v", got)
+	}
+	if kept, _ := st.Renew(ctx, owner, []string{"s1"}, later); len(kept) != 0 {
+		t.Fatal("the old owner still renews a session taken from it")
+	}
+
+	// Released, it is anyone's at once.
+	if err := st.Release(ctx, "d2", []string{"s1"}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := st.LoadSession(ctx, "s1"); got.Lease.Owner != "" {
+		t.Fatalf("after Release the session is held by %+v", got.Lease)
+	}
+	if _, err := st.Acquire(ctx, "s1", lease("d3", later.Add(time.Hour)), later, 3); err != nil {
+		t.Fatalf("Acquire of a released session = %v", err)
+	}
+}
+
+// A daemon that lost a session writes nothing of it: not a save, not a
+// settlement, and a refused settlement changes nothing at all.
+func writesAreFenced(t *testing.T, st daemon.Store) {
+	create(t, st, record("s1"))
+	e := enqueue(t, st, message("s1", "hi", t0))
+	running, _ := st.Claim(ctx, "s1", owner, t0, 10)
+	if len(running) != 1 {
+		t.Fatal("not claimed")
+	}
+	later := t0.Add(25 * time.Hour)
+	if _, err := st.Acquire(ctx, "s1", lease("d2", later.Add(time.Hour)), later, 3); err != nil {
+		t.Fatal(err)
+	}
+
+	stale := record("s1") // d1's
+	stale.Answer = "late"
+	if err := st.SaveSession(ctx, stale); !errors.Is(err, daemon.ErrOwned) {
+		t.Fatalf("SaveSession by the old owner = %v, want ErrOwned", err)
+	}
+	err := st.Settle(ctx, daemon.Settlement{Session: stale, Done: []int64{e.ID},
+		Outbox: []daemon.Message{{Session: "s1", Kind: daemon.MessageReply, Text: "late", Created: later}}})
+	if !errors.Is(err, daemon.ErrOwned) {
+		t.Fatalf("Settle by the old owner = %v, want ErrOwned", err)
+	}
+	if got, _ := st.LoadSession(ctx, "s1"); got.Answer == "late" {
+		t.Fatal("the old owner's record was written")
+	}
+	if got := statusOf(t, st, e.ID); got.Status == daemon.EventDone {
+		t.Fatal("the old owner's settlement settled the event")
+	}
+	if msgs, _ := st.Outbox(ctx, daemon.OutboxFilter{Session: "s1"}); len(msgs) != 0 {
+		t.Fatalf("the old owner's settlement posted %+v", msgs)
+	}
+
+	// The new owner writes; a record naming no owner is written as before.
+	fresh := record("s1")
+	fresh.Lease = daemon.Lease{Owner: "d2"}
+	fresh.Answer = "now"
+	if err := st.SaveSession(ctx, fresh); err != nil {
+		t.Fatalf("SaveSession by the owner = %v", err)
+	}
+	anyone := record("s1")
+	anyone.Lease = daemon.Lease{}
+	if err := st.SaveSession(ctx, anyone); err != nil {
+		t.Fatalf("SaveSession naming no owner = %v", err)
+	}
+}
+
+// Lead: whoever asks first leads, and goes on leading.
+func lead(t *testing.T, st daemon.Store) {
+	for range 2 {
+		if ok, err := st.Lead(ctx, "deliver", owner, time.Now().Add(time.Hour)); err != nil || !ok {
+			t.Fatalf("Lead = %v, %v; want the first to ask to lead, and keep leading", ok, err)
+		}
 	}
 }
 
@@ -503,7 +654,7 @@ func eventsNewestFirst(t *testing.T, st daemon.Store) {
 	a1 := enqueue(t, st, message("a", "1", t0))
 	b1 := enqueue(t, st, message("b", "1", t0))
 	a2 := enqueue(t, st, message("a", "2", t0))
-	st.Claim(ctx, "a", t0, 1)
+	st.Claim(ctx, "a", owner, t0, 1)
 
 	all, _ := st.Events(ctx, daemon.EventFilter{})
 	if !slices.Equal(ids(all), []int64{a2.ID, b1.ID, a1.ID}) {

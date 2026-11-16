@@ -44,6 +44,11 @@ const (
 	// DefaultAttempts is how many times an event is tried before it fails.
 	DefaultAttempts = 3
 
+	// DefaultLease is how long a daemon's hold on a session lasts without
+	// being renewed: how long the sessions of a daemon that died wait before
+	// another takes them over. Renewed every third of it.
+	DefaultLease = 30 * time.Second
+
 	// DefaultRetryDelay is the backoff before an event's second try; it
 	// doubles for each try after.
 	DefaultRetryDelay = 10 * time.Second
@@ -98,7 +103,26 @@ type ManagerConfig struct {
 	Build func(SessionOptions) (*core.Agent, error)
 
 	// Store keeps everything. Default: a [MemoryStore].
+	//
+	// Several Managers may share one — daemons on several machines, one
+	// Postgres. Each session is run by one of them at a time; see
+	// [Store.Acquire].
 	Store Store
+
+	// Name is this daemon's, among those sharing the Store: unique, and the
+	// same when it starts again, so that it takes back at once the sessions
+	// it was running when it stopped. Default: one made up at random, whose
+	// sessions wait out Lease after a crash before another daemon takes them.
+	Name string
+
+	// Addr is where this daemon answers HTTP, as another daemon sharing the
+	// Store would reach it — "http://10.0.0.5:8080" — to forward it the
+	// requests for the sessions it runs. Optional; see [OwnedError].
+	Addr string
+
+	// Lease is how long a hold on a session lasts unrenewed. Default
+	// DefaultLease.
+	Lease time.Duration
 
 	// Limits caps ONE TURN. A long conversation is bounded per exchange; a
 	// cumulative cap would kill a session mid-sentence on its fourth question
@@ -201,15 +225,23 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 	if cfg.RetryDelay <= 0 {
 		cfg.RetryDelay = DefaultRetryDelay
 	}
+	if cfg.Lease <= 0 {
+		cfg.Lease = DefaultLease
+	}
+	if cfg.Name == "" {
+		cfg.Name = "wombatd-" + newID()[:12]
+	}
 
+	// The turns this daemon was running when it last stopped, under this
+	// name, died with it; nobody else's are touched.
 	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
-	n, err := cfg.Store.Recover(ctx, cfg.Attempts)
+	n, err := cfg.Store.Recover(ctx, cfg.Name, cfg.Attempts)
 	cancel()
 	if err != nil {
 		return nil, fmt.Errorf("daemon: recovering the inbox: %w", err)
 	}
 	if n > 0 {
-		cfg.Logger.Info("events a stopped daemon left running are back in the inbox", "events", n)
+		cfg.Logger.Info("events this daemon left running when it stopped are back in the inbox", "events", n)
 	}
 
 	m := &Manager{
@@ -224,10 +256,11 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 		posted:   make(chan struct{}),
 	}
 	m.ctx, m.cancel = context.WithCancel(context.Background())
-	m.loops.Add(3)
+	m.loops.Add(4)
 	go m.work()
 	go m.schedule()
 	go m.sweep()
+	go m.renew()
 	if cfg.Deliver != nil {
 		m.loops.Add(1)
 		go m.deliver()
@@ -251,12 +284,15 @@ func (m *Manager) create(ctx context.Context, opts SessionOptions, thread string
 	if err != nil {
 		return nil, fmt.Errorf("daemon: building the agent for this session: %w", err)
 	}
+	now := time.Now()
 	s := m.newSession(SessionRecord{
 		Version: RecordVersion, ID: newID(), Thread: thread, Options: opts,
-		Created: time.Now(), State: Idle,
+		Created: now, State: Idle, Lease: m.leaseAt(now),
 	}, agent)
 	s.updated = s.created
-	if err := m.store.CreateSession(ctx, s.record()); err != nil {
+	rec := s.record()
+	rec.Lease = m.leaseAt(now) // made here, so held here
+	if err := m.store.CreateSession(ctx, rec); err != nil {
 		return nil, err
 	}
 	m.mu.Lock()
@@ -273,7 +309,9 @@ func (m *Manager) create(ctx context.Context, opts SessionOptions, thread string
 // workspace is gone, its options are no longer allowed.
 var errBuild = errors.New("daemon: cannot rebuild the session's agent")
 
-// Get returns a session, loading it from the store if it is not in memory.
+// Get returns a session, loading it from the store if it is not in memory —
+// and taking it, so that this daemon runs it from now on. A session another
+// daemon runs is an *[OwnedError], which names that daemon.
 func (m *Manager) Get(ctx context.Context, id string) (*Session, error) {
 	m.mu.Lock()
 	if m.closed {
@@ -286,6 +324,31 @@ func (m *Manager) Get(ctx context.Context, id string) (*Session, error) {
 	}
 	m.mu.Unlock()
 
+	// Held first, loaded after: what is loaded is then what the last owner
+	// left, and no other daemon can change it until this one lets go.
+	now := time.Now()
+	n, err := m.store.Acquire(ctx, id, m.leaseAt(now), now, m.cfg.Attempts)
+	if err != nil {
+		return nil, err
+	}
+	if n > 0 {
+		m.cfg.Logger.Info("took over a session whose daemon stopped; its events are back in the inbox", "session", id, "events", n)
+	}
+	s, err := m.load(ctx, id)
+	if err != nil {
+		m.mu.Lock()
+		_, loaded := m.sessions[id] // by a Get that raced this one, and won
+		m.mu.Unlock()
+		if !loaded {
+			m.release(id)
+		}
+		return nil, err
+	}
+	return s, nil
+}
+
+// load builds a session this daemon now holds from its record.
+func (m *Manager) load(ctx context.Context, id string) (*Session, error) {
 	rec, err := m.store.LoadSession(ctx, id)
 	if err != nil {
 		return nil, err
@@ -349,7 +412,7 @@ func (m *Manager) List(ctx context.Context) ([]SessionInfo, error) {
 			out = append(out, s.Info())
 			continue
 		}
-		if rec.State == Running {
+		if rec.State == Running && !m.heldElsewhere(rec.Lease) {
 			rec = interrupted(rec)
 		}
 		out = append(out, infoOf(rec))
@@ -440,53 +503,112 @@ func (m *Manager) Receive(ctx context.Context, in Inbound) (Event, bool, error) 
 		}
 	}
 
-	var s *Session
-	var err error
+	// The session is not taken: an event goes in its inbox, and whichever
+	// daemon runs it — this one, or another — takes it from there.
+	id := in.Session
 	made := false
+	var err error
 	switch {
 	case in.Session != "":
-		s, err = m.Get(ctx, in.Session)
 	case in.Thread != "":
-		s, made, err = m.threadSession(ctx, in.Thread, in.Options)
+		id, made, err = m.threadSession(ctx, in.Thread, in.Options)
 	default:
-		s, err = m.create(ctx, in.Options, "")
-		made = true
+		var s *Session
+		if s, err = m.create(ctx, in.Options, ""); err == nil {
+			id, made = s.id, true
+		}
 	}
 	if err != nil {
 		return Event{}, false, err
 	}
-	if s.Info().State == Done {
+	if state, err := m.stateOf(ctx, id); err != nil {
+		return Event{}, false, err
+	} else if state == Done {
 		return Event{}, false, ErrDone
 	}
 	e, created, err := m.enqueue(ctx, Event{
-		Session: s.id, Kind: in.Kind, Source: in.Source, From: in.From, DedupKey: in.DedupKey, Payload: in.Payload,
+		Session: id, Kind: in.Kind, Source: in.Source, From: in.From, DedupKey: in.DedupKey, Payload: in.Payload,
 	})
 	if err == nil && !created && made {
 		// A delivery of an event received before, which went to the session
 		// it went to then: the one just made for it has nothing in it.
-		_ = m.Delete(ctx, s.id)
+		_ = m.Delete(ctx, id)
 	}
 	return e, created, err
 }
 
-// threadSession finds the session tied to thread, or makes it.
-func (m *Manager) threadSession(ctx context.Context, thread string, opts SessionOptions) (*Session, bool, error) {
+// stateOf is where a session stands; see [Manager.Peek].
+func (m *Manager) stateOf(ctx context.Context, id string) (State, error) {
+	info, err := m.Peek(ctx, id)
+	return info.State, err
+}
+
+// Peek is a session's info, from memory if this daemon runs it and from the
+// store if not — without taking it.
+func (m *Manager) Peek(ctx context.Context, id string) (SessionInfo, error) {
+	m.mu.Lock()
+	s, ok := m.sessions[id]
+	m.mu.Unlock()
+	if ok {
+		return s.Info(), nil
+	}
+	rec, err := m.store.LoadSession(ctx, id)
+	if err != nil {
+		return SessionInfo{}, err
+	}
+	if rec.State == Running && !m.heldElsewhere(rec.Lease) {
+		rec = interrupted(rec)
+	}
+	return infoOf(rec), nil
+}
+
+// SendAs puts a message in a session's inbox, for its next turn, wherever the
+// session runs: [Session.SendAs] when this daemon holds it, and otherwise
+// straight into the store, where the daemon that runs the session takes it —
+// or, should that one have died, the one that takes the session over. A
+// message needs nothing of the session's memory, so it is never refused for
+// where the session is.
+func (m *Manager) SendAs(ctx context.Context, session, from, prompt string) (Event, error) {
+	m.mu.Lock()
+	s, ok := m.sessions[session]
+	m.mu.Unlock()
+	if ok {
+		return s.SendAs(ctx, from, prompt)
+	}
+	if err := CheckFrom(from); err != nil {
+		return Event{}, err
+	}
+	if state, err := m.stateOf(ctx, session); err != nil {
+		return Event{}, err
+	} else if state == Done {
+		return Event{}, ErrDone
+	}
+	payload, _ := json.Marshal(MessagePayload{Text: prompt})
+	e, _, err := m.enqueue(ctx, Event{Session: session, Kind: KindMessage, Source: SourceAPI, From: from, Payload: payload})
+	return e, err
+}
+
+// threadSession finds the session tied to thread, or makes it, and says
+// which it did.
+func (m *Manager) threadSession(ctx context.Context, thread string, opts SessionOptions) (string, bool, error) {
 	for range 2 {
 		id, err := m.store.SessionByThread(ctx, thread)
 		if err == nil {
-			s, err := m.Get(ctx, id)
-			return s, false, err
+			return id, false, nil
 		}
 		if !errors.Is(err, ErrNoSuchSession) {
-			return nil, false, err
+			return "", false, err
 		}
 		s, err := m.create(ctx, opts, thread)
+		if err == nil {
+			return s.id, true, nil
+		}
 		if !errors.Is(err, ErrThreadTaken) {
-			return s, err == nil, err
+			return "", false, err
 		}
 		// Another event for the thread made its session first: use that.
 	}
-	return nil, false, fmt.Errorf("%w: %q", ErrThreadTaken, thread)
+	return "", false, fmt.Errorf("%w: %q", ErrThreadTaken, thread)
 }
 
 // enqueue puts an event in the inbox and wakes the worker.
@@ -523,11 +645,11 @@ func (m *Manager) AddTimer(ctx context.Context, t Timer) (Timer, error) {
 	case t.Every < 0 || (t.Every > 0 && t.Every < MinEvery):
 		return Timer{}, fmt.Errorf("%w: a timer repeats every %v at the most often", ErrBadRequest, MinEvery)
 	}
-	s, err := m.Get(ctx, t.Session)
+	state, err := m.stateOf(ctx, t.Session)
 	if err != nil {
 		return Timer{}, err
 	}
-	if s.Info().State == Done {
+	if state == Done {
 		return Timer{}, ErrDone
 	}
 	active, err := m.store.Timers(ctx, TimerFilter{Session: t.Session, Status: TimerActive})
@@ -573,7 +695,9 @@ func (m *Manager) Outbox(ctx context.Context, f OutboxFilter, wait time.Duration
 		if err != nil || len(msgs) > 0 || left <= 0 {
 			return msgs, err
 		}
-		t := time.NewTimer(left)
+		// Woken by a message this daemon posts, or at the next poll for one
+		// another daemon sharing the store did.
+		t := time.NewTimer(min(left, m.cfg.Poll))
 		select {
 		case <-posted:
 		case <-t.C:
@@ -632,7 +756,39 @@ func (m *Manager) Close() error {
 		s.close()
 	}
 	m.turns.Wait()
+	// Settled, every one: another daemon may take them at once.
+	ids := make([]string, 0, len(live))
+	for _, s := range live {
+		ids = append(ids, s.id)
+	}
+	m.release(ids...)
 	return nil
+}
+
+// Name is this daemon's name among those sharing its store.
+func (m *Manager) Name() string { return m.cfg.Name }
+
+// leaseAt is the hold this daemon takes, or renews, at now.
+func (m *Manager) leaseAt(now time.Time) Lease {
+	return Lease{Owner: m.cfg.Name, Addr: m.cfg.Addr, Until: now.Add(m.cfg.Lease)}
+}
+
+// heldElsewhere reports a lease another daemon holds, live now.
+func (m *Manager) heldElsewhere(l Lease) bool {
+	return l.Owner != "" && l.Owner != m.cfg.Name && l.Until.After(time.Now())
+}
+
+// release gives up this daemon's hold on sessions, best effort: a hold not
+// given up runs out on its own.
+func (m *Manager) release(ids ...string) {
+	if len(ids) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
+	defer cancel()
+	if err := m.store.Release(ctx, m.cfg.Name, ids); err != nil {
+		m.cfg.Logger.Warn("daemon: releasing sessions failed; their leases will run out", "sessions", len(ids), "err", err)
+	}
 }
 
 // Uptime is how long this Manager has been running, for GET /api/health.
@@ -660,6 +816,11 @@ func (m *Manager) settle(s Settlement) error {
 	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
 	defer cancel()
 	err := m.store.Settle(ctx, s)
+	if errors.Is(err, ErrOwned) {
+		m.cfg.Logger.Warn("daemon: another daemon took this session over while its turn ran; the turn is dropped, and its events run there",
+			"session", s.Session.ID)
+		return err
+	}
 	if err != nil && !errors.Is(err, ErrNoSuchSession) {
 		m.cfg.Logger.Warn("daemon: settling a turn failed; its events will run again when the daemon restarts",
 			"session", s.Session.ID, "err", err)
@@ -675,7 +836,7 @@ func (m *Manager) settle(s Settlement) error {
 func (m *Manager) save(rec SessionRecord) {
 	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
 	defer cancel()
-	if err := m.store.SaveSession(ctx, rec); err != nil && !errors.Is(err, ErrNoSuchSession) {
+	if err := m.store.SaveSession(ctx, rec); err != nil && !errors.Is(err, ErrNoSuchSession) && !errors.Is(err, ErrOwned) {
 		m.cfg.Logger.Warn("daemon: saving a session failed", "session", rec.ID, "err", err)
 	}
 }

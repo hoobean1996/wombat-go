@@ -265,7 +265,7 @@ curl -s localhost:8080/api/timers -H 'Content-Type: application/json' -d '{
   "session_id": "<id>", "note": "check whether the fix went out", "at": "2026-11-16T09:00:00Z"}'
 ```
 
-**持久保存。** 使用默认的 `store.driver: memory` 时，wombatd 一停止，所有数据都会丢失。使用 `postgres` 时，数据保存在四张表中——`sessions`、`inbox`、`timers` 和 `outbox`——wombatd 首次启动时会创建它们，重启后从中断处继续。一个 schema 只能对应一个 wombatd：第二个使用同一 schema 的实例会在启动时被拒绝（在 DSN 后加上 `?search_path=name`，可以让每个实例使用各自的 schema）。本地数据库可以这样启动：
+**持久保存。** 使用默认的 `store.driver: memory` 时，wombatd 一停止，所有数据都会丢失。使用 `postgres` 时，数据保存在四张表中——`sessions`、`inbox`、`timers` 和 `outbox`——wombatd 首次启动时会创建它们，重启后从中断处继续。本地数据库可以这样启动：
 
 ```bash
 make pg-up        # 在 podman 中运行 Postgres 17，监听 127.0.0.1:55432
@@ -276,6 +276,16 @@ store:
   driver: postgres
   dsn: postgres://wombat:wombat@127.0.0.1:55432/wombat
 ```
+
+**多个 wombatd 共用一个 Postgres。** 同一个 schema 上可以跑任意多个 wombatd，前面挂不挂负载均衡都行。规则来自那篇文章：每个 inbox 同时只有一个 worker 在处理，而不是每个数据库只能有一个守护进程。
+
+- **每个会话有一个所属实例。** 创建它或最先加载它的 wombatd 持有它的租约，只要会话还在内存里就会续约，也只有它会运行这个会话的轮次。正在运行的一轮、实时事件流、插话、取消，都在这个实例的内存里。
+- **任何实例都能接任何请求。** 某个会话的请求如果落到了不持有它的实例上，会被转发给持有它的实例（事件流也一样），地址是对方公布的 `server.advertise`（默认取 `server.addr`，前提是它写了主机地址）。发消息连转发都不需要：从哪个实例进来，就直接放进这个会话的 inbox。
+- **挂掉的实例会被接管。** 它的租约 30 秒后过期。之后，哪个实例先被问到它的某个会话、或者发现这个会话有待处理的事件，就接管这个会话，把挂掉的实例没跑完的事件放回去重新执行。万一挂掉的实例在一轮中途又活过来，它迟到的写入会被拒绝。在这段时间里，对这个会话的请求会返回 `503`，kind 为 `elsewhere`。
+- **名字。** 每个实例用 `daemon.name` 运行（默认是主机名加端口）。用同一个名字重启，会立刻拿回它之前持有的会话。第二个实例如果用了已被占用的名字，会在启动时被拒绝。
+- **只做一次的事只做一次。** 计时器只触发一次；outbox 的 webhook 同一时间只由一个实例按顺序投递，也就是拿到投递锁的那个实例。
+
+会话可能从一个实例转到另一个：持有它的实例空闲时把它放掉，或者挂了。所以部署多个实例时，`tools.working_dir` 要放在所有实例都能访问的存储上，否则 Agent 会发现自己写的文件在别的机器上。
 
 <a id="zh-http"></a>
 
@@ -569,5 +579,6 @@ make ui-dev       # 以热重载方式运行网页界面，连接正在运行的
 | 会话一直停在 `approving` | 它在等待决定：在网页界面里处理审批卡片，或者先 `GET /api/sessions/{id}/approvals`，再 POST 一个决定。在此之前它不会处理别的任何事情 |
 | `/` 显示“built without its web UI” | 先执行 `make ui`，再执行 `make bin`（或者直接 `make serve`）。构建网页界面需要 npm，二进制文件运行时不需要 |
 | 网页界面要求输入 token | `wombatd.yaml` 中设置了 `server.token`；输入一次即可，该浏览器会记住它 |
-| `another daemon is running on this schema` | 另一个 wombatd 正在使用这个 Postgres schema。停掉它，或者在 `store.dsn` 中加上 `?search_path=name`，给这个实例单独的 schema |
+| `another daemon is running on this schema under that name` | 同一个 schema 上已经有一个 wombatd 用了相同的 `daemon.name`。给每个实例起不同的名字（默认是主机名加端口） |
+| 返回 `503`，kind 为 `elsewhere` | 这个会话由另一个 wombatd 运行，而它现在联系不上：可能已经挂了（它的 30 秒租约过期后，会话会被其他实例接管），或者没有配置地址（`server.advertise`） |
 | 消息在收件箱里越积越多 | 查看 `GET /api/inbox?session=…` 和日志：等待决定的会话不会执行别的任何事情，而且 `daemon.max_runs` 限制了同时执行的轮数 |

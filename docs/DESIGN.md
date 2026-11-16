@@ -603,9 +603,14 @@ postgres` — in four tables, `sessions`, `inbox`, `timers` and `outbox`,
 which `pkg/store/postgres` creates on the first start. Both pass one
 conformance suite, `pkg/daemon/storetest`, so the daemon's tests against the
 memory store stand for Postgres too; `make pg-up` starts one in podman and
-`make test-pg` runs the suite and a restart test against it. One wombatd to a
-schema: a second is refused at the start, because the first thing a daemon does
-is put back the events a dead one left running. Transcripts are `json`, not
+`make test-pg` runs the suite and a restart test against it. Any number of
+wombatd can share a schema. The lock is per inbox, not per database: a session
+is run by the daemon holding its lease. A daemon that dies stops renewing, and
+whoever takes a session over once the lease runs out puts back what was left
+running. Writes are fenced by the lease, so a daemon that comes back to life
+mid-turn cannot write over the one that took over. A request reaching the wrong
+daemon is forwarded to the right one, since what a session holds in memory (the
+turn in flight, the stream) is only there. Transcripts are `json`, not
 `jsonb`, so a tool call's input comes back with its keys in the order the
 model wrote them — a prompt cache that matches a transcript byte for byte
 would otherwise miss on every turn after a reload.
