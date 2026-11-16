@@ -89,6 +89,7 @@ type toolsConfig struct {
 	Confine        bool     `yaml:"confine"`
 	ConfineNetwork string   `yaml:"confine_network"`
 	DenyRead       []string `yaml:"deny_read"`
+	Disable        []string `yaml:"disable"`
 	MCP            string   `yaml:"mcp"`
 	SkillsDir      string   `yaml:"skills_dir"`
 	Media          bool     `yaml:"media"`
@@ -277,6 +278,11 @@ func (c config) validate() []error {
 	}
 	if len(c.Tools.DenyRead) > 0 && !c.Tools.Confine {
 		bad("tools.deny_read", "is applied by tools.confine, which is off")
+	}
+	for _, name := range c.Tools.Disable {
+		if strings.TrimSpace(name) == "" {
+			bad("tools.disable", "holds an empty name")
+		}
 	}
 
 	if c.Turn.BudgetUSD < 0 {

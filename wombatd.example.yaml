@@ -193,6 +193,12 @@ tools:
   # user wombatd runs as, so its permissions cannot keep them out.
   deny_read: []
 
+  # Tools no session is offered, whatever its permission, Full Access
+  # included: built-in ones (write_file, str_replace, bash, http_get, ...)
+  # or an MCP server's (<server>__<tool>). A name that is no tool's keeps
+  # wombatd from starting, so a typo cannot leave the tool on offer.
+  disable: []
+
   # A JSON file of MCP servers, in the usual {"mcpServers": {...}} form,
   # whose tools every session is offered — named <server>__<tool>, and held
   # to the same permission as the built-in ones. The servers are started once

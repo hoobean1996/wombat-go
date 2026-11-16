@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"path/filepath"
+	"slices"
+	"strings"
 	"time"
 
 	"wombat/pkg/core"
@@ -20,6 +23,7 @@ import (
 	"wombat/pkg/core/skill"
 	"wombat/pkg/core/tape"
 	"wombat/pkg/core/tool"
+	"wombat/pkg/core/tool/builtin"
 	"wombat/pkg/core/trace"
 )
 
@@ -99,13 +103,44 @@ func newFactory(cfg config, rec *recorders, logger *slog.Logger) (*factory, erro
 		}
 	}
 	// Last, because it starts processes: nothing after it can fail and leave
-	// them running.
+	// them running, except the check below, which stops them.
 	if cfg.Tools.MCP != "" {
 		if f.mcp, err = connectMCP(cfg.Tools.MCP, logger); err != nil {
 			return nil, err
 		}
 	}
+	if err := f.checkDisabled(); err != nil {
+		f.close()
+		return nil, err
+	}
 	return f, nil
+}
+
+// checkDisabled refuses a tools.disable entry that names no tool: a
+// misspelt name would leave on offer the very tool it meant to take away.
+// The names are the built-in tools' and the MCP servers'.
+func (f *factory) checkDisabled() error {
+	if len(f.cfg.Tools.Disable) == 0 {
+		return nil
+	}
+	known := map[string]bool{}
+	for _, d := range builtin.Default(builtin.Deps{}) {
+		known[d.Name] = true
+	}
+	known[builtin.ViewMedia(builtin.OSFS("")).Name] = true
+	for _, d := range f.mcp.Tools() {
+		known[d.Name] = true
+	}
+	var unknown []string
+	for _, name := range f.cfg.Tools.Disable {
+		if !known[name] {
+			unknown = append(unknown, fmt.Sprintf("%q", name))
+		}
+	}
+	if len(unknown) > 0 {
+		return fmt.Errorf("tools.disable: %s names no tool; the tools are %s", strings.Join(unknown, ", "), strings.Join(slices.Sorted(maps.Keys(known)), ", "))
+	}
+	return nil
 }
 
 // close stops what newFactory started. run defers it before the manager's

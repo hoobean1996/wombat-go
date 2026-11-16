@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"net/http"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -133,6 +134,12 @@ func (f *factory) agent(s session, r role) (*core.Agent, error) {
 	// Before the filter below, so a server's tools are held to the same
 	// capability rules as the built-in ones.
 	tools = append(tools, f.mcp.Tools()...)
+	// tools.disable: what no session is offered, under any policy, Full
+	// Access included. Before the delegate is made from this list, so a
+	// researcher cannot have them either.
+	if len(f.cfg.Tools.Disable) > 0 {
+		tools = tool.Filter(tools, func(d tool.Def) bool { return !slices.Contains(f.cfg.Tools.Disable, d.Name) })
+	}
 
 	// ask_user suspends the run, and this front end has somewhere to put the
 	// answer — a paused turn leaves the session Waiting and the next prompt is

@@ -216,7 +216,7 @@ take effect.
 | `daemon` | `poll`, `max_runs` (turns at once), `attempts` (tries per event), `idle` |
 | `outbox` | `webhook` (where each message is POSTed) and its `headers` |
 | `model` | `provider`, `name`, `base_url`, `api_key`, `proxy`, `headers`, `stream`, `max_tokens`, `system` |
-| `tools` | `working_dir`, `permission`, `full_access`, `confine`, `confine_network`, `deny_read`, `mcp`, `skills_dir`, `media`, `delegate` |
+| `tools` | `working_dir`, `permission`, `full_access`, `confine`, `confine_network`, `deny_read`, `disable`, `mcp`, `skills_dir`, `media`, `delegate` |
 | `turn` | `budget_usd`, `wall`, `max_iters`, `tool_parallelism`, `context_window`, `compact_at` |
 | `mode` | `build`, `plan` or `review` |
 | `done` | `check` (a command that must pass), `attempts`, `accept`, `regressions` |

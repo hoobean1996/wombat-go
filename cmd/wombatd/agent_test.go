@@ -520,6 +520,31 @@ func runAs(t *testing.T, f *factory, permission, prompt string) turnResult {
 // keeps the whole tool set and is asked about none of it: the command runs.
 // Not offered, the request gets the operator's policy, under which the same
 // command waits for a person. "off" stays out of a client's reach either way.
+// tools.disable takes a tool away from every session, whatever its policy:
+// Full Access does not bring it back.
+func TestADisabledToolIsOfferedToNoSession(t *testing.T) {
+	f, _ := testFactory(t, &scripted{turn: func(int, llm.Request) llm.Response { return say("ok") }}, func(c *config) {
+		c.Tools.FullAccess = true
+		c.Tools.Disable = []string{"write_file", "str_replace"}
+	})
+	for _, permission := range []string{"", "full", "readonly"} {
+		a, err := f.build(daemon.SessionOptions{Permission: permission})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var names []string
+		for _, d := range a.Tools(context.Background()) {
+			names = append(names, d.Name)
+		}
+		if slices.Contains(names, "write_file") || slices.Contains(names, "str_replace") {
+			t.Errorf("permission %q: %v still offers a disabled tool", permission, names)
+		}
+		if !slices.Contains(names, "view_file") || !slices.Contains(names, "bash") {
+			t.Errorf("permission %q: %v lost a tool nobody disabled", permission, names)
+		}
+	}
+}
+
 func TestFullAccessIsTheOperatorsToOffer(t *testing.T) {
 	touch := func(root string) *scripted {
 		return &scripted{turn: func(i int, _ llm.Request) llm.Response {

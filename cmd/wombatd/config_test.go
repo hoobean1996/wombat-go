@@ -65,6 +65,7 @@ func TestAConfigThatCannotMeanWhatItSaysIsRefused(t *testing.T) {
 		{"an unknown network", "tools:\n  confine_network: some\n", "tools.confine_network"},
 		{"a relative path to hide", "tools:\n  confine: true\n  deny_read: [secrets]\n", `tools.deny_read: "secrets" is not an absolute path`},
 		{"paths to hide, unconfined", "tools:\n  deny_read: [/etc/wombat]\n", "tools.deny_read: is applied by tools.confine, which is off"},
+		{"an empty tool to disable", "tools:\n  disable: [write_file, \"\"]\n", "tools.disable: holds an empty name"},
 		{"an unknown mode", "mode: plan-only\n", `mode: "plan-only" is not one of build, plan, review`},
 		{"compaction without a window", "turn:\n  compact_at: 0.8\n", "turn.context_window, which is not set"},
 		{"compaction past the window", "turn:\n  context_window: 100000\n  compact_at: 1.5\n", "not a fraction"},
@@ -123,6 +124,9 @@ func TestTheExampleConfigShowsEveryKeyAndItsDefault(t *testing.T) {
 	}
 	if len(cfg.Tools.DenyRead) == 0 {
 		cfg.Tools.DenyRead = nil // [] in the file, nil by default
+	}
+	if len(cfg.Tools.Disable) == 0 {
+		cfg.Tools.Disable = nil // [] in the file, nil by default
 	}
 	if !reflect.DeepEqual(cfg, want) {
 		t.Errorf("the example's values are not the defaults:\nexample  %+v\ndefaults %+v", cfg, want)

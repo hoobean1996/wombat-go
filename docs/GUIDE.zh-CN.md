@@ -201,7 +201,7 @@ wombatd 还会给每个会话的 Agent 提供守护进程自己的工具。任�
 | `daemon` | `poll`、`max_runs`（同时执行的轮数）、`attempts`（每个事件的尝试次数）、`idle` |
 | `outbox` | `webhook`（每条消息 POST 到的地址）及其 `headers` |
 | `model` | `provider`、`name`、`base_url`、`api_key`、`proxy`、`headers`、`stream`、`max_tokens`、`system` |
-| `tools` | `working_dir`、`permission`、`full_access`、`confine`、`confine_network`、`deny_read`、`mcp`、`skills_dir`、`media`、`delegate` |
+| `tools` | `working_dir`、`permission`、`full_access`、`confine`、`confine_network`、`deny_read`、`disable`、`mcp`、`skills_dir`、`media`、`delegate` |
 | `turn` | `budget_usd`、`wall`、`max_iters`、`tool_parallelism`、`context_window`、`compact_at` |
 | `mode` | `build`、`plan` 或 `review` |
 | `done` | `check`（必须通过的命令）、`attempts`、`accept`、`regressions` |

@@ -129,6 +129,24 @@ func TestNewFactory(t *testing.T) {
 
 // The recorders write what record asks for: the model's calls on the tape,
 // and on close, the trace rendered as a report.
+// A tools.disable entry has to name a tool: a misspelt one would leave the
+// tool it meant on offer, so wombatd does not start.
+func TestADisabledToolHasToBeATool(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := defaults()
+	cfg.Tools.WorkingDir = t.TempDir()
+	cfg.Tools.Disable = []string{"write_file", "edit_file"}
+	if _, err := newFactory(cfg, &recorders{}, logger); err == nil || !strings.Contains(err.Error(), `tools.disable: "edit_file" names no tool`) {
+		t.Fatalf("err = %v, want edit_file refused by name", err)
+	}
+	cfg.Tools.Disable = []string{"write_file", "str_replace", "view_media"}
+	f, err := newFactory(cfg, &recorders{}, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.close()
+}
+
 func TestRecordersKeepTheTapeAndRenderTheTrace(t *testing.T) {
 	dir := t.TempDir()
 	cfg := recordConfig{
