@@ -466,6 +466,15 @@ session's **inbox**, and what the agent has to say goes to an **outbox**.
   with a `dedup_key` is received once however often it is delivered, and an
   event about a `thread` — an issue, a chat thread — finds the session for
   that thread, or starts one.
+- **Who said what.** Every event says what it is (`kind`), where it came from
+  (`source`) and, when the sender knows, who sent it (`from`). A chat relayed
+  by a bridge is `"kind": "message"` with the payload `{"text": "..."}`, the
+  bridge's own `source` and the speaker's `from`. The model reads a direct
+  message — `source` `api`, no `from` — as plain text, and anything else in a
+  tag naming all three, so a webhook's payload does not pass for your
+  instruction, nor one speaker for another. The transcript stays exactly what
+  the model was sent; `GET /api/sessions/{id}/messages` returns `origins`
+  beside it, saying which events made which message.
 - **One turn at a time.** A worker takes a session's pending events, all of
   them, and runs one turn on them; what arrives meanwhile is the next turn's.
   `daemon.max_runs` caps turns across sessions.
@@ -494,7 +503,7 @@ An event from outside, about a thread, and a reminder for tomorrow morning:
 
 ```bash
 curl -s localhost:8080/api/events -H 'Content-Type: application/json' -d '{
-  "thread": "github:you/repo#12", "kind": "issue_comment", "source": "github",
+  "thread": "github:you/repo#12", "kind": "issue_comment", "source": "github", "from": "octocat",
   "dedup_key": "delivery-8f2c", "payload": {"body": "the build is red again"}}'
 curl -s localhost:8080/api/timers -H 'Content-Type: application/json' -d '{
   "session_id": "<id>", "note": "check whether the fix went out", "at": "2026-11-16T09:00:00Z"}'
@@ -526,16 +535,16 @@ store:
 
 | Method and path | Purpose |
 |---|---|
-| `POST /api/sessions` | Create a session with its first message: `{"prompt": "..."}`, and optionally `title`, `permission`, `workspace`, `model`, `max_iters` |
+| `POST /api/sessions` | Create a session with its first message: `{"prompt": "..."}`, and optionally `from`, `title`, `permission`, `workspace`, `model`, `max_iters` |
 | `GET /api/sessions` / `GET /api/sessions/{id}` | List sessions, newest first / one session |
 | `DELETE /api/sessions/{id}` | Cancel and forget a session, its timers and messages included |
 | `GET /api/sessions/{id}/events` | Server-Sent Events across every turn. Reconnect with `Last-Event-ID` to resume |
-| `GET /api/sessions/{id}/messages` | The transcript |
-| `POST /api/sessions/{id}/messages` | A message, for the next turn: `{"prompt": "..."}` |
+| `GET /api/sessions/{id}/messages` | The transcript, and beside it `origins`: for each message inbox events made, keyed by its index, the events' `kind`, `source` and `from` |
+| `POST /api/sessions/{id}/messages` | A message, for the next turn: `{"prompt": "...", "from": "..."}` — `from`, optional, names who said it |
 | `POST /api/sessions/{id}/steer` | A message for the turn that is still running |
 | `GET /api/sessions/{id}/approvals` | Calls waiting for a decision |
-| `POST /api/sessions/{id}/approvals/{use_id}` | Decide one: `{"allow": true}` |
-| `POST /api/events` | An event from outside: `{"session_id" or "thread", "kind", "source", "dedup_key", "payload"}` |
+| `POST /api/sessions/{id}/approvals/{use_id}` | Decide one: `{"allow": true, "from": "..."}` |
+| `POST /api/events` | An event from outside: `{"session_id" or "thread", "kind", "source", "from", "dedup_key", "payload"}` |
 | `GET /api/inbox` | Events, newest first: `?session=`, `?status=`, `?limit=` |
 | `GET /api/outbox` | Messages, oldest first: `?after=`, `?wait=` (at most 60s), `?session=`, `?status=`, `?limit=` |
 | `POST /api/outbox/{id}/ack` | Mark a message handled |

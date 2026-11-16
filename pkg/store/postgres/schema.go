@@ -81,6 +81,12 @@ var migrations = []string{
 	CREATE INDEX outbox_pending ON outbox (id) WHERE status = 'pending';
 	CREATE INDEX outbox_session ON outbox (session_id, id);
 	`,
+
+	// 2: who sent an event, beside where it came from: daemon.Event.From.
+	// "sender" because FROM is SQL's.
+	`
+	ALTER TABLE inbox ADD COLUMN sender text NOT NULL DEFAULT '';
+	`,
 }
 
 // migrate brings the schema up to date. A transaction-scoped advisory lock

@@ -9,17 +9,17 @@
 //
 //	GET    /api/health                            {status, version, uptime_sec}
 //	GET    /api/config                            what this server offers
-//	POST   /api/sessions                          create, with its first message: {prompt, ...}
+//	POST   /api/sessions                          create, with its first message: {prompt, from, ...}
 //	GET    /api/sessions                          list, newest first
 //	GET    /api/sessions/{id}                     one SessionInfo
 //	DELETE /api/sessions/{id}                     cancel and forget, timers and all
 //	GET    /api/sessions/{id}/events              SSE, Last-Event-ID resume
-//	GET    /api/sessions/{id}/messages            the transcript
-//	POST   /api/sessions/{id}/messages            a message, for the next turn
+//	GET    /api/sessions/{id}/messages            the transcript, and where its messages came from
+//	POST   /api/sessions/{id}/messages            a message, for the next turn: {prompt, from}
 //	POST   /api/sessions/{id}/steer               a message for the turn in progress
 //	GET    /api/sessions/{id}/approvals           what is waiting for a decision
-//	POST   /api/sessions/{id}/approvals/{use_id}  {"allow": true|false}
-//	POST   /api/events                            an event from outside: a webhook, an alert
+//	POST   /api/sessions/{id}/approvals/{use_id}  {"allow": true|false, "from": "..."}
+//	POST   /api/events                            an event from outside: a webhook, an alert, a relayed chat
 //	GET    /api/inbox                             events, newest first; ?session= ?status=
 //	GET    /api/outbox                            messages, oldest first; ?after= ?wait=
 //	POST   /api/outbox/{id}/ack                   a message handled
@@ -33,6 +33,33 @@
 // arrives on the session's event stream as it happens, and in the outbox,
 // which a client long-polls — GET /api/outbox?after=<last id>&wait=30s — and
 // acks.
+//
+// # Who said what
+//
+// Every event in the inbox says what it is, where it came from and, when the
+// sender knows, who sent it: kind, source and from. A message is kind
+// "message", with the payload {"text": "..."}. Posted to
+// /api/sessions/{id}/messages it is source "api"; a bridge relaying a chat
+// posts it to /api/events with a source of its own ("slack") and from naming
+// the person. A decision is kind "approval", and its from is who decided.
+//
+// The model is told all three. A direct message — source "api", no from — on
+// its own reads as plain text, the conversation it is. Anything else arrives
+// in a tag that names its kind, source and from, so a webhook's payload does
+// not pass for an instruction, nor one speaker for another.
+//
+// The transcript is kept exactly as the model was sent it, so it says where a
+// message came from only as prose for the model. GET
+// /api/sessions/{id}/messages returns, beside it, origins: for each message
+// inbox events made, keyed by its index in messages, those events —
+//
+//	{"messages": [...],
+//	 "origins": {"0": [{"event": 1, "kind": "message", "source": "api", "at": "…"}],
+//	             "4": [{"event": 9, "kind": "message", "source": "slack", "from": "alice", "at": "…"}]}}
+//
+// A message no event made — the model's, a tool's result, a steer — has
+// none. A turn's turn_started frame carries the origins of the message it
+// starts with, for a client rendering the conversation live.
 //
 // Sequence numbers on a session's stream are global to the SESSION, not to
 // the turn. A client that reconnects across a turn boundary therefore resumes
@@ -69,12 +96,29 @@ import (
 // hand looks like.
 type CreateRequest struct {
 	Prompt string `json:"prompt"`
+
+	// From names who is talking, for a session more than one person talks
+	// to; see [SendRequest].
+	From string `json:"from,omitempty"`
+
 	daemon.SessionOptions
 }
 
-// SendRequest is the body of POST /api/sessions/{id}/messages — a message for
-// the session's next turn — and of POST /api/sessions/{id}/steer.
+// SendRequest is the body of POST /api/sessions/{id}/messages: a message for
+// the session's next turn.
 type SendRequest struct {
+	Prompt string `json:"prompt"`
+
+	// From names who said it, when more than one person talks to the
+	// session: the model is told, and the transcript's origins keep it.
+	// Optional; a short line of text.
+	From string `json:"from,omitempty"`
+}
+
+// SteerRequest is the body of POST /api/sessions/{id}/steer: a message for
+// the turn in progress. It has no From: it goes straight into the running
+// turn rather than through the inbox, so there is no event to say it on.
+type SteerRequest struct {
 	Prompt string `json:"prompt"`
 }
 
@@ -88,6 +132,10 @@ type SendRequest struct {
 // delivered by a link somebody was tricked into following.
 type ResolveRequest struct {
 	Allow *bool `json:"allow"`
+
+	// From names who decided, kept with the call's result in the
+	// transcript's origins. Optional.
+	From string `json:"from,omitempty"`
 }
 
 // Accepted is the body of a 202: the event the inbox took, and the session
@@ -105,11 +153,16 @@ type Accepted struct {
 // a chat thread; made, with Options, the first time — or, with neither, to a
 // new session. A sender that may deliver twice sets DedupKey: the same key
 // from the same Source is received once.
+//
+// A bridge relaying a chat posts each message as Kind "message", with the
+// payload {"text": "..."}, its own Source ("slack"), and From naming the
+// person; see "Who said what" in the package documentation.
 type EventRequest struct {
 	SessionID string          `json:"session_id,omitempty"`
 	Thread    string          `json:"thread,omitempty"`
 	Kind      string          `json:"kind"`
 	Source    string          `json:"source,omitempty"`
+	From      string          `json:"from,omitempty"`
 	DedupKey  string          `json:"dedup_key,omitempty"`
 	Payload   json.RawMessage `json:"payload,omitempty"`
 

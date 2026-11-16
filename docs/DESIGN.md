@@ -555,6 +555,14 @@ inbox, and what the agent has to say goes to an outbox.
   dedup key is received once however often it is delivered, and an event about
   a thread — an issue, a chat thread — finds the session for that thread, or
   starts one.
+- **Who said what.** An event carries what it is, where it came from and, when
+  the sender knows, who sent it: `kind`, `source`, `from`. The model reads a
+  direct message as plain text and anything else in a tag naming all three —
+  a webhook's payload is not the user's instruction, and a chat relayed from
+  elsewhere has more than one speaker. The transcript stays byte for byte what
+  the model was sent, for the prompt cache, so where its messages came from is
+  kept beside it rather than in it: the session's origins, keyed by message
+  index, renumbered when a compaction folds the past away.
 - **One turn at a time.** A worker takes a session's pending events, all of
   them, and runs one turn on them; what arrives meanwhile is the next turn's.
   A turn the provider fell over in, or that a restart cut short, runs again,
@@ -573,12 +581,13 @@ inbox, and what the agent has to say goes to an outbox.
   `outbox.webhook` set, wombatd POSTs each message itself, in order.
 
 ```
-POST   /api/sessions                          {"prompt": …} → a session, and its first message
-POST   /api/sessions/{id}/messages            {"prompt": …} → a message, for the next turn
+POST   /api/sessions                          {"prompt": …, "from"?} → a session, and its first message
+POST   /api/sessions/{id}/messages            {"prompt": …, "from"?} → a message, for the next turn
+GET    /api/sessions/{id}/messages            the transcript, and its messages' origins
 GET    /api/sessions/{id}/events              SSE across every turn, honours Last-Event-ID
 POST   /api/sessions/{id}/steer               {"prompt": …} → a message for the turn still running
-POST   /api/sessions/{id}/approvals/{use_id}  {"allow": true|false} → decide a waiting call
-POST   /api/events                            {"thread"?, "kind", "source", "dedup_key"?, "payload"}
+POST   /api/sessions/{id}/approvals/{use_id}  {"allow": true|false, "from"?} → decide a waiting call
+POST   /api/events                            {"thread"?, "kind", "source", "from"?, "dedup_key"?, "payload"}
 GET    /api/outbox                            what the agent said; ?after= ?wait=
 POST   /api/timers                            {"session_id", "note", "in"|"at", "every"?}
 ```
