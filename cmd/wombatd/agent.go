@@ -95,6 +95,11 @@ func (f *factory) session(opts daemon.SessionOptions) (session, error) {
 // confined under tools.confine, and otherwise the plain one, which still
 // filters the environment so the provider key this process holds stays here.
 func (f *factory) runner(workspace string) (sandbox.Runner, error) {
+	if f.cfg.Tools.Sandbox.ExecURL != "" {
+		// Every command runs in the task's own remote sandbox, reached through
+		// the app's exec endpoint. Nothing runs on this host.
+		return newRemoteRunner(f.cfg.Tools.Sandbox.ExecURL, f.cfg.Tools.Sandbox.Token, filepath.Base(workspace)), nil
+	}
 	if f.sandbox == nil {
 		return sandbox.Unconfined(workspace), nil
 	}
@@ -162,6 +167,12 @@ func (f *factory) agent(s session, r role) (*core.Agent, error) {
 		}
 	}
 
+	// In a remote sandbox the model works inside the VM, not at the on-host
+	// workspace path.
+	workdir := s.workspace
+	if f.cfg.Tools.Sandbox.ExecURL != "" {
+		workdir = remoteWorkdir
+	}
 	opts := []core.Option{
 		core.WithName(r.String()),
 		core.WithClient(f.client),
@@ -174,7 +185,7 @@ func (f *factory) agent(s session, r role) (*core.Agent, error) {
 		// Say what the directory is FOR, not just what it is. A bare path in
 		// the system prompt does not connect to the bash tool's exec_dir
 		// parameter in the model's head; naming the parameter does.
-		core.WithEnvBlock("working_directory", s.workspace+
+		core.WithEnvBlock("working_directory", workdir+
 			"\n\nThis is the project you are working on. Pass it as exec_dir to shell tools "+
 			"and use it as the base for any relative path, unless the user names a different location."),
 	}

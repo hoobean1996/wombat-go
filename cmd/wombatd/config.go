@@ -94,6 +94,17 @@ type toolsConfig struct {
 	SkillsDir      string   `yaml:"skills_dir"`
 	Media          bool     `yaml:"media"`
 	Delegate       bool     `yaml:"delegate"`
+	// Sandbox, when set, runs every command in a remote per-task sandbox
+	// through an HTTP endpoint instead of on this host. tools.confine then
+	// does not apply (nothing runs locally to confine).
+	Sandbox sandboxExecConfig `yaml:"sandbox"`
+}
+
+// sandboxExecConfig points at the endpoint that runs a session's commands in
+// its task's remote sandbox (the ondemandagent app's /api/agent/sandbox/exec).
+type sandboxExecConfig struct {
+	ExecURL string `yaml:"exec_url"`
+	Token   string `yaml:"token"`
 }
 
 type turnConfig struct {
@@ -282,6 +293,14 @@ func (c config) validate() []error {
 	for _, name := range c.Tools.Disable {
 		if strings.TrimSpace(name) == "" {
 			bad("tools.disable", "holds an empty name")
+		}
+	}
+	if u := c.Tools.Sandbox.ExecURL; u != "" {
+		if parsed, err := url.Parse(u); err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+			bad("tools.sandbox.exec_url", "%q is not an http(s) URL", u)
+		}
+		if c.Tools.Sandbox.Token == "" {
+			bad("tools.sandbox.token", "is empty, and tools.sandbox.exec_url needs one")
 		}
 	}
 

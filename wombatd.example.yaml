@@ -217,6 +217,14 @@ tools:
   # session's policy.
   delegate: false
 
+  # Run every command in the task's own remote sandbox through an HTTP
+  # endpoint, instead of on this host. When exec_url is set, tools.confine
+  # does not apply (nothing runs locally to confine), and token authenticates
+  # the call. Both empty: commands run on this host, as above.
+  sandbox:
+    exec_url: ""
+    token: ""
+
 # ── how far one turn may go ──────────────────────────────────────────────
 turn:
   # The cost cap in USD per turn, not per conversation: a cumulative cap kills
