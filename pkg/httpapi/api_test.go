@@ -635,6 +635,7 @@ func TestUnknownSessionOnEveryRoute(t *testing.T) {
 		{http.MethodPost, "/api/sessions/nope/steer", `{"prompt":"x"}`},
 		{http.MethodGet, "/api/sessions/nope/approvals", ""},
 		{http.MethodPost, "/api/sessions/nope/approvals/u1", `{"allow":true}`},
+		{http.MethodPost, "/api/sessions/nope/results/u1", `{"output":"x"}`},
 		{http.MethodPost, "/api/events", `{"session_id":"nope","kind":"push"}`},
 		{http.MethodPost, "/api/timers", `{"session_id":"nope","note":"x","in":"1m"}`},
 	} {
@@ -1629,4 +1630,77 @@ func TestAFromThatIsNotANameIsRefused(t *testing.T) {
 		http.StatusBadRequest, "bad_request")
 	h.wantErr(h.do(http.MethodPost, "/api/sessions/"+info.ID+"/steer", `{"prompt":"x","from":"bob"}`),
 		http.StatusBadRequest, "bad_request")
+}
+
+// ===== results and the ledger =====
+
+// A call that waits for a result from outside is listed with the approvals,
+// takes its result over the API, and the turn carries on with it.
+func TestAResultOverTheAPI(t *testing.T) {
+	t.Parallel()
+	// Held at the model call the result resumes, so the second post lands
+	// while the result is being acted on, as the approvals' double click does.
+	c, release := apiScript(apiToolCall("j1", daemon.ToolWaitForResult, `{"handle":"build 7","note":"did it pass?"}`), apiText("it passed")).heldAfter(1)
+	t.Cleanup(release)
+	h := apiServe(t, c, daemon.Tools(), nil)
+	info := h.start(`{"prompt":"wait for the build"}`)
+	h.awaitState(info.ID, daemon.Awaiting)
+
+	var waiting httpapi.ApprovalList
+	h.decode(h.do(http.MethodGet, "/api/sessions/"+info.ID+"/approvals", ""), http.StatusOK, &waiting)
+	if len(waiting.Approvals) != 0 || len(waiting.Awaiting) != 1 || waiting.Awaiting[0].UseID != "j1" ||
+		waiting.Awaiting[0].Handle != "build 7" || !waiting.Awaiting[0].Awaiting {
+		t.Fatalf("approvals = %+v, want the call awaiting its result", waiting)
+	}
+	path := "/api/sessions/" + info.ID + "/results/j1"
+	h.wantErr(h.do(http.MethodPost, path, `{}`), http.StatusBadRequest, "bad_request")
+	h.wantErr(h.do(http.MethodPost, "/api/sessions/"+info.ID+"/results/nope", `{"output":"x"}`), http.StatusNotFound, "no_such_approval")
+	h.wantErr(h.do(http.MethodPost, "/api/sessions/"+info.ID+"/approvals/j1", `{"allow":true}`), http.StatusNotFound, "no_such_approval")
+
+	var accepted httpapi.Accepted
+	h.decode(h.do(http.MethodPost, path, `{"output":"build 7: green","from":"ci"}`), http.StatusAccepted, &accepted)
+	if accepted.Event.Kind != daemon.KindResult || accepted.Event.From != "ci" {
+		t.Fatalf("accepted = %+v, want the result's event", accepted)
+	}
+	h.wantErr(h.do(http.MethodPost, path, `{"output":"again"}`), http.StatusConflict, "already_answered")
+	release()
+	if done := h.awaitState(info.ID, daemon.Idle); done.Answer != "it passed" {
+		t.Fatalf("the turn carried on to %+v", done)
+	}
+}
+
+// The ledger is listed over the API, filtered by session, state, turn and
+// step.
+func TestToolCallsOverTheAPI(t *testing.T) {
+	t.Parallel()
+	h := apiServe(t, apiScript(apiToolCall("u1", "look", `{"q":"x"}`), apiText("seen")), []tool.Def{apiTool("look")}, nil)
+	info := h.start(`{"prompt":"look"}`)
+	h.awaitState(info.ID, daemon.Idle)
+
+	var list httpapi.ToolCallList
+	h.decode(h.do(http.MethodGet, "/api/tool-calls?session="+info.ID, ""), http.StatusOK, &list)
+	if len(list.Calls) != 1 {
+		t.Fatalf("the ledger = %+v, want the one call", list.Calls)
+	}
+	c := list.Calls[0]
+	if c.UseID != "u1" || c.Tool != "look" || string(c.Input) != `{"q":"x"}` || c.State != tool.StateSucceeded ||
+		c.Output != "ok" || c.Attempts != 1 || c.Turn != 1 || c.Step != 1 {
+		t.Fatalf("the call = %+v", c)
+	}
+	for q, n := range map[string]int{
+		"state=succeeded":               1,
+		"state=running,waiting":         0,
+		"state=running&state=succeeded": 1,
+		"turn=1&step=1":                 1,
+		"turn=2":                        0,
+		"parent=-":                      1,
+	} {
+		h.decode(h.do(http.MethodGet, "/api/tool-calls?session="+info.ID+"&"+q, ""), http.StatusOK, &list)
+		if len(list.Calls) != n {
+			t.Errorf("?%s = %d calls, want %d", q, len(list.Calls), n)
+		}
+	}
+	for _, q := range []string{"state=lost", "step=x", "turn=0", "limit=-1"} {
+		h.wantErr(h.do(http.MethodGet, "/api/tool-calls?"+q, ""), http.StatusBadRequest, "bad_request")
+	}
 }
