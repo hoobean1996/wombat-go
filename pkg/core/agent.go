@@ -182,7 +182,8 @@ func WithToolMiddleware(mw ...tool.Middleware) Option {
 //
 // Everything the built-in chain does becomes yours to reproduce: panic
 // recovery, validation, per-call timeout, retry, the circuit breaker, dedup
-// annotation, output truncation, budget accounting, logging and observation.
+// annotation, output truncation, budget accounting, the [Journal]'s record of
+// each call, logging and observation.
 // Two omissions bite hardest and neither announces itself — without
 // [tool.WithObserver] no tool events reach the stream, and without
 // [tool.WithRecovery] a panicking tool escapes the innermost guard.
@@ -532,6 +533,10 @@ func (a *Agent) toolFallback() time.Duration {
 //     not attempts;
 //   - the ToolCalls count sits inside every gate — inherited ones included —
 //     so only a call that is about to run is counted;
+//   - the journal's write of a call as running sits inside that count, the
+//     last thing before the call takes effect, and outside retry, the
+//     timeout and truncation, so what it records is one logical call and
+//     the result the model will read (see [Journal]);
 //   - inherited middleware — a parent run's permission gate, carried into this
 //     run by the delegate call it allowed — sits just inside the caller's own
 //     middleware, so this agent's own gate rules first (see
@@ -554,6 +559,7 @@ func (a *Agent) defaultToolChain() tool.Handler {
 		tool.WithRetry(tool.RetryPolicy{MaxAttempts: DefaultToolRetryAttempts}),
 		tool.WithCircuitBreaker(DefaultBreakerThreshold, DefaultBreakerCooldown),
 		tool.WithTruncation(DefaultToolOutputLimit, a.cfg.untruncated...),
+		journalCalls,
 		budgetToolCalls,
 		tool.WithInherited,
 	}

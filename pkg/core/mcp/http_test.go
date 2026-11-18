@@ -12,6 +12,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"wombat/pkg/core/llm"
+	"wombat/pkg/core/tool"
 )
 
 // httpFake is a Streamable HTTP server that holds its clients to the parts of
@@ -278,6 +281,15 @@ func TestSessionReachesOnlyTheServersThatAskForIt(t *testing.T) {
 		{"a server that asks, in a session", true, WithSession(ctx, "sess-1"), `{"wombat/session":"sess-1"}`},
 		{"a server that asks, outside a session", true, ctx, ""},
 		{"a server that does not ask", false, WithSession(ctx, "sess-1"), ""},
+		// A call the harness dispatched names itself to every server, as a
+		// digest that says nothing about the session.
+		{"a dispatched call, to a server that does not ask", false,
+			tool.WithInfo(WithSession(ctx, "sess-1"), tool.Info{UseID: "u1"}),
+			`{"wombat/call":"` + callDigest("u1") + `"}`},
+		{"a dispatched call, to a server that asks", true,
+			tool.WithCallKeys(tool.WithInfo(WithSession(ctx, "sess-1"), tool.Info{UseID: "u1"}),
+				func(llm.ToolUseID) string { return "sess-1/4.0" }),
+			`{"wombat/call":"` + callDigest("sess-1/4.0") + `","wombat/session":"sess-1"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c, err := Connect(ctx, Server{Name: "meta", URL: srv.URL, Session: tc.session})

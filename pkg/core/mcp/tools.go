@@ -73,8 +73,15 @@ func (c *Client) CallTool(ctx context.Context, name string, args json.RawMessage
 	}
 	var res callResult
 	params := map[string]any{"name": name, "arguments": args}
+	meta := map[string]any{}
 	if id := sessionFrom(ctx); c.server.Session && id != "" {
-		params["_meta"] = map[string]any{MetaSession: id}
+		meta[MetaSession] = id
+	}
+	if key := tool.CallKey(ctx); key != "" {
+		meta[MetaCall] = callDigest(key)
+	}
+	if len(meta) > 0 {
+		params["_meta"] = meta
 	}
 	err := c.call(ctx, "tools/call", params, &res)
 	if err != nil {

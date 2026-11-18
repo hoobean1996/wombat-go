@@ -230,7 +230,10 @@ func WithRetry(p RetryPolicy) Middleware {
 
 			for attempt := 0; ; attempt++ {
 				out, err := next(ctx, d, use)
-				if err == nil || !d.Retryable(err) || attempt+1 >= p.MaxAttempts {
+				// A call waiting for a decision or a result has not failed,
+				// whatever a classifier says: trying it again would ask twice,
+				// or start the work it is waiting on a second time.
+				if err == nil || pending(err) || !d.Retryable(err) || attempt+1 >= p.MaxAttempts {
 					return out, err
 				}
 
@@ -349,7 +352,9 @@ func WithCircuitBreaker(threshold int, cooldown time.Duration) Middleware {
 			// authored. Leaving the counters alone — rather than resetting
 			// them — is the point: four real failures, a bad path, then a
 			// fifth real failure should still trip a threshold of five.
-			if err != nil && (ctx.Err() != nil || IsCallerFault(err)) {
+			// A call waiting for a decision or a result is neither either: it
+			// has not finished at all.
+			if err != nil && (ctx.Err() != nil || IsCallerFault(err) || pending(err)) {
 				return out, err
 			}
 
@@ -502,7 +507,7 @@ func WithDedupRepeats(threshold int) Middleware {
 	return func(next Handler) Handler {
 		return func(ctx context.Context, d Def, use llm.ToolUse) (string, error) {
 			out, err := next(ctx, d, use)
-			if err != nil && ctx.Err() != nil {
+			if err != nil && (ctx.Err() != nil || pending(err)) {
 				return out, err
 			}
 

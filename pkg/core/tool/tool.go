@@ -90,6 +90,18 @@ type Def struct {
 	// Retryable classifies an error as worth retrying. Nil means never, which
 	// is the conservative default: most tool errors are deterministic.
 	Retryable func(error) bool
+
+	// Recovery is what a run resumed after its process died does with a call
+	// of this tool it finds interrupted — one that may or may not have taken
+	// effect. Zero, [RecoverAuto], runs an Idempotent or read-only tool again
+	// and reports any other to the model; see [RecoveryOf].
+	Recovery Recovery
+
+	// Reconcile, when set, is asked first about such a call: whether its
+	// effect landed. A write whose file already holds what it was to write
+	// did; a replacement whose old text is still there did not, and can run
+	// again. An error leaves the call to Recovery.
+	Reconcile ReconcileFunc
 }
 
 // Spec projects the wire subset handed to the model.
