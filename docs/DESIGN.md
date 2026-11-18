@@ -566,15 +566,20 @@ inbox, and what the agent has to say goes to an outbox.
   index, renumbered when a compaction folds the past away.
 - **One turn at a time.** A worker takes a session's pending events, all of
   them, and runs one turn on them; what arrives meanwhile is the next turn's.
-  A turn the provider fell over in, or that a restart cut short, runs again,
-  from the transcript it started from.
+  A turn the provider fell over in, or that a restart cut short, carries on
+  from where it was written down — see *The ledger* below — rather than
+  starting over.
 - **Timers.** The agent sets its own with `set_timer` — once, to follow up, or
   every so often — and a client with `POST /api/timers`. A timer that is due
   puts an event in the inbox; a daemon that was down fires each one once when
   it comes back, not once for every period it missed.
-- **Decisions.** A call the policy puts in front of a person defers, as above:
-  the session is saved mid-call, waits for decisions and takes nothing else,
-  and resumes once they are all in.
+- **Decisions, and results.** A call the policy puts in front of a person
+  defers, as above: the session is saved mid-call, waits for decisions and
+  takes nothing else, and resumes once they are all in. A call that starts
+  something finishing outside the session — a build, a job — can end the
+  turn the same way (`tool.Await`; the daemon's `wait_for_result`): the
+  session is `awaiting`, and the result posted to
+  `POST /api/sessions/{id}/results/{use_id}` is what the call returns.
 - **The outbox.** The reply to a message, a question the model asks, the calls
   waiting for a decision, and what the agent chooses to say with
   `send_message` — a timer's turn says nothing unless it does. A client
@@ -588,6 +593,8 @@ GET    /api/sessions/{id}/messages            the transcript, and its messages' 
 GET    /api/sessions/{id}/events              SSE across every turn, honours Last-Event-ID
 POST   /api/sessions/{id}/steer               {"prompt": …} → a message for the turn still running
 POST   /api/sessions/{id}/approvals/{use_id}  {"allow": true|false, "from"?} → decide a waiting call
+POST   /api/sessions/{id}/results/{use_id}    {"output", "is_error"?, "from"?} → the result a call waits for
+GET    /api/tool-calls                        the ledger; ?session= ?state= ?turn=
 POST   /api/events                            {"thread"?, "kind", "source", "from"?, "dedup_key"?, "payload"}
 GET    /api/outbox                            what the agent said; ?after= ?wait=
 POST   /api/timers                            {"session_id", "note", "in"|"at", "every"?}
@@ -599,16 +606,19 @@ per turn**, so a client that reconnects across a turn boundary resumes at the
 event it dropped instead of at the start of the current turn.
 
 Everything lives in a `daemon.Store`: in memory, or — with `store.driver:
-postgres` — in four tables, `sessions`, `inbox`, `timers` and `outbox`,
-which `pkg/store/postgres` creates on the first start. Both pass one
+postgres` — in six tables, `sessions`, `inbox`, `timers`, `outbox`, and the
+ledger's `tool_calls` and `tool_runs`, which `pkg/store/postgres` creates on
+the first start. Both pass one
 conformance suite, `pkg/daemon/storetest`, so the daemon's tests against the
 memory store stand for Postgres too; `make pg-up` starts one in podman and
 `make test-pg` runs the suite and a restart test against it. Any number of
 wombatd can share a schema. The lock is per inbox, not per database: a session
 is run by the daemon holding its lease. A daemon that dies stops renewing, and
 whoever takes a session over once the lease runs out puts back what was left
-running. Writes are fenced by the lease, so a daemon that comes back to life
-mid-turn cannot write over the one that took over. A request reaching the wrong
+running. Writes are fenced by the lease and its epoch — moved on whenever the
+session changes hands — so a daemon that comes back to life mid-turn cannot
+write over the one that took over, nor one that let a session go and took it
+back write over itself. A request reaching the wrong
 daemon is forwarded to the right one, since what a session holds in memory (the
 turn in flight, the stream) is only there. Transcripts are `json`, not
 `jsonb`, so a tool call's input comes back with its keys in the order the
@@ -625,6 +635,65 @@ answers only to loopback names (`httpapi.WithAllowedHosts`).
 `server.token` adds a bearer token (`httpapi.WithBearerToken`); beyond
 loopback, a server without one logs that anyone who can reach it can drive
 it.
+
+### The ledger
+
+A turn used to be written down twice: when it began, and when it ended. A
+daemon that died in between left nothing of the turn but its events, which ran
+again from the transcript the turn started from — every tool call with them,
+the ones that had already written a file or sent a payment included. A
+decision made things worse: the approved call ran, the model call after it
+failed, and the turn — resumed again from the decision — ran the approved call
+a second time.
+
+Now a turn writes itself down as it goes, in a ledger of its tool calls
+(`core.Journal`; `daemon.ToolCall`, `GET /api/tool-calls`):
+
+- **Before anything a reply asks for happens**, the reply is a step: its calls,
+  every one `pending`, and where the turn has got to — the transcript so far,
+  its iterations, what it has spent — in one write (`Store.OpenStep`). The
+  model's answer is a step too, so a turn resumed after it is not asked for
+  the answer again.
+- **A call not safe to run again** is written `running` just before it takes
+  effect, and with its outcome once it has. One that is — read-only, or
+  `Idempotent` — is not: run again, it does no harm, and the writes it would
+  cost are the ones a busy agent makes most.
+- **When the step's calls are all answered**, or the run stops at one, each
+  call's state and result are written in one go.
+
+A call is named by its session, step and place in the reply —
+`<session>/<step>.<index>`, `tool.CallKey` — not by the provider's tool_use
+id, which some gateways reuse. Its states are a small machine:
+
+```
+pending ──► running ──► succeeded | failed            (ended)
+   │           └──────► interrupted ──► running …     (its process stopped mid-call)
+   ├──► denied | cancelled                            (ended: refused, never run)
+   ├──► deferred ──► … a decision ──► running | denied
+   └──► waiting  ──► … a result   ──► succeeded | failed
+```
+
+A daemon that takes a session over, a turn tried again after the provider fell
+over, or a decision coming back all start from what the ledger has
+(`core.Recover`, `Input.Recorded`). A call that ended is answered with what it
+returned and does not run again; one that never started runs now. One that was
+`running` may or may not have taken effect, and that is decided in order: the
+tool's `Reconcile` is asked whether it landed (`write_file` compares the file
+with what it was to write); otherwise its `tool.Recovery` says — run it again,
+tell the model it may or may not have taken effect so it checks first (the
+default for anything that is not safe to run again), or stop for a person to
+decide (`tools.recovery: ask`). A delegate call's sub-agent is journaled under
+the call (`core.Nester`, the `tool_runs` table), so a delegate run again
+carries its sub-agent on rather than starting it over.
+
+The tools the daemon gives the agent are made safe to run again, keyed by the
+call: `send_message` sends once, `set_timer` sets one timer. An MCP server is
+told the call's key in `_meta["wombat/call"]` — a digest, so it says nothing
+about the session — and can do the same. A turn carried on keeps its number,
+its budget (the earlier runs count against it) and its spend (counted once).
+
+The ledger keeps a call for `store.ledger_retention` (30 days) after it
+ended, for the sessions with no turn in flight and nothing waiting.
 
 ## What is kept
 
