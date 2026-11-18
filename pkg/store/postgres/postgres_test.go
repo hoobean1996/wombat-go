@@ -92,6 +92,52 @@ func TestOpenIsIdempotent(t *testing.T) {
 	}
 }
 
+// A database a daemon before the ledger made is brought up to date with its
+// sessions in it: each in its first epoch, with no turn in flight and no
+// steps yet, and a turn on it writes its steps down.
+func TestOpenMigratesASchemaFromBeforeTheLedger(t *testing.T) {
+	ctx := context.Background()
+	where := schema(t)
+	conn, err := pgx.Connect(ctx, where)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	if _, err := conn.Exec(ctx, `CREATE TABLE wombat_schema (version integer NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	for v, m := range postgres.Migrations[:3] {
+		if _, err := conn.Exec(ctx, m); err != nil {
+			t.Fatalf("version %d: %v", v+1, err)
+		}
+		if _, err := conn.Exec(ctx, `INSERT INTO wombat_schema (version) VALUES ($1)`, v+1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := conn.Exec(ctx, `
+		INSERT INTO sessions (id, created, meta, messages, owner, owner_addr, lease_until)
+		VALUES ('old', now(), '{"version":1,"id":"old","state":"idle","answer":"kept"}', '[]', 'd1', '', now() + interval '1 hour')`); err != nil {
+		t.Fatal(err)
+	}
+
+	st := open(t, where)
+	rec, err := st.LoadSession(ctx, "old")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Answer != "kept" || rec.Lease.Owner != "d1" || rec.Lease.Epoch != 1 || rec.Inflight != nil {
+		t.Fatalf("migrated: %+v", rec)
+	}
+	step, err := st.OpenStep(ctx, daemon.StepOpen{Session: "old", Owner: "d1", Epoch: 1, Turn: 1,
+		Inflight: &daemon.Inflight{Turn: 1}, Calls: []daemon.ToolCall{{Index: 0, UseID: "u1", Tool: "read"}}})
+	if err != nil || step != 1 {
+		t.Fatalf("OpenStep on a migrated session = %d, %v", step, err)
+	}
+	if calls, err := st.ToolCalls(ctx, daemon.CallFilter{Session: "old"}); err != nil || len(calls) != 1 {
+		t.Fatalf("ToolCalls = %v, %v", calls, err)
+	}
+}
+
 // One daemon to a name: a second under the same name is told, and gets its
 // turn once the first is gone. Daemons under other names share the schema.
 func TestLockIsOneDaemonPerName(t *testing.T) {

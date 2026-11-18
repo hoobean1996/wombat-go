@@ -8,6 +8,8 @@ import (
 	"slices"
 	"sync"
 	"time"
+
+	"wombat/pkg/core/tool"
 )
 
 // MemoryStore returns a [Store] that keeps everything in this process, and
@@ -36,7 +38,20 @@ type memSession struct {
 	awaiting bool
 	meta     []byte
 	messages []byte
+	inflight []byte
 	lease    Lease
+
+	// epoch outlives the lease, which a release clears; steps numbers the
+	// session's steps; calls and subs are its ledger.
+	epoch int64
+	steps int
+	calls map[[2]int]ToolCall // by step and index
+	subs  map[subKey]SubRun
+}
+
+type subKey struct {
+	parent string
+	run    int
 }
 
 // ownedBy reports the session held, at now, by a daemon other than owner.
@@ -107,11 +122,17 @@ func (m *memStore) CreateSession(_ context.Context, rec SessionRecord) error {
 			}
 		}
 	}
+	inflight, err := EncodeInflight(rec.Inflight)
+	if err != nil {
+		return err
+	}
 	lease := rec.Lease
 	lease.Until = micro(lease.Until)
+	lease.Epoch = 1
 	m.sessions[rec.ID] = &memSession{
 		thread: rec.Thread, created: micro(rec.Created), awaiting: rec.Deferred != nil,
-		meta: meta, messages: msgs, lease: lease,
+		meta: meta, messages: msgs, inflight: inflight, lease: lease, epoch: 1,
+		calls: map[[2]int]ToolCall{}, subs: map[subKey]SubRun{},
 	}
 	return nil
 }
@@ -121,29 +142,35 @@ func (m *memStore) SaveSession(_ context.Context, rec SessionRecord) error {
 	if err != nil {
 		return err
 	}
+	inflight, err := EncodeInflight(rec.Inflight)
+	if err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.saveLocked(rec, meta, msgs)
+	return m.saveLocked(rec, meta, msgs, inflight)
 }
 
-func (m *memStore) saveLocked(rec SessionRecord, meta, msgs []byte) error {
-	if err := m.writableLocked(rec); err != nil {
+func (m *memStore) saveLocked(rec SessionRecord, meta, msgs, inflight []byte) error {
+	if err := m.writableLocked(rec.ID, rec.Lease.Owner, rec.Lease.Epoch); err != nil {
 		return err
 	}
 	s := m.sessions[rec.ID]
-	s.awaiting, s.meta, s.messages = rec.Deferred != nil, meta, msgs
+	s.awaiting, s.meta, s.messages, s.inflight = rec.Deferred != nil, meta, msgs, inflight
 	return nil
 }
 
-// writableLocked is whether rec may be written: the session is there, and
-// held by rec.Lease.Owner when that is set.
-func (m *memStore) writableLocked(rec SessionRecord) error {
-	s, ok := m.sessions[rec.ID]
+// writableLocked is whether a session may be written: it is there, and held
+// by owner when that is set — under epoch, when that is.
+func (m *memStore) writableLocked(id, owner string, epoch int64) error {
+	s, ok := m.sessions[id]
 	switch {
 	case !ok:
-		return fmt.Errorf("%w: %s", ErrNoSuchSession, rec.ID)
-	case rec.Lease.Owner != "" && s.lease.Owner != rec.Lease.Owner:
-		return &OwnedError{Session: rec.ID, Lease: s.lease}
+		return fmt.Errorf("%w: %s", ErrNoSuchSession, id)
+	case owner != "" && (s.lease.Owner != owner || (epoch != 0 && s.epoch != epoch)):
+		l := s.lease
+		l.Epoch = s.epoch
+		return &OwnedError{Session: id, Lease: l}
 	}
 	return nil
 }
@@ -151,17 +178,22 @@ func (m *memStore) writableLocked(rec SessionRecord) error {
 func (m *memStore) LoadSession(_ context.Context, id string) (SessionRecord, error) {
 	m.mu.Lock()
 	s, ok := m.sessions[id]
-	var meta, msgs []byte
+	var meta, msgs, inflight []byte
 	var lease Lease
 	if ok {
-		meta, msgs, lease = s.meta, s.messages, s.lease
+		meta, msgs, inflight, lease = s.meta, s.messages, s.inflight, s.lease
+		lease.Epoch = s.epoch
 	}
 	m.mu.Unlock()
 	if !ok {
 		return SessionRecord{}, fmt.Errorf("%w: %s", ErrNoSuchSession, id)
 	}
 	rec, err := DecodeRecord(meta, msgs)
+	if err != nil {
+		return rec, err
+	}
 	rec.Lease = lease
+	rec.Inflight, err = DecodeInflight(inflight)
 	return rec, err
 }
 
@@ -188,7 +220,9 @@ func (m *memStore) ListSessions(context.Context) ([]SessionRecord, error) {
 	}
 	all := make([]entry, 0, len(m.sessions))
 	for id, s := range m.sessions {
-		all = append(all, entry{id, s.created, s.meta, s.lease})
+		l := s.lease
+		l.Epoch = s.epoch
+		all = append(all, entry{id, s.created, s.meta, l})
 	}
 	m.mu.Unlock()
 	slices.SortFunc(all, func(a, b entry) int {
@@ -254,7 +288,7 @@ func (m *memStore) claimable(e Event, now time.Time) bool {
 		return false
 	}
 	s, ok := m.sessions[e.Session]
-	return ok && (!s.awaiting || e.Kind == KindApproval)
+	return ok && (!s.awaiting || e.Kind == KindApproval || e.Kind == KindResult)
 }
 
 // orphaned is a running event whose session nobody holds any more, at now:
@@ -308,10 +342,13 @@ func (m *memStore) Claim(_ context.Context, session, owner string, now time.Time
 }
 
 func (m *memStore) Settle(_ context.Context, s Settlement) error {
-	var meta, msgs []byte
+	var meta, msgs, inflight []byte
 	if s.Session.ID != "" {
 		var err error
 		if meta, msgs, err = encodeRecord(s.Session); err != nil {
+			return err
+		}
+		if inflight, err = EncodeInflight(s.Session.Inflight); err != nil {
 			return err
 		}
 	}
@@ -319,7 +356,7 @@ func (m *memStore) Settle(_ context.Context, s Settlement) error {
 	defer m.mu.Unlock()
 	// Everything that can refuse is checked before anything is changed.
 	if s.Session.ID != "" {
-		if err := m.writableLocked(s.Session); err != nil {
+		if err := m.writableLocked(s.Session.ID, s.Session.Lease.Owner, s.Session.Lease.Epoch); err != nil {
 			return err
 		}
 	}
@@ -330,7 +367,7 @@ func (m *memStore) Settle(_ context.Context, s Settlement) error {
 	}
 
 	if s.Session.ID != "" {
-		_ = m.saveLocked(s.Session, meta, msgs)
+		_ = m.saveLocked(s.Session, meta, msgs, inflight)
 	}
 	m.setStatus(s.Done, EventDone, "", time.Time{})
 	m.setStatus(s.Retry, EventPending, s.Error, micro(s.RetryAt))
@@ -387,8 +424,12 @@ func (m *memStore) Acquire(_ context.Context, session string, l Lease, now time.
 	if s.lease.Owner != l.Owner {
 		// Whatever the last owner left running died with it.
 		n = m.recoverLocked(func(id string) bool { return id == session }, attempts)
+		// Changing hands, from a daemon or from nobody: whatever the last
+		// tenure had in flight is fenced off.
+		s.epoch++
 	}
 	l.Until = micro(l.Until)
+	l.Epoch = s.epoch
 	s.lease = l
 	return n, nil
 }
@@ -473,6 +514,13 @@ func (m *memStore) AddTimer(_ context.Context, t Timer) (Timer, error) {
 	defer m.mu.Unlock()
 	if _, ok := m.sessions[t.Session]; !ok {
 		return Timer{}, fmt.Errorf("%w: %s", ErrNoSuchSession, t.Session)
+	}
+	if t.DedupKey != "" {
+		for _, old := range m.timers {
+			if old.DedupKey == t.DedupKey {
+				return old, nil
+			}
+		}
 	}
 	m.lastID.timer++
 	t.ID = m.lastID.timer
@@ -679,4 +727,163 @@ func copyEvent(e Event) Event {
 func copyMessage(m Message) Message {
 	m.Data, m.InReplyTo = clone(m.Data), slices.Clone(m.InReplyTo)
 	return m
+}
+
+// ===== The ledger =====
+
+func (m *memStore) OpenStep(_ context.Context, o StepOpen) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.writableLocked(o.Session, o.Owner, o.Epoch); err != nil {
+		return 0, err
+	}
+	s := m.sessions[o.Session]
+	step := s.steps + 1
+	at := micro(cmp.Or(o.At, time.Now()))
+	var inflight []byte
+	if o.Inflight != nil {
+		f := *o.Inflight
+		f.Step = step
+		b, err := EncodeInflight(&f)
+		if err != nil {
+			return 0, err
+		}
+		inflight = b
+	}
+	s.steps = step
+	for _, c := range o.Calls {
+		// Pending, with nothing come of it yet, whatever it was handed with.
+		s.calls[[2]int{step, c.Index}] = ToolCall{
+			Session: o.Session, Step: step, Index: c.Index, Turn: o.Turn, Parent: o.Parent, Run: o.Run,
+			UseID: c.UseID, Tool: c.Tool, Input: clone(c.Input),
+			State: tool.StatePending, Owner: o.Owner, Created: at,
+		}
+	}
+	if o.Inflight != nil {
+		s.inflight = inflight
+	}
+	if o.Sub != nil {
+		sub := *o.Sub
+		sub.Session, sub.Parent, sub.Run, sub.Step, sub.Updated = o.Session, o.Parent, o.Run, step, at
+		sub.Messages = slices.Clone(sub.Messages)
+		s.subs[subKey{o.Parent, o.Run}] = sub
+	}
+	return step, nil
+}
+
+func (m *memStore) MoveCalls(_ context.Context, mv CallMoves) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.writableLocked(mv.Session, mv.Owner, mv.Epoch); err != nil {
+		return err
+	}
+	s := m.sessions[mv.Session]
+	// All or nothing: every move is checked before any is made.
+	for _, mo := range mv.Moves {
+		c, ok := s.calls[[2]int{mv.Step, mo.Index}]
+		if !ok {
+			return fmt.Errorf("daemon: no call %s in the ledger", CallKey(mv.Session, mv.Step, mo.Index))
+		}
+		if err := CheckMove(c, mo); err != nil {
+			return err
+		}
+	}
+	at := micro(cmp.Or(mv.At, time.Now()))
+	for _, mo := range mv.Moves {
+		k := [2]int{mv.Step, mo.Index}
+		c := s.calls[k]
+		mo.Media, mo.Tags = slices.Clone(mo.Media), slices.Clone(mo.Tags)
+		ApplyMove(&c, mo, mv.Owner, at)
+		s.calls[k] = c
+	}
+	return nil
+}
+
+func (m *memStore) ToolCalls(_ context.Context, f CallFilter) ([]ToolCall, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []ToolCall
+	for id, s := range m.sessions {
+		if f.Session != "" && id != f.Session {
+			continue
+		}
+		for _, c := range s.calls {
+			if (f.Step != 0 && c.Step != f.Step) || (f.Turn != 0 && c.Turn != f.Turn) ||
+				(f.Parent == "-" && c.Parent != "") || (f.Parent != "" && f.Parent != "-" && c.Parent != f.Parent) ||
+				(len(f.States) > 0 && !slices.Contains(f.States, c.State)) {
+				continue
+			}
+			c.Input, c.Media, c.Tags = clone(c.Input), slices.Clone(c.Media), slices.Clone(c.Tags)
+			if c.Decision != nil {
+				d := *c.Decision
+				c.Decision = &d
+			}
+			out = append(out, c)
+		}
+	}
+	slices.SortFunc(out, func(a, b ToolCall) int {
+		return cmp.Or(b.Created.Compare(a.Created), cmp.Compare(b.Step, a.Step), cmp.Compare(b.Index, a.Index), cmp.Compare(a.Session, b.Session))
+	})
+	if f.Limit > 0 && len(out) > f.Limit {
+		out = out[:f.Limit]
+	}
+	return out, nil
+}
+
+func (m *memStore) SubRun(_ context.Context, session, parent string, n int) (SubRun, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[session]
+	if !ok {
+		return SubRun{}, false, fmt.Errorf("%w: %s", ErrNoSuchSession, session)
+	}
+	sub, ok := s.subs[subKey{parent, n}]
+	if !ok {
+		return SubRun{}, false, nil
+	}
+	// Through JSON, as Postgres hands it back: nothing a caller holds aliases it.
+	b, err := json.Marshal(sub.Messages)
+	if err != nil {
+		return SubRun{}, false, err
+	}
+	sub.Messages = nil
+	if err := json.Unmarshal(b, &sub.Messages); err != nil {
+		return SubRun{}, false, err
+	}
+	return sub, true, nil
+}
+
+func (m *memStore) PruneCalls(_ context.Context, before time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	before = micro(before)
+	n := 0
+	for _, s := range m.sessions {
+		if s.awaiting || s.inflight != nil {
+			continue
+		}
+		for k, c := range s.calls {
+			if cmp.Or(c.Finished, c.Created).Before(before) {
+				delete(s.calls, k)
+				n++
+			}
+		}
+		for k := range s.subs {
+			if !m.liveParentLocked(s, k.parent) {
+				delete(s.subs, k)
+			}
+		}
+	}
+	return n, nil
+}
+
+// liveParentLocked reports whether the call named key is still in the
+// session's ledger and has not ended: its sub-agent may yet carry on.
+func (m *memStore) liveParentLocked(s *memSession, key string) bool {
+	for _, c := range s.calls {
+		if c.Key() == key {
+			return !c.State.Final()
+		}
+	}
+	return false
 }

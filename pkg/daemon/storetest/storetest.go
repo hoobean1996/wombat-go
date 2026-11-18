@@ -34,7 +34,7 @@ func Run(t *testing.T, open func(t *testing.T) daemon.Store) {
 		{"NewerRecordIsRefused", newerRecordIsRefused},
 		{"EnqueueAndDedup", enqueueAndDedup},
 		{"ReadyAndClaim", readyAndClaim},
-		{"AnAwaitingSessionTakesOnlyApprovals", awaitingTakesOnlyApprovals},
+		{"AnAwaitingSessionTakesOnlyDecisionsAndResults", awaitingTakesOnlyApprovals},
 		{"SettleIsAllOrNothing", settleIsAllOrNothing},
 		{"Recover", recoverRunning},
 		{"Leases", leases},
@@ -45,6 +45,15 @@ func Run(t *testing.T, open func(t *testing.T) daemon.Store) {
 		{"FireOnceAndRepeat", fireOnceAndRepeat},
 		{"Outbox", outbox},
 		{"Delivery", delivery},
+		{"LedgerWritesStepsDown", ledgerWritesStepsDown},
+		{"LedgerMovesCalls", ledgerMovesCalls},
+		{"LedgerKeepsEveryState", ledgerKeepsEveryState},
+		{"LedgerFilters", ledgerFilters},
+		{"LedgerIsFenced", ledgerIsFenced},
+		{"InflightGoesWithTheSession", inflightGoesWithTheSession},
+		{"SubRunsAreKept", subRunsAreKept},
+		{"PruneForgetsWhatNothingCarriesOn", pruneForgetsWhatNothingCarriesOn},
+		{"TimersDedup", timersDedup},
 	} {
 		t.Run(tc.name, func(t *testing.T) { tc.fn(t, open(t)) })
 	}
@@ -142,7 +151,12 @@ func sessionRoundTrip(t *testing.T, st daemon.Store) {
 		{Event: 3, Kind: daemon.KindMessage, Source: "slack", From: "alice", At: t0},
 		{Event: 4, Kind: "push", Source: "github", At: t0.Add(time.Millisecond)},
 	}}
+	rec.DeferredStep = 3
+	rec.Results = map[llm.ToolUseID]daemon.Posted{"j1": {Output: "built", IsError: true}}
+	rec.Inflight = &daemon.Inflight{Turn: 3, Step: 4, Base: -1, Iterations: 2, Events: []int64{8},
+		Messages: []llm.Message{llm.UserText("go on")}}
 	create(t, st, rec)
+	rec.Lease.Epoch = 1 // its first tenure, whatever the record said
 
 	got, err := st.LoadSession(ctx, "s1")
 	if err != nil {
@@ -255,6 +269,8 @@ func deleteTakesEverything(t *testing.T, st daemon.Store) {
 		if _, _, err := st.Post(ctx, daemon.Message{Session: s, Kind: daemon.MessageSent, Text: "x"}); err != nil {
 			t.Fatal(err)
 		}
+		openStep(t, st, daemon.StepOpen{Session: s, Turn: 1, At: t0, Calls: []daemon.ToolCall{call(0, "u1", "read", `{}`)}})
+		openStep(t, st, daemon.StepOpen{Session: s, Turn: 1, Parent: s + "/1.0", Run: 1, At: t0, Sub: &daemon.SubRun{}})
 	}
 	if err := st.DeleteSession(ctx, "gone"); err != nil {
 		t.Fatal(err)
@@ -270,6 +286,15 @@ func deleteTakesEverything(t *testing.T, st daemon.Store) {
 	}
 	if events[0].Session != "kept" || timers[0].Session != "kept" || msgs[0].Session != "kept" {
 		t.Error("the delete took the wrong session's rows")
+	}
+	if calls := toolCalls(t, st, daemon.CallFilter{}); len(calls) != 1 || calls[0].Session != "kept" {
+		t.Errorf("the ledger kept %v, want only the kept session's call", keys(calls))
+	}
+	if _, ok, _ := st.SubRun(ctx, "kept", "kept/1.0", 1); !ok {
+		t.Error("the kept session lost its sub-agent")
+	}
+	if _, _, err := st.SubRun(ctx, "gone", "gone/1.0", 1); !errors.Is(err, daemon.ErrNoSuchSession) {
+		t.Errorf("SubRun of a deleted session = %v, want ErrNoSuchSession", err)
 	}
 	if _, _, err := st.Enqueue(ctx, message("gone", "hi", t0)); !errors.Is(err, daemon.ErrNoSuchSession) {
 		t.Errorf("Enqueue to a deleted session = %v, want ErrNoSuchSession", err)
@@ -395,13 +420,16 @@ func awaitingTakesOnlyApprovals(t *testing.T, st daemon.Store) {
 	if ready, _ := st.Ready(ctx, t0, owner, nil, 10); !slices.Equal(ready, []string{"s1"}) {
 		t.Fatalf("Ready = %v, want the session, for its approval", ready)
 	}
-	if got, _ := st.Claim(ctx, "s1", owner, t0, 10); !slices.Equal(ids(got), []int64{ok.ID}) {
-		t.Fatalf("Claim = %v, want only the approval %d", ids(got), ok.ID)
+	// A result for a call it waits on is one too.
+	res := enqueue(t, st, daemon.Event{Session: "s1", Kind: daemon.KindResult, Source: daemon.SourceAPI,
+		Payload: json.RawMessage(`{"use_id":"j1","output":"built"}`), Created: t0})
+	if got, _ := st.Claim(ctx, "s1", owner, t0, 10); !slices.Equal(ids(got), []int64{ok.ID, res.ID}) {
+		t.Fatalf("Claim = %v, want only the approval %d and the result %d", ids(got), ok.ID, res.ID)
 	}
 
 	// Decided, it takes everything again.
 	rec.State, rec.Deferred = daemon.Idle, nil
-	if err := st.Settle(ctx, daemon.Settlement{Session: rec, Done: []int64{ok.ID}}); err != nil {
+	if err := st.Settle(ctx, daemon.Settlement{Session: rec, Done: []int64{ok.ID, res.ID}}); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := st.Claim(ctx, "s1", owner, t0, 10); !slices.Equal(ids(got), []int64{msg.ID}) {

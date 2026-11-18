@@ -97,6 +97,65 @@ var migrations = []string{
 		ADD COLUMN lease_until timestamptz;
 	CREATE INDEX sessions_owner ON sessions (owner) WHERE owner IS NOT NULL;
 	`,
+
+	// 4: the ledger — every tool call a session's turns make, from the moment
+	// the model asks for it until it has its result, and where the sub-agents
+	// those calls start had got to — and where a turn in flight had got to,
+	// for a daemon that takes it over to carry it on from: daemon.ToolCall,
+	// daemon.Store.OpenStep. epoch fences a daemon's writes to the tenure it
+	// made them in: daemon.Lease.Epoch. A timer's dedup_key makes a call that
+	// sets one, run again, set it once.
+	`
+	ALTER TABLE sessions
+		ADD COLUMN epoch    bigint NOT NULL DEFAULT 1,
+		ADD COLUMN steps    integer NOT NULL DEFAULT 0,
+		ADD COLUMN inflight json;
+
+	CREATE TABLE tool_calls (
+		session_id text NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
+		step       integer NOT NULL,
+		idx        integer NOT NULL,
+		turn       integer NOT NULL,
+		-- the call whose sub-agent made this one, and which of its sub-agents
+		parent     text NOT NULL DEFAULT '',
+		run        integer NOT NULL DEFAULT 0,
+		use_id     text NOT NULL,
+		tool       text NOT NULL,
+		input      json,
+		state      text NOT NULL
+		           CHECK (state IN ('pending', 'running', 'succeeded', 'failed', 'denied',
+		                            'deferred', 'waiting', 'interrupted', 'cancelled')),
+		attempts   integer NOT NULL DEFAULT 0,
+		output     text NOT NULL DEFAULT '',
+		is_error   boolean NOT NULL DEFAULT false,
+		media      json,
+		tags       text[] NOT NULL DEFAULT '{}',
+		reason     text NOT NULL DEFAULT '',
+		handle     text NOT NULL DEFAULT '',
+		decision   json,
+		owner      text NOT NULL DEFAULT '',
+		created    timestamptz NOT NULL,
+		started    timestamptz,
+		finished   timestamptz,
+		PRIMARY KEY (session_id, step, idx)
+	);
+	CREATE INDEX tool_calls_newest ON tool_calls (created DESC, step DESC, idx DESC);
+	CREATE INDEX tool_calls_parent ON tool_calls (session_id, parent) WHERE parent <> '';
+	CREATE INDEX tool_calls_ended ON tool_calls ((coalesce(finished, created)));
+
+	CREATE TABLE tool_runs (
+		session_id text NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
+		parent     text NOT NULL,
+		run        integer NOT NULL,
+		step       integer NOT NULL,
+		messages   json NOT NULL,
+		iterations integer NOT NULL,
+		updated    timestamptz NOT NULL,
+		PRIMARY KEY (session_id, parent, run)
+	);
+
+	ALTER TABLE timers ADD COLUMN dedup_key text UNIQUE;
+	`,
 }
 
 // migrate brings the schema up to date. A transaction-scoped advisory lock
