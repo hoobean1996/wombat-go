@@ -32,6 +32,12 @@ type TurnStarted struct {
 	// transcript's origins will keep them: who said what, through which
 	// channel. For a turn resuming after decisions, the decisions.
 	Origins []Origin `json:"origins,omitempty"`
+
+	// Resumed is a turn carried on from where it was written down — the
+	// daemon that ran it stopped, or it failed and is tried again — rather
+	// than begun: its number is the one it had, and its events and origins
+	// are the ones it began with.
+	Resumed bool `json:"resumed,omitempty"`
 }
 
 // TurnEnded closes one turn and says how.
@@ -63,9 +69,10 @@ type TurnEnded struct {
 	// submitted.
 	Tool string `json:"tool,omitempty"`
 
-	// Approvals are the calls waiting for a decision, when the turn ended
-	// deferred.
+	// Approvals are the calls waiting for a decision, and Awaiting those
+	// waiting for a result, when the turn ended deferred.
 	Approvals []Approval `json:"approvals,omitempty"`
+	Awaiting  []Approval `json:"awaiting,omitempty"`
 
 	// Error and ErrorKind describe a failed turn. ErrorKind is bounded; see
 	// [ErrorKind].

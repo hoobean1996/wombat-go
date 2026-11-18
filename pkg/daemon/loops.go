@@ -8,10 +8,11 @@ import (
 	"time"
 )
 
-// The five loops a Manager runs: the worker, which turns events into turns;
+// The six loops a Manager runs: the worker, which turns events into turns;
 // the timers, which turn time into events; the dispatcher, which sends the
-// outbox; the sweeper, which drops what memory no longer needs; and the
-// renewer, which keeps this daemon's hold on the sessions it has.
+// outbox; the sweeper, which drops what memory no longer needs; the renewer,
+// which keeps this daemon's hold on the sessions it has; and the pruner, which
+// forgets the tool calls of the ledger once they are old enough.
 
 // work claims what is ready, whenever it is told there is something and at
 // every poll.
@@ -296,5 +297,37 @@ func (m *Manager) renewAt(now time.Time) {
 	for _, s := range lost {
 		m.cfg.Logger.Warn("daemon: lost a session to another daemon, or to a deletion", "session", s.id)
 		go s.close() // it waits for the turn to stop; the renewer does not
+	}
+}
+
+// prune forgets, every prunePeriod, the calls of the ledger that ended
+// longer than LedgerRetention ago. One daemon of those sharing the store does
+// it: the one that leads "prune".
+func (m *Manager) prune() {
+	defer m.loops.Done()
+	t := time.NewTicker(prunePeriod)
+	defer t.Stop()
+	for {
+		m.pruneAt(time.Now())
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
+func (m *Manager) pruneAt(now time.Time) {
+	ctx, cancel := context.WithTimeout(m.ctx, storeTimeout)
+	defer cancel()
+	if lead, err := m.store.Lead(ctx, "prune", m.cfg.Name, now.Add(2*prunePeriod)); err != nil || !lead {
+		return
+	}
+	n, err := m.store.PruneCalls(ctx, now.Add(-m.cfg.LedgerRetention))
+	switch {
+	case err != nil && m.ctx.Err() == nil:
+		m.cfg.Logger.Warn("daemon: pruning the ledger failed", "err", err)
+	case n > 0:
+		m.cfg.Logger.Info("ledger pruned", "calls", n)
 	}
 }

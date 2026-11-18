@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -155,5 +156,89 @@ func TestADaemonOnPostgresCarriesOnAfterARestart(t *testing.T) {
 	}
 	if len(events) != 3 {
 		t.Errorf("%d events, want the message, the decision and the timer", len(events))
+	}
+}
+
+// A daemon on Postgres dies in the middle of a turn — its connections go,
+// and with them everything it had not written — and the next one carries the
+// turn on from the ledger: the read it did is not done again, and the write
+// that was running when it died is not run again but reported.
+func TestADaemonOnPostgresCarriesATurnOnAfterItDied(t *testing.T) {
+	ctx := context.Background()
+	where := schema(t)
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	var reads, writes atomic.Int64
+	took, hold := make(chan struct{}, 4), make(chan struct{})
+	defer close(hold)
+	read := tool.Def{Name: "read", Description: "reads", InputSchema: json.RawMessage(`{"type":"object"}`), Caps: tool.CapReadOnly,
+		Fn: func(context.Context, json.RawMessage) (string, error) { reads.Add(1); return "the file says 42", nil }}
+	write := tool.Def{Name: "write", Description: "writes", InputSchema: json.RawMessage(`{"type":"object"}`), Caps: tool.CapMutating,
+		Fn: func(ctx context.Context, _ json.RawMessage) (string, error) {
+			writes.Add(1)
+			took <- struct{}{}
+			select {
+			case <-hold:
+			case <-ctx.Done():
+			}
+			return "written", nil
+		}}
+	cl := &replies{next: []llm.Response{
+		{Content: []llm.ContentBlock{llm.ToolUse{ID: "r1", Name: "read", Input: json.RawMessage(`{}`)}}, StopReason: llm.StopToolUse},
+		{Content: []llm.ContentBlock{llm.ToolUse{ID: "w1", Name: "write", Input: json.RawMessage(`{}`)}}, StopReason: llm.StopToolUse},
+		say("carried on"),
+	}}
+	build := func(daemon.SessionOptions) (*core.Agent, error) {
+		return core.New(core.WithClient(cl), core.WithModel("m"), core.WithTools(read, write), core.WithLogger(quiet))
+	}
+	start := func() (*postgres.Store, *daemon.Manager) {
+		st := open(t, where)
+		if err := st.Lock(ctx, "d1"); err != nil {
+			t.Fatal(err)
+		}
+		m, err := daemon.NewManager(daemon.ManagerConfig{Store: st, Build: build, Name: "d1", Poll: 5 * time.Millisecond, Logger: quiet})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return st, m
+	}
+
+	st, m := start()
+	s, err := m.Create(ctx, daemon.SessionOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := s.Send(ctx, "read it, then write it down")
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-took
+	// Dead: nothing it does from here reaches the database.
+	st.Close()
+	defer m.Close()
+
+	next, m2 := start()
+	defer next.Close()
+	defer m2.Close()
+	again, err := m2.Get(ctx, s.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := ended(t, again, 1)
+	if done.Answer != "carried on" || done.RetryAt != (time.Time{}) || !slices.Contains(done.Events, msg.ID) {
+		t.Fatalf("the turn carried on = %+v", done)
+	}
+	if reads.Load() != 1 || writes.Load() != 1 {
+		t.Fatalf("read %d times and wrote %d; want each once", reads.Load(), writes.Load())
+	}
+	calls, err := m2.ToolCalls(ctx, daemon.CallFilter{Session: s.ID()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	states := map[string]tool.State{}
+	for _, c := range calls {
+		states[string(c.UseID)] = c.State
+	}
+	if states["r1"] != tool.StateSucceeded || states["w1"] != tool.StateFailed {
+		t.Fatalf("the ledger = %+v, want the read succeeded and the write failed as interrupted", calls)
 	}
 }

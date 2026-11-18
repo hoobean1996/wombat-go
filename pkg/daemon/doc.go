@@ -18,11 +18,10 @@
 // side, up to [ManagerConfig.MaxRuns].
 //
 // A turn that fails for a reason worth another try — the provider fell over,
-// the daemon was stopped mid-turn — puts its events back, to be tried again
-// after a backoff, up to [ManagerConfig.Attempts] times; it runs again from
-// the transcript as it was before, so nothing it did is in the conversation
-// twice. Anything else a turn did on the way — a file written, a message sent
-// — it may do again: delivery is at least once.
+// the daemon was stopped mid-turn, or died — puts its events back, to be
+// tried again after a backoff, up to [ManagerConfig.Attempts] times; and it
+// carries on from where it got to, rather than starting over. See "The
+// ledger".
 //
 // # Timers
 //
@@ -40,7 +39,41 @@
 // outbox says what is waiting. The decision comes back as an event — see
 // [Session.Resolve] — and once every call is decided the turn resumes where
 // it stopped, the approved calls run, and the model reads their real output.
-// Until then the session takes nothing but decisions.
+// Until then the session takes nothing but decisions. An approved call runs
+// once: the ledger says whether it ran before a resumed turn was cut short.
+//
+// # Waiting for a result
+//
+// A call that starts something finishing outside the session — a build, a
+// job — can end the turn instead of holding it open, with [tool.Await]; the
+// agent does so with the wait_for_result tool. The session is [Awaiting], and
+// the result posted for the call ([Session.Complete]) is what the call
+// returns: once every call the session waits on has its result, or its
+// decision, the turn resumes.
+//
+// # The ledger
+//
+// A turn writes itself down as it goes (see [core.Journal]): every reply of
+// the model before anything the reply asks for happens — its tool calls,
+// pending, and where the turn has got to, in one write — and every call that
+// is not safe to run again as it starts and as it ends. That is the ledger
+// ([ToolCall], [Manager.ToolCalls]), kept beside the session.
+//
+// A turn tried again — here after the provider fell over, or by the daemon
+// that takes the session over after this one died — and a turn resumed on a
+// decision start from what the ledger has: a call that ended is answered with
+// what it returned and does not run again; one that never started runs now;
+// one that was running, and so may or may not have taken effect, is run again
+// if its tool is safe to run again, and otherwise reported to the model as
+// interrupted — or put to a person, as its [tool.Recovery] says. The daemon's
+// own tools are safe to run again: a message is sent once, and a timer set
+// once, however often the call runs.
+//
+// A turn carried on keeps its number, its budget — what its earlier runs used
+// counts against it — and its spend, counted once. Every write fences on the
+// lease the turn began under and its epoch ([Lease.Epoch]), so a daemon that
+// lost the session writes none of it. The ledger keeps a call for
+// [ManagerConfig.LedgerRetention] after it ended.
 //
 // # The outbox
 //
@@ -53,8 +86,8 @@
 //
 // # What is kept
 //
-// Sessions and the three tables live in a [Store]: [MemoryStore], or Postgres
-// with wombat/pkg/store/postgres. A session in memory is a cache of its
+// Sessions, the three tables and the ledger live in a [Store]: [MemoryStore],
+// or Postgres with wombat/pkg/store/postgres. A session in memory is a cache of its
 // record — it is loaded when it is needed and dropped after
 // [ManagerConfig.Idle] without anything to do — and so is its event log, which
 // a stream resumes from and a restart does not keep.

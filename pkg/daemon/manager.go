@@ -49,6 +49,10 @@ const (
 	// another takes them over. Renewed every third of it.
 	DefaultLease = 30 * time.Second
 
+	// DefaultLedgerRetention is how long the ledger keeps a tool call once
+	// it has ended.
+	DefaultLedgerRetention = 30 * 24 * time.Hour
+
 	// DefaultRetryDelay is the backoff before an event's second try; it
 	// doubles for each try after.
 	DefaultRetryDelay = 10 * time.Second
@@ -72,6 +76,9 @@ const (
 
 	// storeTimeout bounds a store call the daemon makes on its own behalf.
 	storeTimeout = 30 * time.Second
+
+	// prunePeriod is how often the ledger is pruned.
+	prunePeriod = time.Hour
 
 	// deliverTimeout bounds one delivery.
 	deliverTimeout = 30 * time.Second
@@ -157,6 +164,12 @@ type ManagerConfig struct {
 	// returns an error for is tried again after a backoff. nil leaves the
 	// messages to a client, which acks them. See [Webhook].
 	Deliver func(context.Context, Message) error
+
+	// LedgerRetention is how long the ledger keeps a tool call once it has
+	// ended — see [Store.PruneCalls] — for the sessions with no turn in
+	// flight and nothing waiting. Default DefaultLedgerRetention; negative
+	// keeps every call.
+	LedgerRetention time.Duration
 }
 
 // Manager runs sessions: it takes their events from the inbox, runs their
@@ -231,6 +244,9 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 	if cfg.Name == "" {
 		cfg.Name = "wombatd-" + newID()[:12]
 	}
+	if cfg.LedgerRetention == 0 {
+		cfg.LedgerRetention = DefaultLedgerRetention
+	}
 
 	// The turns this daemon was running when it last stopped, under this
 	// name, died with it; nobody else's are touched.
@@ -261,6 +277,10 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 	go m.schedule()
 	go m.sweep()
 	go m.renew()
+	if cfg.LedgerRetention > 0 {
+		m.loops.Add(1)
+		go m.prune()
+	}
 	if cfg.Deliver != nil {
 		m.loops.Add(1)
 		go m.deliver()
@@ -295,6 +315,7 @@ func (m *Manager) create(ctx context.Context, opts SessionOptions, thread string
 	if err := m.store.CreateSession(ctx, rec); err != nil {
 		return nil, err
 	}
+	s.epoch = 1 // a new session's first tenure; see Store.CreateSession
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
@@ -383,15 +404,18 @@ func (m *Manager) load(ctx context.Context, id string) (*Session, error) {
 }
 
 // interrupted is a record saved as running, as it stands now that the turn is
-// not: still stopped on its decision if it was resuming one, failed
-// otherwise.
+// not: still stopped on its decision if it was resuming one and got nowhere
+// it wrote down, failed otherwise.
 func interrupted(rec SessionRecord) SessionRecord {
-	if rec.Deferred != nil {
-		rec.State = Approving
+	if rec.Deferred != nil && rec.Inflight == nil {
+		rec.State = stateOf(rec.Deferred)
 		return rec
 	}
 	rec.State, rec.Outcome, rec.Answer = Failed, "", ""
 	rec.Error, rec.ErrorKind = "the daemon stopped while this turn was running; its events will run again", KindInterrupted
+	if rec.Inflight != nil {
+		rec.Error = "the daemon stopped while this turn was running; it carries on from where it got to"
+	}
 	return rec
 }
 
@@ -483,7 +507,7 @@ func (m *Manager) Receive(ctx context.Context, in Inbound) (Event, bool, error) 
 	switch {
 	case !validName.MatchString(in.Kind):
 		return Event{}, false, fmt.Errorf("%w: kind %q is not a name", ErrBadRequest, in.Kind)
-	case in.Kind == KindApproval || in.Kind == KindTimer:
+	case in.Kind == KindApproval || in.Kind == KindTimer || in.Kind == KindResult:
 		return Event{}, false, fmt.Errorf("%w: a %s is not posted as an event", ErrBadRequest, in.Kind)
 	case !validName.MatchString(in.Source):
 		return Event{}, false, fmt.Errorf("%w: source %q is not a name", ErrBadRequest, in.Source)
@@ -670,6 +694,13 @@ func (m *Manager) AddTimer(ctx context.Context, t Timer) (Timer, error) {
 // not empty.
 func (m *Manager) CancelTimer(ctx context.Context, id int64, session string) error {
 	return m.store.CancelTimer(ctx, id, session)
+}
+
+// ToolCalls lists the ledger, the newest call first: every tool call the
+// sessions' turns made, what came of it, and how many times it ran. See
+// [ToolCall].
+func (m *Manager) ToolCalls(ctx context.Context, f CallFilter) ([]ToolCall, error) {
+	return m.store.ToolCalls(ctx, f)
 }
 
 // Timers lists timers, the soonest due first.

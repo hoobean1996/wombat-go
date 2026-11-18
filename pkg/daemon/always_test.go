@@ -380,7 +380,11 @@ func TestToolsWorkOnlyInADaemonTurn(t *testing.T) {
 			t.Errorf("%s outside a turn = %v, want it to say why not", d.Name, err)
 		}
 	}
-	if !slices.Equal(ToolNames(), []string{Tools()[0].Name, Tools()[1].Name, Tools()[2].Name, Tools()[3].Name}) {
+	var names []string
+	for _, d := range Tools() {
+		names = append(names, d.Name)
+	}
+	if !slices.Equal(ToolNames(), names) {
 		t.Error("ToolNames does not name Tools")
 	}
 }
