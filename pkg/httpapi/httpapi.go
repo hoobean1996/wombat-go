@@ -19,8 +19,10 @@
 //	GET    /api/sessions/{id}/file?path=          a file in its workspace, and a /files/ URL to read it
 //	POST   /api/sessions/{id}/messages            a message, for the next turn: {prompt, from}
 //	POST   /api/sessions/{id}/steer               a message for the turn in progress
-//	GET    /api/sessions/{id}/approvals           what is waiting for a decision
+//	GET    /api/sessions/{id}/approvals           what is waiting for a decision, and for a result
 //	POST   /api/sessions/{id}/approvals/{use_id}  {"allow": true|false, "from": "..."}
+//	POST   /api/sessions/{id}/results/{use_id}    {"output": "...", "is_error": false, "from": "..."}
+//	GET    /api/tool-calls                        the ledger, newest first; ?session= ?state= ?turn= ?step= ?parent=
 //	POST   /api/events                            an event from outside: a webhook, an alert, a relayed chat
 //	GET    /api/inbox                             events, newest first; ?session= ?status=
 //	GET    /api/outbox                            messages, oldest first; ?after= ?wait=
@@ -241,7 +243,31 @@ type SessionList struct {
 }
 
 // ApprovalList is the body of GET /api/sessions/{id}/approvals, for the same
-// reason [SessionList] is an object.
+// reason [SessionList] is an object: the calls waiting for a decision, and
+// those waiting for a result (POST /api/sessions/{id}/results/{use_id}).
 type ApprovalList struct {
 	Approvals []daemon.Approval `json:"approvals"`
+	Awaiting  []daemon.Approval `json:"awaiting"`
+}
+
+// ResultRequest is the body of POST /api/sessions/{id}/results/{use_id}: the
+// result of a call the session is waiting on, which started something that
+// finishes outside it — a build, a job. The call returns Output, as if its
+// tool had, or fails with it when IsError.
+//
+// Output is a pointer for the reason [ResolveRequest.Allow] is: a body that
+// omits it is a 400, not an empty result.
+type ResultRequest struct {
+	Output  *string `json:"output"`
+	IsError bool    `json:"is_error,omitempty"`
+
+	// From names who, or what, posted it; kept with the call's result in the
+	// transcript's origins. Optional.
+	From string `json:"from,omitempty"`
+}
+
+// ToolCallList is the body of GET /api/tool-calls: calls of the ledger, the
+// newest first. See [daemon.ToolCall].
+type ToolCallList struct {
+	Calls []daemon.ToolCall `json:"calls"`
 }

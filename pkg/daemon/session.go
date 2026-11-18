@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"iter"
 	"maps"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -97,6 +98,20 @@ type Session struct {
 	deferredAt time.Time
 	decidedBy  []Origin
 	replyTo    []int64
+
+	// deferredStep is the step of the ledger deferred is on, and results
+	// what has been posted for its calls that await one.
+	deferredStep int
+	results      map[llm.ToolUseID]Posted
+
+	// inflight is the turn in flight as it was last written down: by the
+	// journal of the turn running, or by one a daemon that stopped left to
+	// carry on. nil between turns.
+	inflight *Inflight
+
+	// epoch is the tenure this daemon holds the session in; every write of
+	// it is made under it. Set when the session is made or loaded.
+	epoch int64
 }
 
 func (m *Manager) newSession(rec SessionRecord, agent *core.Agent) *Session {
@@ -107,7 +122,8 @@ func (m *Manager) newSession(rec SessionRecord, agent *core.Agent) *Session {
 		msgs: rec.Messages, origins: rec.Origins, spend: rec.Spend,
 		outcome: rec.Outcome, answer: rec.Answer, errText: rec.Error, errKind: rec.ErrorKind, pauseID: rec.PauseID,
 		deferred: rec.Deferred, verdicts: rec.Verdicts, deferredAt: rec.DeferredAt, decidedBy: rec.DecidedBy,
-		replyTo: rec.ReplyTo,
+		replyTo: rec.ReplyTo, deferredStep: rec.DeferredStep, results: rec.Results, inflight: rec.Inflight,
+		epoch: rec.Lease.Epoch,
 	}
 }
 
@@ -119,18 +135,21 @@ func (s *Session) record() SessionRecord {
 }
 
 func (s *Session) recordLocked() SessionRecord {
-	return SessionRecord{
-		// The owner, so the store writes the record only while this daemon
-		// still holds the session.
-		Lease:   Lease{Owner: s.m.cfg.Name},
-		Version: RecordVersion, ID: s.id, Thread: s.thread, Options: s.opts,
+	rec := SessionRecord{
+		// The owner and its tenure, so the store writes the record only while
+		// this daemon still holds the session, as it held it when it took it.
+		Lease: Lease{Owner: s.m.cfg.Name, Epoch: s.epoch},
+		ID:    s.id, Thread: s.thread, Options: s.opts,
 		Created: s.created, Updated: s.updated,
 		Turns: s.turns, State: s.state, Messages: s.msgs, Origins: maps.Clone(s.origins), Spend: s.spend,
 		Outcome: s.outcome, Answer: s.answer, Error: s.errText, ErrorKind: s.errKind, PauseID: s.pauseID,
 		Deferred: s.deferred, Verdicts: maps.Clone(s.verdicts), DeferredAt: s.deferredAt,
 		DecidedBy: slices.Clone(s.decidedBy), ReplyTo: slices.Clone(s.replyTo),
+		DeferredStep: s.deferredStep, Results: maps.Clone(s.results), Inflight: s.inflight,
 		Events: s.base + len(s.frames),
 	}
+	rec.Version = layoutOf(rec)
+	return rec
 }
 
 // ID returns the session's opaque identifier.
@@ -234,7 +253,7 @@ func (s *Session) ResolveAs(ctx context.Context, from, useID string, allow bool)
 		return Event{}, err
 	}
 	s.mu.Lock()
-	waiting := s.waitingOnLocked(llm.ToolUseID(useID))
+	waiting := s.decidingLocked(llm.ToolUseID(useID))
 	_, decided := s.verdicts[llm.ToolUseID(useID)]
 	s.mu.Unlock()
 	switch {
@@ -268,7 +287,78 @@ func (s *Session) Pending() []Approval {
 	}
 	var out []Approval
 	for _, c := range s.deferred.Calls {
-		if _, decided := s.verdicts[c.UseID]; !decided {
+		if _, decided := s.verdicts[c.UseID]; !decided && !c.Awaiting {
+			out = append(out, approvalOf(c, s.deferredAt))
+		}
+	}
+	return out
+}
+
+// ResultPayload is the payload of a [KindResult] event.
+type ResultPayload struct {
+	UseID   llm.ToolUseID `json:"use_id"`
+	Output  string        `json:"output"`
+	IsError bool          `json:"is_error,omitempty"`
+}
+
+// Complete posts the result of a call the session is waiting on, which
+// started something that finishes outside the session ([tool.Await]): the
+// call returns it, as if its tool had, or fails with it when isError. The
+// result is an event like any other; once every call the session waits on
+// has its result, or its decision, the turn resumes.
+//
+// It reports [ErrNoSuchApproval] for a call that is not waiting for a
+// result, and [ErrAlreadyAnswered] for one that has its result.
+func (s *Session) Complete(ctx context.Context, useID, output string, isError bool) (Event, error) {
+	return s.CompleteAs(ctx, "", useID, output, isError)
+}
+
+// CompleteAs is [Session.Complete] by someone named, kept, like a decision,
+// with the call's result in the transcript's origins. An empty from is
+// Complete.
+func (s *Session) CompleteAs(ctx context.Context, from, useID, output string, isError bool) (Event, error) {
+	if err := CheckFrom(from); err != nil {
+		return Event{}, err
+	}
+	if err := s.open(); err != nil {
+		return Event{}, err
+	}
+	s.mu.Lock()
+	waiting := s.awaitingOnLocked(llm.ToolUseID(useID))
+	_, posted := s.results[llm.ToolUseID(useID)]
+	s.mu.Unlock()
+	switch {
+	case !waiting:
+		return Event{}, fmt.Errorf("%w: no call %s is waiting for a result", ErrNoSuchApproval, useID)
+	case posted:
+		return Event{}, fmt.Errorf("%w: call %s has its result", ErrAlreadyAnswered, useID)
+	}
+	payload, _ := json.Marshal(ResultPayload{UseID: llm.ToolUseID(useID), Output: output, IsError: isError})
+	e, created, err := s.m.enqueue(ctx, Event{
+		Session: s.id, Kind: KindResult, Source: SourceAPI, From: from, Payload: payload,
+		// One result per call, however many times it is posted.
+		DedupKey: "result:" + s.id + ":" + useID,
+	})
+	if err != nil {
+		return Event{}, err
+	}
+	if !created {
+		return Event{}, fmt.Errorf("%w: call %s has its result", ErrAlreadyAnswered, useID)
+	}
+	s.touch()
+	return e, nil
+}
+
+// Awaited lists the calls waiting for a result that has not been posted.
+func (s *Session) Awaited() []Approval {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.deferred == nil {
+		return nil
+	}
+	var out []Approval
+	for _, c := range s.deferred.Calls {
+		if _, posted := s.results[c.UseID]; !posted && c.Awaiting {
 			out = append(out, approvalOf(c, s.deferredAt))
 		}
 	}
@@ -335,11 +425,28 @@ func (s *Session) allowPending(ctx context.Context) {
 }
 
 func approvalOf(c core.DeferredCall, since time.Time) Approval {
-	return Approval{UseID: string(c.UseID), Tool: c.Tool, Reason: c.Reason, Input: jsonOrNil(c.Input), Since: since}
+	return Approval{UseID: string(c.UseID), Tool: c.Tool, Reason: c.Reason, Input: jsonOrNil(c.Input), Since: since,
+		Awaiting: c.Awaiting, Handle: c.Handle}
 }
 
-func (s *Session) waitingOnLocked(id llm.ToolUseID) bool {
-	return s.deferred != nil && slices.ContainsFunc(s.deferred.Calls, func(c core.DeferredCall) bool { return c.UseID == id })
+// decidingLocked reports whether the session waits on a decision about id.
+func (s *Session) decidingLocked(id llm.ToolUseID) bool {
+	return s.deferred != nil && slices.ContainsFunc(s.deferred.Calls, func(c core.DeferredCall) bool { return c.UseID == id && !c.Awaiting })
+}
+
+// awaitingOnLocked reports whether the session waits on a result for id.
+func (s *Session) awaitingOnLocked(id llm.ToolUseID) bool {
+	return s.deferred != nil && slices.ContainsFunc(s.deferred.Calls, func(c core.DeferredCall) bool { return c.UseID == id && c.Awaiting })
+}
+
+// stateOf is the state a session stopped on d is in: approving while any
+// call waits on a person's decision, awaiting while they only wait on
+// results.
+func stateOf(d *core.Deferred) State {
+	if len(d.Decisions()) > 0 {
+		return Approving
+	}
+	return Awaiting
 }
 
 // Steer passes prompt to the turn in progress; see core.Run.Steer. It is
@@ -387,8 +494,40 @@ func (s *Session) open() error {
 
 // ===== A turn =====
 
+// turnStart is what a turn begins from: the run's input, and what the session
+// records of the turn besides.
+type turnStart struct {
+	in      core.Input
+	prompt  string
+	replyTo []int64
+	prov    provenance
+	handled []Event
+
+	// resumed is the turn in flight this one carries on, when it is one.
+	resumed *Inflight
+
+	// step is the step of the ledger a run resumed on decisions starts on,
+	// and decided the decisions on its calls this batch brought.
+	step    int
+	decided map[llm.ToolUseID]*Decision
+
+	// abandoned is a turn in flight nothing will carry on, and its step's
+	// calls, closed before this turn begins.
+	abandoned     *Inflight
+	abandonedRows []ToolCall
+}
+
 // handle runs one claimed batch of the session's events.
 func (s *Session) handle(batch []Event) {
+	// What the ledger has of the steps the session stopped on, read before
+	// the session is locked: no reader of the session waits on the store.
+	inflightRows, deferredRows, err := s.stoppedOn()
+	if err != nil {
+		s.m.logger().Warn("daemon: reading the ledger failed", "session", s.id, "err", err)
+		s.m.settle(Settlement{Retry: eventIDs(batch), RetryAt: time.Now().Add(s.m.cfg.RetryDelay), Error: err.Error()})
+		return
+	}
+
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -398,50 +537,55 @@ func (s *Session) handle(batch []Event) {
 	s.wg.Add(1)
 	defer s.wg.Done()
 
-	var decisions, rest []Event
-	for _, e := range batch {
-		if e.Kind == KindApproval {
-			decisions = append(decisions, e)
-		} else {
-			rest = append(rest, e)
-		}
-	}
-
 	if s.state == Done {
 		s.mu.Unlock()
 		s.m.settle(Settlement{Failed: eventIDs(batch), Error: ErrDone.Error()})
 		return
 	}
 
-	var in core.Input
-	var prompt string
-	var replyTo []int64
-	prov := provenance{at: -1}
-	handled := batch
-	if s.deferred != nil {
-		for _, e := range decisions {
-			var v ApprovalPayload
-			if json.Unmarshal(e.Payload, &v) == nil && s.waitingOnLocked(v.UseID) {
-				if s.verdicts == nil {
-					s.verdicts = map[llm.ToolUseID]bool{}
-				}
-				s.verdicts[v.UseID] = v.Allow
-				// Once, though a resumed turn that is tried again sees its
-				// decisions again.
-				if !slices.ContainsFunc(s.decidedBy, func(o Origin) bool { return o.Event == e.ID }) {
-					s.decidedBy = append(s.decidedBy, OriginOf(e))
-				}
+	t := turnStart{prov: provenance{at: -1}, handled: batch}
+	if f := s.inflight; f != nil {
+		mine, rest := partition(batch, f.Events)
+		if len(mine) > 0 && f.Base <= len(s.msgs) {
+			// The turn in flight carries on, from where it was written down,
+			// before anything else begins; what came in since waits for the
+			// turn after.
+			if len(rest) > 0 {
+				defer s.m.settle(Settlement{Retry: eventIDs(rest), Error: "held back: the session was carrying on the turn in flight"})
 			}
+			msgs := f.Transcript(s.msgs)
+			t.in = core.Recover(core.Checkpoint{Messages: msgs, Calls: callsOf(inflightRows), Iterations: f.Iterations})
+			t.replyTo, t.handled, t.resumed = slices.Clone(f.ReplyTo), mine, f
+			t.prov = provenance{at: f.At, origins: slices.Clone(f.Origins), folds: slices.Clone(f.Folds)}
+			s.runLocked(t)
+			return
 		}
+		// Its events were given up on: nothing carries it on.
+		t.abandoned, t.abandonedRows, s.inflight = f, inflightRows, nil
+	}
+
+	var decisions, rest []Event
+	for _, e := range batch {
+		if e.Kind == KindApproval || e.Kind == KindResult {
+			decisions = append(decisions, e)
+		} else {
+			rest = append(rest, e)
+		}
+	}
+
+	if s.deferred != nil {
+		decided := s.applyLocked(decisions)
 		if len(rest) > 0 {
 			// A store hands a session waiting on a decision nothing else; if
 			// one did, what it handed over waits for the turn after this.
-			handled = decisions
+			t.handled = decisions
 			defer s.m.settle(Settlement{Retry: eventIDs(rest), Error: "held back: the session was waiting on a decision"})
 		}
-		if !s.decidedLocked() {
+		if !s.resolvedLocked() {
 			s.updated = time.Now()
 			s.mu.Unlock()
+			s.abandon(t.abandoned, t.abandonedRows)
+			s.mark(deferredRows, decided)
 			// Snapshotted once the write is ours, so a permission changed in
 			// between is in it rather than written over.
 			s.writing.Lock()
@@ -449,44 +593,69 @@ func (s *Session) handle(batch []Event) {
 			s.writing.Unlock()
 			return
 		}
-		in = core.Decide(s.msgs, *s.deferred, maps.Clone(s.verdicts))
-		replyTo = s.replyTo
+		// What the ledger has of the calls is the record of what ran: a call
+		// that finished after the decisions, before a crash cut the resumed
+		// run short, is answered from it and does not run again.
+		t.in = core.Decide(s.msgs, *s.deferred, maps.Clone(s.verdicts)).
+			Recorded(callsOf(deferredRows)).Completed(s.completedLocked())
+		t.replyTo = s.replyTo
+		t.step, t.decided = s.deferredStep, decided
 		// The resumed run answers every call of the turn it stopped on in one
 		// message, put right after the transcript it stopped with.
-		prov = provenance{at: len(s.msgs), origins: slices.Clone(s.decidedBy)}
+		t.prov = provenance{at: len(s.msgs), origins: slices.Clone(s.decidedBy)}
 	} else {
 		if len(rest) == 0 {
 			// Decisions on calls nobody is waiting on any more: a race with
-			// the turn that settled them, and nothing to do.
+			// the turn that settled them, and nothing to do — but forget a
+			// turn in flight given up on.
 			s.mu.Unlock()
-			s.m.settle(Settlement{Done: eventIDs(decisions)})
+			set := Settlement{Done: eventIDs(decisions)}
+			s.writing.Lock()
+			if t.abandoned != nil {
+				s.abandon(t.abandoned, t.abandonedRows)
+				set.Session = s.record()
+			}
+			s.settleOrForget(set)
+			s.writing.Unlock()
 			return
 		}
-		prompt = render(rest, s.pauseID != "")
+		t.prompt = render(rest, s.pauseID != "")
 		switch {
 		case len(s.msgs) == 0:
-			in = core.Ask(prompt)
+			t.in = core.Ask(t.prompt)
 		case s.pauseID != "":
 			// The model asked something, and this is what came back: its
 			// tool call gets it, and the siblings it made alongside are closed.
-			in = core.AnswerPause(s.msgs, s.pauseID, prompt)
+			t.in = core.AnswerPause(s.msgs, s.pauseID, t.prompt)
 		default:
 			// Then closes a dangling tool_use first — a cancelled turn leaves
 			// one, and a provider rejects a transcript that still has it.
-			in = core.Then(s.msgs, prompt)
+			t.in = core.Then(s.msgs, t.prompt)
 		}
 		// Each of the three puts what came in at the end of the transcript.
-		prov = provenance{at: len(in.Messages) - 1, origins: originsOf(rest)}
+		t.prov = provenance{at: len(t.in.Messages) - 1, origins: originsOf(rest)}
 		for _, e := range rest {
 			if e.Kind == KindMessage {
-				replyTo = append(replyTo, e.ID)
+				t.replyTo = append(t.replyTo, e.ID)
 			}
 		}
 	}
+	s.runLocked(t)
+}
+
+// runLocked runs the turn t begins: the caller holds s.mu, which it lets go.
+func (s *Session) runLocked(t turnStart) {
+	turn := s.turns + 1
+	var used governor.Used
+	if f := t.resumed; f != nil {
+		// The same turn, carried on: its number, and its budget as it stood.
+		turn, used = f.Turn, f.Used
+	}
+	s.turns = max(s.turns, turn)
 
 	// Background, not a request's context: the turn is no client's. The
 	// budget is per turn, so a long conversation is capped per exchange.
-	ctx, cancel := governor.WithBudget(context.Background(), s.m.cfg.Limits)
+	ctx, cancel := governor.WithBudgetFrom(context.Background(), s.m.cfg.Limits, used)
 	// One grant set per turn: an approval is about the work in front of the
 	// person now, not a standing licence for every later exchange.
 	ctx = permission.WithGrants(ctx, permission.NewGrants())
@@ -494,45 +663,225 @@ func (s *Session) handle(batch []Event) {
 	// For the MCP servers that act for a session's owner (Server.Session).
 	ctx = mcp.WithSession(ctx, s.id)
 
+	ids := eventIDs(t.handled)
+	ready := make(chan struct{})
+	j := &journal{m: s.m, session: s.id, owner: s.m.cfg.Name, epoch: s.epoch, turn: turn, ready: ready, opened: s.opened}
+	j.reopen(0, nil)
+	switch f := t.resumed; {
+	case f != nil:
+		j.frame = *f
+		j.frame.Messages = nil
+		j.reopen(f.Step, t.in.Messages)
+	default:
+		j.frame = Inflight{Turn: turn, Base: sharedPrefix(s.msgs, t.in.Messages), Events: ids,
+			ReplyTo: slices.Clone(t.replyTo), At: t.prov.at, Origins: slices.Clone(t.prov.origins)}
+		if t.step > 0 {
+			j.reopen(t.step, t.in.Messages)
+			j.decided = t.decided
+		}
+	}
+	ctx = core.WithJournal(ctx, j)
+
 	// Under the lock, and deliberately: Start and Buffer only spawn
 	// goroutines, and doing them here is what keeps Cancel and Steer from
 	// seeing a turn half begun.
-	buf := core.Buffer(s.agent.Start(ctx, in))
-	s.turns++
-	turn := s.turns
+	buf := core.Buffer(s.agent.Start(ctx, t.in))
 	s.state, s.run, s.cancel = Running, buf, cancel
 	s.outcome, s.answer, s.errText, s.errKind = "", "", "", ""
-	ids := eventIDs(handled)
-	s.emitLocked(turn, TurnStarted{Turn: turn, Prompt: prompt, Events: ids, Origins: prov.origins})
+	s.emitLocked(turn, TurnStarted{Turn: turn, Prompt: t.prompt, Events: ids, Origins: t.prov.origins, Resumed: t.resumed != nil})
 	// Saved as running, so a daemon that dies mid-turn is found out when the
 	// session is next loaded; the transcript is the one the turn started
 	// from, and the events that make it are in the inbox.
 	rec := s.recordLocked()
 	s.mu.Unlock()
+	s.abandon(t.abandoned, t.abandonedRows)
 	// After any write from outside already under way: it snapshotted before
-	// this turn began, so it is the older of the two.
+	// this turn began, so it is the older of the two. The journal writes
+	// nothing until it is done, so the turn's progress lands on top of it.
 	s.writing.Lock()
 	s.m.save(rec)
 	s.writing.Unlock()
+	close(ready)
 
 	// context.Background, not ctx: the log has to get every event, the ones
 	// saying why a cancelled turn stopped included. Follow returns on its own
 	// once the run is over, which cancelling guarantees.
+	prov := t.prov
 	for _, ev := range buf.Follow(context.Background(), 0) {
 		if c, ok := ev.(core.TranscriptCompacted); ok {
 			prov.folds = append(prov.folds, c.Folded)
 		}
 		s.append(turn, ev)
 	}
-	s.end(ctx, cancel, turn, buf, handled, replyTo, prov)
+	s.end(ctx, cancel, turn, buf, t.handled, t.replyTo, prov, j)
+}
+
+// opened is the journal telling the session where its turn has got to.
+func (s *Session) opened(f Inflight) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.inflight = &f
+}
+
+// stoppedOn reads what the ledger has of the steps the session stopped on:
+// the turn in flight's, and the one its decisions are on.
+func (s *Session) stoppedOn() (inflight, deferred []ToolCall, err error) {
+	s.mu.Lock()
+	var fs, ds int
+	if s.inflight != nil {
+		fs = s.inflight.Step
+	}
+	if s.deferred != nil {
+		ds = s.deferredStep
+	}
+	s.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
+	defer cancel()
+	if fs > 0 {
+		if inflight, err = s.m.store.ToolCalls(ctx, CallFilter{Session: s.id, Step: fs}); err != nil {
+			return nil, nil, err
+		}
+	}
+	switch {
+	case ds == fs:
+		deferred = inflight
+	case ds > 0:
+		if deferred, err = s.m.store.ToolCalls(ctx, CallFilter{Session: s.id, Step: ds}); err != nil {
+			return nil, nil, err
+		}
+	}
+	return inflight, deferred, nil
+}
+
+// applyLocked records the decisions and results that came in, on calls the
+// session is waiting on, and returns the decisions, for the ledger.
+func (s *Session) applyLocked(events []Event) map[llm.ToolUseID]*Decision {
+	decided := map[llm.ToolUseID]*Decision{}
+	for _, e := range events {
+		switch e.Kind {
+		case KindApproval:
+			var v ApprovalPayload
+			if json.Unmarshal(e.Payload, &v) != nil || !s.decidingLocked(v.UseID) {
+				continue
+			}
+			if s.verdicts == nil {
+				s.verdicts = map[llm.ToolUseID]bool{}
+			}
+			s.verdicts[v.UseID] = v.Allow
+			decided[v.UseID] = &Decision{Allow: v.Allow, By: OriginOf(e)}
+		case KindResult:
+			var r ResultPayload
+			if json.Unmarshal(e.Payload, &r) != nil || !s.awaitingOnLocked(r.UseID) {
+				continue
+			}
+			if s.results == nil {
+				s.results = map[llm.ToolUseID]Posted{}
+			}
+			s.results[r.UseID] = Posted{Output: r.Output, IsError: r.IsError}
+		default:
+			continue
+		}
+		// Once, though a resumed turn that is tried again sees its
+		// decisions again.
+		if !slices.ContainsFunc(s.decidedBy, func(o Origin) bool { return o.Event == e.ID }) {
+			s.decidedBy = append(s.decidedBy, OriginOf(e))
+		}
+	}
+	return decided
+}
+
+// completedLocked is the results posted so far, as the tool_results of the
+// calls they are for.
+func (s *Session) completedLocked() map[llm.ToolUseID]llm.ToolResult {
+	if len(s.results) == 0 {
+		return nil
+	}
+	out := make(map[llm.ToolUseID]llm.ToolResult, len(s.results))
+	for id, p := range s.results {
+		out[id] = llm.ToolResult{ToolUseID: id, Content: p.Output, IsError: p.IsError}
+	}
+	return out
+}
+
+// mark writes decisions down on the calls of the ledger they are about,
+// best effort: the session's record has them either way.
+func (s *Session) mark(rows []ToolCall, decided map[llm.ToolUseID]*Decision) {
+	var moves []CallMove
+	for _, r := range rows {
+		if d, ok := decided[r.UseID]; ok && !r.State.Final() {
+			moves = append(moves, CallMove{Index: r.Index, State: r.State, Output: r.Output, IsError: r.IsError,
+				Media: r.Media, Tags: r.Tags, Reason: r.Reason, Handle: r.Handle, Decision: d})
+		}
+	}
+	if len(moves) > 0 {
+		s.moveCalls(rows[0].Step, moves)
+	}
+}
+
+// abandon closes the calls of a turn in flight nothing will carry on: what
+// never started was not run, and what was running may or may not have
+// finished. Best effort.
+func (s *Session) abandon(f *Inflight, rows []ToolCall) {
+	if f == nil {
+		return
+	}
+	s.m.logger().Warn("daemon: a turn in flight was given up on, and is not carried on", "session", s.id, "turn", f.Turn, "step", f.Step)
+	var moves []CallMove
+	for _, r := range rows {
+		switch r.State {
+		case tool.StateRunning:
+			moves = append(moves, CallMove{Index: r.Index, State: tool.StateInterrupted, Reason: "the turn was given up on while this call ran"})
+		case tool.StatePending, tool.StateDeferred, tool.StateWaiting:
+			moves = append(moves, CallMove{Index: r.Index, State: tool.StateCancelled, Reason: "not run: the turn was given up on"})
+		}
+	}
+	if len(moves) > 0 {
+		s.moveCalls(f.Step, moves)
+	}
+}
+
+func (s *Session) moveCalls(step int, moves []CallMove) {
+	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
+	defer cancel()
+	err := s.m.store.MoveCalls(ctx, CallMoves{Session: s.id, Owner: s.m.cfg.Name, Epoch: s.epoch, Step: step, Moves: moves, At: time.Now()})
+	if err != nil && !errors.Is(err, ErrNoSuchSession) && !errors.Is(err, ErrOwned) {
+		s.m.logger().Warn("daemon: writing to the ledger failed", "session", s.id, "step", step, "err", err)
+	}
+}
+
+// partition splits events into those ids names and the rest.
+func partition(events []Event, ids []int64) (in, out []Event) {
+	for _, e := range events {
+		if slices.Contains(ids, e.ID) {
+			in = append(in, e)
+		} else {
+			out = append(out, e)
+		}
+	}
+	return in, out
+}
+
+// sharedPrefix is how many of a session's messages a turn's transcript
+// begins with as they are: all of them, or all but the last, when the
+// turn's first message was folded into it — a user turn after a user turn
+// is one message.
+func sharedPrefix(session, turn []llm.Message) int {
+	n := min(len(session), len(turn))
+	if n > 0 && !reflect.DeepEqual(session[n-1], turn[n-1]) {
+		n--
+	}
+	return n
 }
 
 // end records how a turn ended, says so in the log and the outbox, and
 // settles its events.
-func (s *Session) end(ctx context.Context, cancel context.CancelFunc, turn int, buf *core.Buffered, events []Event, replyTo []int64, prov provenance) {
+func (s *Session) end(ctx context.Context, cancel context.CancelFunc, turn int, buf *core.Buffered, events []Event, replyTo []int64, prov provenance, j *journal) {
 	defer cancel()
 	now := time.Now()
-	end := TurnEnded{Turn: turn, Events: eventIDs(events), Spend: turnSpend(ctx)}
+	// What the turn has cost, all its runs together, less what the session
+	// has counted already: a run of it that stopped to be tried again.
+	total := turnSpend(ctx)
+	end := TurnEnded{Turn: turn, Events: eventIDs(events), Spend: total.minus(j.frame.Counted)}
 	var post []Message
 	reply := func(kind, text string) {
 		post = append(post, Message{Session: s.id, Thread: s.thread, Kind: kind, Text: text, InReplyTo: replyTo, Created: now})
@@ -559,18 +908,31 @@ func (s *Session) end(ctx context.Context, cancel context.CancelFunc, turn int, 
 			reply(MessageReply, end.Answer)
 		}
 	case core.Deferred:
-		end.State, end.Outcome = Approving, "deferred"
+		end.State, end.Outcome = stateOf(&o), "deferred"
 		deferred = &o
 		for _, c := range o.Calls {
-			end.Approvals = append(end.Approvals, approvalOf(c, now))
+			if c.Awaiting {
+				end.Awaiting = append(end.Awaiting, approvalOf(c, now))
+			} else {
+				end.Approvals = append(end.Approvals, approvalOf(c, now))
+			}
 		}
-		data, _ := json.Marshal(struct {
-			Approvals []Approval `json:"approvals"`
-		}{end.Approvals})
 		// InReplyTo, like a reply: the calls are part of answering those
 		// messages, and a client showing the conversation already shows them.
-		post = append(post, Message{Session: s.id, Thread: s.thread, Kind: MessageApproval,
-			Text: approvalText(end.Approvals), Data: data, InReplyTo: replyTo, Created: now})
+		if len(end.Approvals) > 0 {
+			data, _ := json.Marshal(struct {
+				Approvals []Approval `json:"approvals"`
+			}{end.Approvals})
+			post = append(post, Message{Session: s.id, Thread: s.thread, Kind: MessageApproval,
+				Text: approvalText(end.Approvals), Data: data, InReplyTo: replyTo, Created: now})
+		}
+		if len(end.Awaiting) > 0 {
+			data, _ := json.Marshal(struct {
+				Awaiting []Approval `json:"awaiting"`
+			}{end.Awaiting})
+			post = append(post, Message{Session: s.id, Thread: s.thread, Kind: MessageAwaiting,
+				Text: awaitingText(end.Awaiting), Data: data, InReplyTo: replyTo, Created: now})
+		}
 	default:
 		err := buf.Err()
 		end.State, end.Error, end.ErrorKind = Failed, errText(err), ErrorKind(err)
@@ -605,15 +967,22 @@ func (s *Session) end(ctx context.Context, cancel context.CancelFunc, turn int, 
 	if len(retry) == 0 {
 		// Keep the transcript even on failure: the user watched half an
 		// answer arrive, and "it broke, carry on" is the most ordinary thing
-		// a conversation does. A turn that will run again starts over from
-		// the transcript it started from, so it is not there twice.
+		// a conversation does.
 		next.Messages = buf.Messages()
 		next.Origins = prov.apply(s.origins, next.Messages)
 		next.PauseID, next.Deferred, next.Verdicts, next.DeferredAt, next.ReplyTo = pauseID, deferred, nil, time.Time{}, nil
-		next.DecidedBy = nil
+		next.DecidedBy, next.DeferredStep, next.Results, next.Inflight = nil, 0, nil, nil
 		if deferred != nil {
 			next.Verdicts, next.DeferredAt, next.ReplyTo = map[llm.ToolUseID]bool{}, now, replyTo
+			next.DeferredStep = j.at()
 		}
+	} else if next.Inflight != nil {
+		// To be tried again, from where the turn was last written down —
+		// the transcript it started from stays the session's — with what it
+		// has cost so far counted, and carried on.
+		f := *next.Inflight
+		f.Used, f.Counted = governor.FromContext(ctx).Progress().Used(), total
+		next.Inflight = &f
 	}
 	next.Spend.add(end.Spend)
 	next.State = end.State
@@ -641,7 +1010,7 @@ func (s *Session) end(ctx context.Context, cancel context.CancelFunc, turn int, 
 	s.msgs, s.origins, s.spend, s.state = next.Messages, next.Origins, next.Spend, next.State
 	s.outcome, s.answer, s.errText, s.errKind = next.Outcome, next.Answer, next.Error, next.ErrorKind
 	s.pauseID, s.deferred, s.verdicts, s.deferredAt, s.replyTo = next.PauseID, next.Deferred, next.Verdicts, next.DeferredAt, next.ReplyTo
-	s.decidedBy = next.DecidedBy
+	s.decidedBy, s.deferredStep, s.results, s.inflight = next.DecidedBy, next.DeferredStep, next.Results, next.Inflight
 	s.run, s.cancel = nil, nil
 	// What was sent with Steer and never reached the model is handed back,
 	// so a client can send it as a message instead of losing it.
@@ -651,7 +1020,7 @@ func (s *Session) end(ctx context.Context, cancel context.CancelFunc, turn int, 
 	// was snapshotted; and a session switched to full access meanwhile asks
 	// nobody, the calls this turn stopped on included.
 	changed := s.opts != next.Options
-	allow := deferred != nil && s.opts.Permission == PermissionFull
+	allow := len(end.Approvals) > 0 && s.opts.Permission == PermissionFull
 	s.mu.Unlock()
 	s.m.logger().Info("turn ended", "session", s.id, "turn", turn, "events", len(events),
 		"state", string(end.State), "cost_usd", end.Spend.CostUSD, "retry", len(retry) > 0)
@@ -706,9 +1075,13 @@ func maxAttempts(events []Event) int {
 	return n
 }
 
-func (s *Session) decidedLocked() bool {
+// resolvedLocked reports whether every call the session stopped on has
+// what it waits for: its decision, or its result.
+func (s *Session) resolvedLocked() bool {
 	for _, c := range s.deferred.Calls {
-		if _, ok := s.verdicts[c.UseID]; !ok {
+		_, decided := s.verdicts[c.UseID]
+		_, posted := s.results[c.UseID]
+		if (c.Awaiting && !posted) || (!c.Awaiting && !decided) {
 			return false
 		}
 	}
@@ -725,6 +1098,26 @@ func approvalText(approvals []Approval) string {
 	}
 	for _, a := range approvals {
 		fmt.Fprintf(&b, "\n- %s %s (use_id %s)", a.Tool, a.Input, a.UseID)
+		if a.Reason != "" {
+			fmt.Fprintf(&b, ": %s", a.Reason)
+		}
+	}
+	return b.String()
+}
+
+// awaitingText is a message saying what results the session waits for.
+func awaitingText(awaiting []Approval) string {
+	var b strings.Builder
+	if len(awaiting) == 1 {
+		b.WriteString("Waiting for the result of a tool call:\n")
+	} else {
+		fmt.Fprintf(&b, "Waiting for the results of %d tool calls:\n", len(awaiting))
+	}
+	for _, a := range awaiting {
+		fmt.Fprintf(&b, "\n- %s (use_id %s)", a.Tool, a.UseID)
+		if a.Handle != "" {
+			fmt.Fprintf(&b, ", for %s", a.Handle)
+		}
 		if a.Reason != "" {
 			fmt.Fprintf(&b, ": %s", a.Reason)
 		}

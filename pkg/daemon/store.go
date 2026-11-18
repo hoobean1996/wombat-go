@@ -29,18 +29,20 @@ import (
 // Times are kept to the microsecond, in UTC.
 type Store interface {
 	// CreateSession records a new session, held by rec.Lease when it names an
-	// owner. A Thread another session already has is [ErrThreadTaken].
+	// owner, in its first epoch: 1. A Thread another session already has is
+	// [ErrThreadTaken].
 	CreateSession(ctx context.Context, rec SessionRecord) error
 
-	// SaveSession replaces a session's record. One that is not there —
-	// deleted while its turn ran — is [ErrNoSuchSession], and stays deleted.
-	// With rec.Lease.Owner set, it is written only while that daemon holds the
-	// session, and is an *[OwnedError] otherwise: a daemon whose lease ran out
-	// does not write over the one that took the session over.
+	// SaveSession replaces a session's record, its Inflight with it. One that
+	// is not there — deleted while its turn ran — is [ErrNoSuchSession], and
+	// stays deleted. With rec.Lease.Owner set, it is written only while that
+	// daemon holds the session — under rec.Lease.Epoch, when that is set — and
+	// is an *[OwnedError] otherwise: a daemon whose lease ran out does not
+	// write over the one that took the session over.
 	SaveSession(ctx context.Context, rec SessionRecord) error
 
-	// LoadSession returns a session's record, its Lease included, or
-	// [ErrNoSuchSession].
+	// LoadSession returns a session's record, its Lease and Inflight
+	// included, or [ErrNoSuchSession].
 	LoadSession(ctx context.Context, id string) (SessionRecord, error)
 
 	// SessionByThread returns the id of the session tied to an external
@@ -51,8 +53,8 @@ type Store interface {
 	// but with its Lease.
 	ListSessions(ctx context.Context) ([]SessionRecord, error)
 
-	// DeleteSession forgets a session, and its events, timers and messages
-	// with it. One that is not there is [ErrNoSuchSession].
+	// DeleteSession forgets a session, and its events, timers, messages and
+	// ledger with it. One that is not there is [ErrNoSuchSession].
 	DeleteSession(ctx context.Context, id string) error
 
 	// Enqueue adds an event to its session's inbox, as pending. An event with
@@ -120,7 +122,9 @@ type Store interface {
 	// Events lists inbox events, newest first.
 	Events(ctx context.Context, f EventFilter) ([]Event, error)
 
-	// AddTimer adds an active timer to its session, which must exist.
+	// AddTimer adds an active timer to its session, which must exist. A
+	// DedupKey one already there has is not added again: that one is
+	// returned instead.
 	AddTimer(ctx context.Context, t Timer) (Timer, error)
 
 	// CancelTimer cancels an active timer — of that session, when session is
@@ -149,6 +153,39 @@ type Store interface {
 	// Undelivered records a failed delivery: the message is tried again no
 	// sooner than retry, or — when retry is zero — never, and is failed.
 	Undelivered(ctx context.Context, id int64, reason string, retry time.Time) error
+
+	// ===== The ledger =====
+	//
+	// Every tool call a session's turns make, from the moment the model asks
+	// for it until it has its result: see [ToolCall]. A turn writes it as it
+	// goes, so a daemon that takes the turn over carries it on from there.
+
+	// OpenStep numbers a model reply — the session's next step — and writes
+	// it down before anything it asks for happens: its calls, pending, and
+	// where the run had got to, all at once, and only while o.Owner holds the
+	// session under o.Epoch (an *[OwnedError] otherwise). It returns the
+	// step's number.
+	OpenStep(ctx context.Context, o StepOpen) (int, error)
+
+	// MoveCalls records calls of one step changing state, all at once, and
+	// only while m.Owner holds the session under m.Epoch. A call that has
+	// ended moves only to another ending — the more exact one its step
+	// closes with — and a call it names that is not there is an error.
+	MoveCalls(ctx context.Context, m CallMoves) error
+
+	// ToolCalls lists the ledger, the newest call first.
+	ToolCalls(ctx context.Context, f CallFilter) ([]ToolCall, error)
+
+	// SubRun returns where the n-th sub-agent a call started had got to, by
+	// the call's key, or false when it had not got anywhere.
+	SubRun(ctx context.Context, session, parent string, n int) (SubRun, bool, error)
+
+	// PruneCalls forgets the calls of sessions with no turn in flight and
+	// nothing waiting that ended before before — or, never having ended,
+	// were made before it: nothing will carry them on — and reports how many
+	// it forgot. Of those sessions it forgets as well where the sub-agents of
+	// calls that are gone or have ended had got to.
+	PruneCalls(ctx context.Context, before time.Time) (int, error)
 
 	// Close releases what the store holds. The Manager does not call it: the
 	// store belongs to whoever opened it.
@@ -205,6 +242,13 @@ type Lease struct {
 	Addr string `json:"addr,omitempty"`
 
 	Until time.Time `json:"until,omitzero"`
+
+	// Epoch counts the times the session has changed hands: [Store.Acquire]
+	// moves it on whenever a daemon takes the session from another or from
+	// nobody. A write that names one is made only under it, so a daemon that
+	// let a session go and took it back cannot have a write from before land
+	// on what it does now. Zero names none.
+	Epoch int64 `json:"epoch,omitempty"`
 }
 
 // OwnedError is [ErrOwned]: the session, and the lease another daemon holds
@@ -220,8 +264,8 @@ func (e *OwnedError) Error() string {
 
 func (e *OwnedError) Unwrap() error { return ErrOwned }
 
-// RecordVersion is the layout of [SessionRecord] this package writes, and
-// the newest it reads.
+// RecordVersion is the newest layout of [SessionRecord] this package writes,
+// and the newest it reads.
 //
 // A change that a reader of the old layout would misread — a field renamed,
 // retyped or given a new meaning — bumps it. A record from a newer layout is
@@ -229,7 +273,27 @@ func (e *OwnedError) Unwrap() error { return ErrOwned }
 // format change keeps the sessions the newer one saved, and gets them back
 // when it is rolled forward again. Adding a field a reader may ignore is not
 // such a change.
-const RecordVersion = 1
+//
+// Version 2 is a session waiting on a call that awaits a result: a reader of
+// version 1 would take the call for one waiting on a decision, and a yes
+// would run it again. Any other record is still written as version 1, which
+// is what it is: an older daemon, which knows nothing of the ledger, reads it
+// right, and only starts a turn in flight over rather than carrying it on.
+const RecordVersion = 2
+
+// layoutOf is the version a record is written in: the oldest that holds it.
+func layoutOf(rec SessionRecord) int {
+	if rec.Deferred != nil && len(rec.Deferred.Awaited()) > 0 {
+		return 2
+	}
+	return 1
+}
+
+// Posted is a result posted for a call that awaits one.
+type Posted struct {
+	Output  string `json:"output"`
+	IsError bool   `json:"is_error,omitempty"`
+}
 
 // ErrNewerRecord reports a saved session written in a newer layout than
 // [RecordVersion].
@@ -239,8 +303,9 @@ var ErrNewerRecord = errors.New("daemon: session saved by a newer version")
 // where it stands.
 //
 // What is not in it is what only exists while a process runs: the event log a
-// stream resumes from, and a turn in flight. A turn a crash cut short is not
-// lost, though — its events are still in the inbox, and are run again.
+// stream resumes from. A turn in flight is kept beside it, as its journal
+// last wrote it down (Inflight): a turn a crash cut short is carried on from
+// there, and its events — still in the inbox — run it.
 type SessionRecord struct {
 	// Version is the layout the record was written in; see [RecordVersion].
 	Version int `json:"version"`
@@ -291,8 +356,23 @@ type SessionRecord struct {
 
 	// DecidedBy are the decisions behind Verdicts, as origins: they arrive
 	// one at a time, and become the origins of the message the resumed turn
-	// answers the calls in.
+	// answers the calls in. The results posted for calls that await one are
+	// here too.
 	DecidedBy []Origin `json:"decided_by,omitempty"`
+
+	// DeferredStep is the step of the ledger Deferred is on: the model reply
+	// the transcript ends with, whose calls the ledger has.
+	DeferredStep int `json:"deferred_step,omitempty"`
+
+	// Results are what has been posted so far for the calls of Deferred that
+	// await a result ([tool.Await]), by tool_use id.
+	Results map[llm.ToolUseID]Posted `json:"results,omitempty"`
+
+	// Inflight is the turn in flight, as its journal last wrote it down, for
+	// a daemon that takes the session over to carry on: nil between turns.
+	// Like Lease, it is kept beside the record rather than in it; SaveSession
+	// and Settle write it with the record, and OpenStep on its own.
+	Inflight *Inflight `json:"-"`
 
 	// ReplyTo are the messages a stopped turn has not answered yet: when the
 	// turn resumes and answers, that answer is their reply.
@@ -366,6 +446,11 @@ const (
 
 	// KindTimer is a timer that fired: {"timer": 7, "note": "...", ...}.
 	KindTimer = "timer"
+
+	// KindResult is the result of a call the session is waiting on, which
+	// started something that finishes outside it ([tool.Await]):
+	// {"use_id": "...", "output": "...", "is_error": false}.
+	KindResult = "result"
 )
 
 // The sources this package names.
@@ -422,6 +507,11 @@ type Timer struct {
 	// CreatedBy is who set it: "agent", or "api".
 	CreatedBy string    `json:"created_by"`
 	Created   time.Time `json:"created"`
+
+	// DedupKey makes setting the same timer twice set it once: the agent's
+	// set_timer names it after its call, so a call run again sets nothing
+	// new. Optional.
+	DedupKey string `json:"-"`
 
 	// Fired is how many times it has.
 	Fired int `json:"fired"`
@@ -538,6 +628,10 @@ const (
 	// MessageApproval lists calls waiting for a decision; see
 	// POST /api/sessions/{id}/approvals/{use_id}.
 	MessageApproval = "approval"
+
+	// MessageAwaiting lists calls waiting for a result from outside the
+	// session; see POST /api/sessions/{id}/results/{use_id}.
+	MessageAwaiting = "awaiting"
 
 	// MessageError is a turn that failed on messages a person sent, and will
 	// not be tried again.

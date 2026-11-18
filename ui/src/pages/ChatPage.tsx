@@ -11,7 +11,7 @@ import { confirmDialog } from '../lib/confirm'
 import { toast } from '../lib/toast'
 import type { Message, SessionInfo } from '../types'
 import { Composer } from '../components/Composer'
-import { ApprovalCard, AssistantBlock, LiveBlock, QueuedList, SessionStatus, SpendLine, UserBubble } from '../components/Thread'
+import { ApprovalCard, AssistantBlock, AwaitCard, LiveBlock, QueuedList, SessionStatus, SpendLine, UserBubble } from '../components/Thread'
 import { exchanges } from '../lib/transcript'
 import { Icon, Link, Modal } from '../components/ui'
 
@@ -57,15 +57,15 @@ function SessionMenu({ info, messages }: { info: SessionInfo; messages: Message[
 export function ChatPage({ id }: { id: string }) {
   const view = useSessionView(id)
   const config = useApp(s => s.config)
-  const { info, messages, approvals, queued, live, refresh } = view
-  // A call the transcript holds without a result is either waiting for a
-  // decision (the approvals say which) or was never run.
+  const { info, messages, approvals, awaiting, queued, live, refresh } = view
+  // A call the transcript holds without a result is either waiting — for a
+  // decision or a result, the approvals say which — or was never run.
   const list = useMemo(() => {
-    const waiting = new Set(approvals.map(a => a.use_id))
+    const waiting = new Set([...approvals, ...awaiting].map(a => a.use_id))
     const all = exchanges(messages)
     if (!waiting.size) return all
     return all.map(ex => ({ ...ex, steps: ex.steps.map(s => (s.status === 'pending' && waiting.has(s.id) ? { ...s, status: 'waiting' as const } : s)) }))
-  }, [messages, approvals])
+  }, [messages, approvals, awaiting])
   const [deciding, setDeciding] = useState(false)
   const model = info?.options.model || config?.default_model
   // The file open beside the conversation, in the URL, so the back button closes it.
@@ -78,7 +78,7 @@ export function ChatPage({ id }: { id: string }) {
   useLayoutEffect(() => {
     const el = threadRef.current
     if (el && stick.current) el.scrollTop = el.scrollHeight
-  }, [list, live, approvals, queued, info?.state])
+  }, [list, live, approvals, awaiting, queued, info?.state])
 
   if (view.missing) {
     return <div className="main"><div className="empty"><div><div className="big">找不到这个会话</div><div>它可能已经被删除，或者已经过期。<Link to="/">新建一个对话</Link></div></div></div></div>
@@ -101,7 +101,21 @@ export function ChatPage({ id }: { id: string }) {
     }
   }
 
+  const post = async (useId: string, output: string, isError: boolean) => {
+    setDeciding(true)
+    try {
+      await api.postResult(info.id, useId, output, isError)
+      toast('结果已提交')
+      refresh()
+    } catch (e) {
+      toast(api.errorText(e))
+    } finally {
+      setDeciding(false)
+    }
+  }
+
   const running = info.state === 'running' || !!live
+  const stopped = info.state === 'approving' || info.state === 'awaiting'
   const lastIdx = list.length - 1
 
   return (
@@ -125,7 +139,7 @@ export function ChatPage({ id }: { id: string }) {
             <Fragment key={i}>
               {ex.prompt !== null && <UserBubble text={ex.prompt} />}
               {(ex.steps.length > 0 || ex.text || ex.thinking > 0) && (
-                <AssistantBlock ex={ex} model={model} status={i === lastIdx && !live && info.state === 'approving' ? <span className="st-wait">等待你的确认</span> : undefined} />
+                <AssistantBlock ex={ex} model={model} status={i === lastIdx && !live && stopped ? <span className="st-wait">{info.state === 'approving' ? '等待你的确认' : '等待外部结果'}</span> : undefined} />
               )}
             </Fragment>
           ))}
@@ -135,15 +149,24 @@ export function ChatPage({ id }: { id: string }) {
               <LiveBlock live={live} model={model} />
             </>
           )}
-          {!live && info.state === 'approving' && approvals.map(ap => (
+          {!live && stopped && approvals.map(ap => (
             <ApprovalCard key={ap.use_id} ap={ap} busy={deciding} onDecide={allow => void decide(ap.use_id, allow)} />
+          ))}
+          {!live && stopped && awaiting.map(ap => (
+            <AwaitCard key={ap.use_id} ap={ap} busy={deciding} onPost={(out, isError) => void post(ap.use_id, out, isError)} />
           ))}
           {!live && <SessionStatus info={info} />}
           <QueuedList events={queued} />
         </div>
       </div>
       <div className="dock">
-        {info.state === 'approving' && !live && <div className="offline-bar"><Icon name="lock" /><span><b>有 {approvals.length} 个调用在等你确认。</b>全部决定之后这一轮会继续；在那之前，新消息会排队。</span></div>}
+        {stopped && !live && (
+          <div className="offline-bar"><Icon name={approvals.length ? 'lock' : 'clock'} /><span>
+            {approvals.length > 0 && <b>有 {approvals.length} 个调用在等你确认。</b>}
+            {awaiting.length > 0 && <b>有 {awaiting.length} 个调用在等外部结果。</b>}
+            全部有了结果之后这一轮会继续；在那之前，新消息会排队。
+          </span></div>
+        )}
         <Composer key={info.id} sessionId={info.id} permission={info.options.permission ?? ''} running={running} up onSent={refresh} />
       </div>
     </div>

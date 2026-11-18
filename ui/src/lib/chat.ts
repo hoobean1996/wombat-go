@@ -18,9 +18,9 @@ import type { InboxEvent, OutboxMessage } from '../types'
  * for any other client reading it.
  */
 
-/** A message typed into a session's chat, or a decision made there, rather than an event from outside. */
+/** A message typed into a session's chat, or a decision or a result posted there, rather than an event from outside. */
 export const isChatEvent = (e: Pick<InboxEvent, 'kind' | 'source'>) =>
-  (e.kind === 'message' || e.kind === 'approval') && (e.source === 'api' || e.source === '')
+  (e.kind === 'message' || e.kind === 'approval' || e.kind === 'result') && (e.source === 'api' || e.source === '')
 
 // Inbox event id → whether it is a chat message. What an event is and where
 // it came from never change, so what is learnt here never goes stale.

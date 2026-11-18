@@ -52,16 +52,19 @@ type Submitted struct {
 	Payload json.RawMessage
 }
 
-// Deferred means the run reached tool calls that need a decision nobody could
-// make while it ran — a person's approval, with nobody waiting to be asked —
-// and ended rather than wait. See [tool.Defer].
+// Deferred means the run reached tool calls that wait for something nobody
+// could give it while it ran — a person's approval, with nobody waiting to be
+// asked ([tool.Defer]), or the result of work that finishes outside the run
+// ([tool.Await]) — and ended rather than wait.
 //
 // The transcript ends with the model's turn, its calls unanswered. Resume with
 // [Decide] once Calls are decided: an approved call runs then, through the
 // same middleware as any other, and its real output — not the approval —
-// becomes its result; a refused one is answered with the refusal. The calls
-// of the same turn that did run are in Done, and are answered together with
-// the rest, so the model sees one result for each of its calls, in order.
+// becomes its result; a refused one is answered with the refusal. A call that
+// awaits a result is answered with it, given with [Input.Completed]. The
+// calls of the same turn that did run are in Done, and are answered together
+// with the rest, so the model sees one result for each of its calls, in
+// order.
 //
 // It survives a process boundary: it marshals to JSON and back, so a host can
 // keep it next to the transcript until the decisions arrive.
@@ -70,12 +73,41 @@ type Deferred struct {
 	Done  []llm.ToolResult
 }
 
-// DeferredCall is one call waiting for a decision.
+// DeferredCall is one call waiting: for a decision, or, Awaiting, for a
+// result.
 type DeferredCall struct {
 	UseID  llm.ToolUseID   `json:"use_id"`
 	Tool   string          `json:"tool"`
 	Input  json.RawMessage `json:"input,omitempty"`
 	Reason string          `json:"reason,omitempty"`
+
+	// Awaiting is a call that started something which finishes outside the
+	// run, waiting for its result rather than for a decision; Reason says
+	// what it waits for, and Handle names it where the work is.
+	Awaiting bool   `json:"awaiting,omitempty"`
+	Handle   string `json:"handle,omitempty"`
+}
+
+// Decisions lists the calls that wait for a person's decision.
+func (d Deferred) Decisions() []DeferredCall {
+	var out []DeferredCall
+	for _, c := range d.Calls {
+		if !c.Awaiting {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// Awaited lists the calls that wait for a result.
+func (d Deferred) Awaited() []DeferredCall {
+	var out []DeferredCall
+	for _, c := range d.Calls {
+		if c.Awaiting {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // deferredJSON is Deferred on the wire. Done travels as a user message, the

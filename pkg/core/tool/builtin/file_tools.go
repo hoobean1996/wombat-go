@@ -162,6 +162,7 @@ func WriteFile(fsys FS) tool.Def {
 		Idempotent: false,
 		Timeout:    10 * time.Second,
 		Category:   "file_io",
+		Reconcile:  reconcileWrite(fsys),
 	}, func(ctx context.Context, in writeFileIn) (string, error) {
 		if err := requireAbs("path", in.Path); err != nil {
 			return "", err
@@ -171,6 +172,27 @@ func WriteFile(fsys FS) tool.Def {
 		}
 		return fmt.Sprintf("wrote %d bytes to %s", len(in.Content), in.Path), nil
 	})
+}
+
+// reconcileWrite is write_file's answer for a call that was interrupted: the
+// file holds exactly what it was to write, so it landed, or it does not, and
+// writing it again is what the call does anyway. Nothing after the call can
+// have touched the file meanwhile — its run stopped there.
+func reconcileWrite(fsys FS) tool.ReconcileFunc {
+	return func(ctx context.Context, raw json.RawMessage) (string, bool, error) {
+		var in writeFileIn
+		if err := json.Unmarshal(raw, &in); err != nil {
+			return "", false, err
+		}
+		if err := requireAbs("path", in.Path); err != nil {
+			return "", false, err
+		}
+		data, err := fsys.ReadFile(ctx, in.Path)
+		if err == nil && string(data) == in.Content {
+			return fmt.Sprintf("wrote %d bytes to %s", len(in.Content), in.Path), true, nil
+		}
+		return "", false, nil
+	}
 }
 
 // ===== str_replace =====
@@ -215,6 +237,7 @@ func StrReplace(fsys FS) tool.Def {
 		Idempotent: false,
 		Timeout:    10 * time.Second,
 		Category:   "file_io",
+		Reconcile:  reconcileReplace(fsys),
 	}, func(ctx context.Context, in strReplaceIn) (string, error) {
 		if err := requireAbs("path", in.Path); err != nil {
 			return "", err
@@ -248,6 +271,39 @@ func StrReplace(fsys FS) tool.Def {
 		return fmt.Sprintf("replaced 1 occurrence in %s (%d → %d bytes)",
 			in.Path, len(content), len(updated)), nil
 	})
+}
+
+// reconcileReplace is str_replace's answer for a call that was interrupted,
+// read off the file: old_str still there once, so the edit did not land and
+// can run again; old_str gone and new_str there, so it did. Anything else —
+// new_str containing old_str, so the counts cannot tell, or a file that holds
+// neither — it cannot tell.
+func reconcileReplace(fsys FS) tool.ReconcileFunc {
+	return func(ctx context.Context, raw json.RawMessage) (string, bool, error) {
+		var in strReplaceIn
+		if err := json.Unmarshal(raw, &in); err != nil {
+			return "", false, err
+		}
+		if err := requireAbs("path", in.Path); err != nil {
+			return "", false, err
+		}
+		if in.OldStr == "" || strings.Contains(in.NewStr, in.OldStr) {
+			return "", false, errors.New("str_replace: the file cannot show whether this edit landed")
+		}
+		data, err := fsys.ReadFile(ctx, in.Path)
+		if err != nil {
+			return "", false, err
+		}
+		content := string(data)
+		switch old := strings.Count(content, in.OldStr); {
+		case old == 1:
+			return "", false, nil
+		case old == 0 && (in.NewStr == "" || strings.Contains(content, in.NewStr)):
+			return fmt.Sprintf("replaced 1 occurrence in %s (found done when the agent resumed)", in.Path), true, nil
+		default:
+			return "", false, fmt.Errorf("str_replace: %s holds old_str %d times and the edit cannot be told apart", in.Path, old)
+		}
+	}
 }
 
 // ===== save_tool_result =====

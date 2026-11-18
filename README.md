@@ -152,7 +152,10 @@ server:
 ```
 
 wombatd creates its tables on first start. After a restart, including one
-in the middle of a turn, it picks up where it stopped.
+in the middle of a turn, it picks up where it stopped: every tool call is
+written down before it runs, so a call that finished is not run again, and
+one that was running when wombatd stopped is run again only if that is safe
+(`GET /api/tool-calls` shows the ledger).
 
 > [!WARNING]
 > Without `server.token`, anything that can reach the port can run the agent

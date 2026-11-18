@@ -390,6 +390,9 @@ func New(m *daemon.Manager, opts ...Option) http.Handler {
 	mux.HandleFunc("POST /api/sessions/{id}/steer", a.placed("id", a.steer))
 	mux.HandleFunc("GET /api/sessions/{id}/approvals", a.placed("id", a.listApprovals))
 	mux.HandleFunc("POST /api/sessions/{id}/approvals/{use_id}", a.placed("id", a.resolveApproval))
+	mux.HandleFunc("POST /api/sessions/{id}/results/{use_id}", a.placed("id", a.postResult))
+	// Not placed: the ledger is the store's, whichever daemon reads it.
+	mux.HandleFunc("GET /api/tool-calls", a.listToolCalls)
 	mux.HandleFunc("POST /api/events", a.postEvent)
 	mux.HandleFunc("GET /api/inbox", a.listInbox)
 	mux.HandleFunc("GET /api/outbox", a.listOutbox)
@@ -711,11 +714,88 @@ func (a *api) listApprovals(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, r, err)
 		return
 	}
-	pending := s.Pending()
+	pending, awaited := s.Pending(), s.Awaited()
 	if pending == nil {
 		pending = []daemon.Approval{}
 	}
-	writeJSON(w, http.StatusOK, ApprovalList{Approvals: pending})
+	if awaited == nil {
+		awaited = []daemon.Approval{}
+	}
+	writeJSON(w, http.StatusOK, ApprovalList{Approvals: pending, Awaiting: awaited})
+}
+
+// postResult posts the result of a call the session is waiting on, which
+// started something that finishes outside it. Like a decision it is an
+// event: 202, and the turn resumes once every waiting call has what it
+// waits for.
+func (a *api) postResult(w http.ResponseWriter, r *http.Request) {
+	s, err := a.session(r)
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	var req ResultRequest
+	if err := decodeBody(w, r, &req); err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	if req.Output == nil {
+		a.fail(w, r, fmt.Errorf("%w: output is required, if empty", daemon.ErrBadRequest))
+		return
+	}
+	e, err := s.CompleteAs(r.Context(), req.From, r.PathValue("use_id"), *req.Output, req.IsError)
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, Accepted{Event: e, Session: s.Info()})
+}
+
+// listToolCalls lists the ledger, the newest call first: ?session= ?step=
+// ?turn= ?parent= ("-" for a session's own calls only) ?state= (repeated, or
+// comma-separated) ?limit=.
+func (a *api) listToolCalls(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	limit, err := limitOf(q.Get("limit"))
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	f := daemon.CallFilter{Session: q.Get("session"), Parent: q.Get("parent"), Limit: limit}
+	for _, n := range []struct {
+		name string
+		dst  *int
+	}{{"step", &f.Step}, {"turn", &f.Turn}} {
+		raw := q.Get(n.name)
+		if raw == "" {
+			continue
+		}
+		v, err := strconv.Atoi(raw)
+		if err != nil || v <= 0 {
+			a.fail(w, r, fmt.Errorf("%w: %s=%q is not a positive number", daemon.ErrBadRequest, n.name, raw))
+			return
+		}
+		*n.dst = v
+	}
+	for _, raw := range q["state"] {
+		for _, st := range strings.Split(raw, ",") {
+			state := tool.State(strings.TrimSpace(st))
+			if !state.Valid() {
+				a.fail(w, r, fmt.Errorf("%w: state=%q is not a call state (%v)", daemon.ErrBadRequest, st, tool.States()))
+				return
+			}
+			f.States = append(f.States, state)
+		}
+	}
+	calls, err := a.m.ToolCalls(r.Context(), f)
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	if calls == nil {
+		calls = []daemon.ToolCall{}
+	}
+	writeJSON(w, http.StatusOK, ToolCallList{Calls: calls})
 }
 
 // resolveApproval decides one call the session is waiting on. The decision

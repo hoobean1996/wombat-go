@@ -291,10 +291,16 @@ session's **inbox**, and what the agent has to say goes to an **outbox**.
   them, and runs one turn on them; what arrives meanwhile is the next turn's.
   `daemon.max_runs` caps turns across sessions.
 - **Trying again.** A turn the daemon stopped, or that the provider failed in a
-  way it says is passing (a rate limit, a 5xx, the network), runs again — from
-  the transcript it started from, so nothing is in the conversation twice — up
-  to `daemon.attempts`. A daemon that died mid-turn has its events put back
-  when the next one starts.
+  way it says is passing (a rate limit, a 5xx, the network), is tried again,
+  up to `daemon.attempts` — and carries on from where it got to rather than
+  starting over. Every tool call is written down before it runs, in a ledger
+  (`GET /api/tool-calls`, and the UI's 工具调用 page): a call that finished is
+  not run again, and one that was running when the daemon stopped, and may or
+  may not have taken effect, runs again only if it is safe to (a read, or a
+  tool that says so). Of any other the model is told it may have taken
+  effect, so it checks before trying again — or, with `tools.recovery: ask`,
+  a person decides. A daemon that died mid-turn has its events put back when
+  the next one starts, and the turn is carried on there.
 - **Timers.** The agent sets its own with `set_timer` — once, to follow up, or
   every so often — and a client with `POST /api/timers`. A timer that is due
   puts an event in the inbox; a daemon that was down fires each one once when
@@ -322,9 +328,11 @@ curl -s localhost:8080/api/timers -H 'Content-Type: application/json' -d '{
 ```
 
 **Keeping it.** With the default `store.driver: memory`, everything is gone
-when wombatd stops. With `postgres`, it is kept in four tables — `sessions`,
-`inbox`, `timers` and `outbox` — which wombatd creates on its first start, and
-a restart carries on where it stopped. For a local database:
+when wombatd stops. With `postgres`, it is kept in six tables — `sessions`,
+`inbox`, `timers`, `outbox`, and the ledger's `tool_calls` and `tool_runs` —
+which wombatd creates on its first start, and a restart carries on where it
+stopped, a turn cut short included. The ledger keeps a call for
+`store.ledger_retention` (30 days) after it ended. For a local database:
 
 ```bash
 make pg-up        # Postgres 17 in podman, on 127.0.0.1:55432
@@ -384,8 +392,10 @@ wrote somewhere else.
 | `GET /api/sessions/{id}/messages` | The transcript, and beside it `origins`: for each message inbox events made, keyed by its index, the events' `kind`, `source` and `from` |
 | `POST /api/sessions/{id}/messages` | A message, for the next turn: `{"prompt": "...", "from": "..."}` — `from`, optional, names who said it |
 | `POST /api/sessions/{id}/steer` | A message for the turn that is still running |
-| `GET /api/sessions/{id}/approvals` | Calls waiting for a decision |
+| `GET /api/sessions/{id}/approvals` | Calls waiting for a decision (`approvals`), and for a result from outside (`awaiting`) |
 | `POST /api/sessions/{id}/approvals/{use_id}` | Decide one: `{"allow": true, "from": "..."}` |
+| `POST /api/sessions/{id}/results/{use_id}` | The result a call waits for — a build, a job the agent started and waits on with `wait_for_result`: `{"output": "...", "is_error": false, "from": "..."}`. The call returns it, and once nothing else waits the turn carries on |
+| `GET /api/tool-calls` | The ledger, newest first: every tool call, its state (`pending`, `running`, `succeeded`, `failed`, `denied`, `deferred`, `waiting`, `interrupted`, `cancelled`), how many times it ran and what came of it. `?session=`, `?state=` (repeated or comma-separated), `?turn=`, `?step=`, `?parent=` (`-` for a session's own calls), `?limit=` |
 | `POST /api/events` | An event from outside: `{"session_id" or "thread", "kind", "source", "from", "dedup_key", "payload"}` |
 | `GET /api/inbox` | Events, newest first: `?session=`, `?status=`, `?limit=` |
 | `GET /api/outbox` | Messages, oldest first: `?after=`, `?wait=` (at most 60s), `?session=`, `?status=`, `?limit=` |

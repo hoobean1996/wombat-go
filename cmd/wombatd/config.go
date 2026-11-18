@@ -53,8 +53,9 @@ type serverConfig struct {
 }
 
 type storeConfig struct {
-	Driver string `yaml:"driver"`
-	DSN    string `yaml:"dsn"`
+	Driver          string        `yaml:"driver"`
+	DSN             string        `yaml:"dsn"`
+	LedgerRetention time.Duration `yaml:"ledger_retention"`
 }
 
 type daemonConfig struct {
@@ -90,6 +91,7 @@ type toolsConfig struct {
 	ConfineNetwork string   `yaml:"confine_network"`
 	DenyRead       []string `yaml:"deny_read"`
 	Disable        []string `yaml:"disable"`
+	Recovery       string   `yaml:"recovery"`
 	MCP            string   `yaml:"mcp"`
 	SkillsDir      string   `yaml:"skills_dir"`
 	Media          bool     `yaml:"media"`
@@ -154,13 +156,13 @@ const (
 func defaults() config {
 	return config{
 		Server: serverConfig{Addr: "127.0.0.1:8080", Metrics: true, Log: "info"},
-		Store:  storeConfig{Driver: driverMemory},
+		Store:  storeConfig{Driver: driverMemory, LedgerRetention: daemon.DefaultLedgerRetention},
 		Daemon: daemonConfig{
 			Poll: daemon.DefaultPoll, MaxRuns: daemon.DefaultMaxRuns,
 			Attempts: daemon.DefaultAttempts, Idle: daemon.DefaultIdle,
 		},
 		Model:  modelConfig{Provider: "openai", Stream: "auto", MaxTokens: core.DefaultMaxTokens},
-		Tools:  toolsConfig{WorkingDir: ".", Permission: "workspace", ConfineNetwork: "loopback"},
+		Tools:  toolsConfig{WorkingDir: ".", Permission: "workspace", ConfineNetwork: "loopback", Recovery: recoveryReport},
 		Turn:   turnConfig{BudgetUSD: 1, MaxIters: 12, ToolParallelism: core.DefaultToolParallelism},
 		Mode:   modeBuild,
 		Done:   doneConfig{Attempts: 3},
@@ -182,6 +184,14 @@ var (
 	streamModes = map[string]llm.StreamMode{"auto": llm.StreamAuto, "always": llm.StreamAlways, "never": llm.StreamNever}
 	tapeModes   = map[string]tape.Mode{"auto": tape.Auto, "record": tape.Record, "replay": tape.Replay}
 	networks    = map[string]sandbox.Network{"loopback": sandbox.NetLoopback, "none": sandbox.NetNone, "full": sandbox.NetFull}
+	recoveries  = map[string]bool{recoveryReport: true, recoveryAsk: true}
+)
+
+// What tools.recovery may say becomes of a call that was running when its
+// daemon stopped, of a tool not safe to run again.
+const (
+	recoveryReport = "report" // the model is told it may or may not have taken effect
+	recoveryAsk    = "ask"    // a person decides whether it runs again
 )
 
 // loadConfig reads the file at path over the defaults, and refuses one that
@@ -259,6 +269,9 @@ func (c config) validate() []error {
 	case c.Store.Driver == driverMemory && c.Store.DSN != "":
 		bad("store.dsn", "is set, and store.driver is memory: say postgres to keep sessions there")
 	}
+	if c.Store.LedgerRetention < 0 {
+		bad("store.ledger_retention", "is negative; 0 keeps every call")
+	}
 	positive := func(key string, d time.Duration) {
 		if d <= 0 {
 			bad(key, "%v is not a positive duration", d)
@@ -295,6 +308,7 @@ func (c config) validate() []error {
 			bad("tools.disable", "holds an empty name")
 		}
 	}
+	oneOf("tools.recovery", c.Tools.Recovery, slices.Sorted(maps.Keys(recoveries)))
 	if u := c.Tools.Sandbox.ExecURL; u != "" {
 		if parsed, err := url.Parse(u); err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 			bad("tools.sandbox.exec_url", "%q is not an http(s) URL", u)

@@ -12,6 +12,7 @@ interface MenuState { session: SessionInfo; left: number; top: number }
 
 const FLAG: Partial<Record<SessionInfo['state'], [string, string]>> = {
   approving: ['sb-approve', '待确认'],
+  awaiting: ['sb-approve', '等结果'],
   waiting: ['sb-approve', '待回答'],
   failed: ['sb-fail', '出错'],
 }
@@ -98,6 +99,7 @@ export function Sidebar({ route, collapsed, onToggle, width = 252, onWidth, onRe
       {nav('/inbox', 'inbox', 'download', 'Inbox')}
       {nav('/outbox', 'outbox', 'upload', 'Outbox', pending)}
       {nav('/timers', 'timers', 'clock', '计时器')}
+      {nav('/calls', 'calls', 'list', '工具调用')}
 
       <div className="sb-scroll">
         {loaded && sessions.length === 0 && <div className="sb-empty">还没有会话</div>}

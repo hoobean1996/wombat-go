@@ -161,6 +161,25 @@ export function ApprovalCard({ ap, onDecide, busy }: { ap: Approval; onDecide: (
   )
 }
 
+/** A call waiting for a result from outside: a build, a job. Whatever is posted is what the call returns. */
+export function AwaitCard({ ap, onPost, busy }: { ap: Approval; onPost: (output: string, isError: boolean) => void; busy: boolean }) {
+  const [output, setOutput] = useState('')
+  const [isError, setIsError] = useState(false)
+  return (
+    <div className="approve await">
+      <div className="ap-h"><Icon name="clock" />在等外部结果<span className="rule">{ap.tool}</span></div>
+      {ap.handle && <div className="ap-cmd">{ap.handle}</div>}
+      {ap.reason && <div className="ap-meta">{ap.reason}</div>}
+      <textarea className="inp" rows={3} value={output} onChange={e => setOutput(e.target.value)} placeholder="结果：这个调用会把它当作返回值交给模型" />
+      <div className="ap-acts">
+        <label className="hint"><input type="checkbox" checked={isError} onChange={e => setIsError(e.target.checked)} /> 作为错误返回</label>
+        <span className="hint">也可以由外部系统 POST 到 <code>/api/sessions/…/results/{ap.use_id}</code></span>
+        <button className="btn sm dark" disabled={busy} onClick={() => onPost(output, isError)}>提交结果</button>
+      </div>
+    </div>
+  )
+}
+
 /** The end of the thread: what the session is waiting for, or why it stopped. */
 export function SessionStatus({ info }: { info: SessionInfo }) {
   if (info.state === 'waiting' && info.answer) {

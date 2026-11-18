@@ -1,5 +1,7 @@
-// Package postgres is a [daemon.Store] in Postgres: the sessions, and the
-// inbox, timer and outbox tables an always-on daemon runs on.
+// Package postgres is a [daemon.Store] in Postgres: the sessions, the
+// inbox, timer and outbox tables an always-on daemon runs on, and the ledger
+// of every tool call the sessions' turns make (tool_calls, and tool_runs for
+// where their sub-agents had got to).
 //
 //	st, err := postgres.Open(ctx, "postgres://wombat:wombat@127.0.0.1:5432/wombat")
 //	...
@@ -130,11 +132,15 @@ func (s *Store) CreateSession(ctx context.Context, rec daemon.SessionRecord) err
 	if err != nil {
 		return err
 	}
+	inflight, err := daemon.EncodeInflight(rec.Inflight)
+	if err != nil {
+		return err
+	}
 	_, err = s.pool.Exec(ctx, `
-		INSERT INTO sessions (id, thread, created, awaiting, meta, messages, owner, owner_addr, lease_until)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		INSERT INTO sessions (id, thread, created, awaiting, meta, messages, owner, owner_addr, lease_until, epoch, inflight)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, $10)`,
 		rec.ID, nullString(rec.Thread), rec.Created, rec.Deferred != nil, meta, msgs,
-		nullString(rec.Lease.Owner), rec.Lease.Addr, nullTime(rec.Lease.Until))
+		nullString(rec.Lease.Owner), rec.Lease.Addr, nullTime(rec.Lease.Until), inflight)
 	if isUnique(err, "sessions_thread_key") {
 		return fmt.Errorf("%w: %q", daemon.ErrThreadTaken, rec.Thread)
 	}
@@ -150,29 +156,47 @@ func saveSession(ctx context.Context, q querier, rec daemon.SessionRecord) error
 	if err != nil {
 		return err
 	}
-	// With an owner named, written only while that daemon holds it.
+	inflight, err := daemon.EncodeInflight(rec.Inflight)
+	if err != nil {
+		return err
+	}
+	// With an owner named, written only while that daemon holds it — under
+	// the epoch named, when one is.
 	tag, err := q.Exec(ctx, `
-		UPDATE sessions SET awaiting = $2, meta = $3, messages = $4
-		WHERE id = $1 AND ($5 = '' OR owner = $5)`,
-		rec.ID, rec.Deferred != nil, meta, msgs, rec.Lease.Owner)
+		UPDATE sessions SET awaiting = $2, meta = $3, messages = $4, inflight = $7
+		WHERE id = $1 AND `+fenced(5, 6),
+		rec.ID, rec.Deferred != nil, meta, msgs, rec.Lease.Owner, rec.Lease.Epoch, inflight)
 	if err != nil {
 		return wrap(err)
 	}
 	if tag.RowsAffected() > 0 {
 		return nil
 	}
-	l, err := leaseOf(ctx, q, rec.ID)
+	return ownedOrGone(ctx, q, rec.ID)
+}
+
+// fenced is the condition a write by a daemon is made under: with an owner
+// named — $owner — only while that daemon holds the session, and with an
+// epoch — $epoch — only under it.
+func fenced(owner, epoch int) string {
+	return fmt.Sprintf(`($%[1]d::text = '' OR (owner = $%[1]d AND ($%[2]d::bigint = 0 OR epoch = $%[2]d)))`, owner, epoch)
+}
+
+// ownedOrGone is why a fenced write of a session wrote nothing: it is gone,
+// or another lease holds it.
+func ownedOrGone(ctx context.Context, q querier, id string) error {
+	l, err := leaseOf(ctx, q, id)
 	if err != nil {
 		return err
 	}
-	return &daemon.OwnedError{Session: rec.ID, Lease: l}
+	return &daemon.OwnedError{Session: id, Lease: l}
 }
 
 // leaseCols read a session's lease, as scanLease takes it.
-const leaseCols = `coalesce(owner, ''), owner_addr, lease_until`
+const leaseCols = `coalesce(owner, ''), owner_addr, lease_until, epoch`
 
-func scanLease(owner, addr string, until *time.Time) daemon.Lease {
-	l := daemon.Lease{Owner: owner, Addr: addr}
+func scanLease(owner, addr string, until *time.Time, epoch int64) daemon.Lease {
+	l := daemon.Lease{Owner: owner, Addr: addr, Epoch: epoch}
 	if until != nil {
 		l.Until = until.UTC()
 	}
@@ -183,22 +207,24 @@ func scanLease(owner, addr string, until *time.Time) daemon.Lease {
 func leaseOf(ctx context.Context, q querier, id string) (daemon.Lease, error) {
 	var owner, addr string
 	var until *time.Time
-	err := q.QueryRow(ctx, `SELECT `+leaseCols+` FROM sessions WHERE id = $1`, id).Scan(&owner, &addr, &until)
+	var epoch int64
+	err := q.QueryRow(ctx, `SELECT `+leaseCols+` FROM sessions WHERE id = $1`, id).Scan(&owner, &addr, &until, &epoch)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return daemon.Lease{}, fmt.Errorf("%w: %s", daemon.ErrNoSuchSession, id)
 	}
 	if err != nil {
 		return daemon.Lease{}, wrap(err)
 	}
-	return scanLease(owner, addr, until), nil
+	return scanLease(owner, addr, until, epoch), nil
 }
 
 func (s *Store) LoadSession(ctx context.Context, id string) (daemon.SessionRecord, error) {
-	var meta, msgs []byte
+	var meta, msgs, inflight []byte
 	var owner, addr string
 	var until *time.Time
-	err := s.pool.QueryRow(ctx, `SELECT meta, messages, `+leaseCols+` FROM sessions WHERE id = $1`, id).
-		Scan(&meta, &msgs, &owner, &addr, &until)
+	var epoch int64
+	err := s.pool.QueryRow(ctx, `SELECT meta, messages, inflight, `+leaseCols+` FROM sessions WHERE id = $1`, id).
+		Scan(&meta, &msgs, &inflight, &owner, &addr, &until, &epoch)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return daemon.SessionRecord{}, fmt.Errorf("%w: %s", daemon.ErrNoSuchSession, id)
 	}
@@ -206,7 +232,11 @@ func (s *Store) LoadSession(ctx context.Context, id string) (daemon.SessionRecor
 		return daemon.SessionRecord{}, wrap(err)
 	}
 	rec, err := daemon.DecodeRecord(meta, msgs)
-	rec.Lease = scanLease(owner, addr, until)
+	if err != nil {
+		return rec, err
+	}
+	rec.Lease = scanLease(owner, addr, until, epoch)
+	rec.Inflight, err = daemon.DecodeInflight(inflight)
 	return rec, err
 }
 
@@ -229,6 +259,7 @@ func (s *Store) ListSessions(ctx context.Context) ([]daemon.SessionRecord, error
 		Owner string
 		Addr  string
 		Until *time.Time
+		Epoch int64
 	}
 	all, err := pgx.CollectRows(rows, pgx.RowToStructByPos[row])
 	if err != nil {
@@ -240,7 +271,7 @@ func (s *Store) ListSessions(ctx context.Context) ([]daemon.SessionRecord, error
 		if err != nil {
 			return nil, err
 		}
-		rec.Lease = scanLease(r.Owner, r.Addr, r.Until)
+		rec.Lease = scanLease(r.Owner, r.Addr, r.Until, r.Epoch)
 		out = append(out, rec)
 	}
 	return out, nil
@@ -305,7 +336,7 @@ func enqueue(ctx context.Context, q querier, e daemon.Event) (daemon.Event, bool
 
 // claimable is the rule Ready and Claim share, over inbox e joined to
 // sessions s; $1 is now.
-const claimable = `e.status = 'pending' AND e.not_before <= $1 AND (NOT s.awaiting OR e.kind = 'approval')`
+const claimable = `e.status = 'pending' AND e.not_before <= $1 AND (NOT s.awaiting OR e.kind IN ('approval', 'result'))`
 
 // takeable is a session that owner, $4, holds or could take at now, $1.
 const takeable = `(s.owner IS NULL OR s.owner = $4 OR s.lease_until <= $1)`
@@ -430,25 +461,32 @@ func (s *Store) Acquire(ctx context.Context, session string, l daemon.Lease, now
 		n = 0
 		var owner, addr string
 		var until *time.Time
-		err := tx.QueryRow(ctx, `SELECT `+leaseCols+` FROM sessions WHERE id = $1 FOR UPDATE`, session).Scan(&owner, &addr, &until)
+		var epoch int64
+		err := tx.QueryRow(ctx, `SELECT `+leaseCols+` FROM sessions WHERE id = $1 FOR UPDATE`, session).Scan(&owner, &addr, &until, &epoch)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("%w: %s", daemon.ErrNoSuchSession, session)
 		}
 		if err != nil {
 			return wrap(err)
 		}
-		held := scanLease(owner, addr, until)
+		held := scanLease(owner, addr, until, epoch)
 		if held.Owner != "" && held.Owner != l.Owner && held.Until.After(now) {
 			return &daemon.OwnedError{Session: session, Lease: held}
 		}
-		if held.Owner != l.Owner {
+		moved := held.Owner != l.Owner
+		if moved {
 			// Whatever the last owner left running died with it.
 			if n, err = recoverWhere(ctx, tx, `session_id = $1`, session, attempts); err != nil {
 				return err
 			}
 		}
-		_, err = tx.Exec(ctx, `UPDATE sessions SET owner = $2, owner_addr = $3, lease_until = $4 WHERE id = $1`,
-			session, l.Owner, l.Addr, l.Until)
+		// Changing hands, from a daemon or from nobody, moves the epoch on:
+		// whatever the last tenure had in flight is fenced off.
+		_, err = tx.Exec(ctx, `
+			UPDATE sessions SET owner = $2, owner_addr = $3, lease_until = $4,
+				epoch = epoch + CASE WHEN $5 THEN 1 ELSE 0 END
+			WHERE id = $1`,
+			session, l.Owner, l.Addr, l.Until, moved)
 		return wrap(err)
 	})
 	return n, err
@@ -531,14 +569,27 @@ func scanTimer(row pgx.CollectableRow) (daemon.Timer, error) {
 
 func (s *Store) AddTimer(ctx context.Context, t daemon.Timer) (daemon.Timer, error) {
 	rows, err := s.pool.Query(ctx, `
-		INSERT INTO timers (session_id, note, due, every_ns, created_by, created)
-		VALUES ($1, $2, $3, $4, $5, $6) RETURNING `+timerCols,
-		t.Session, t.Note, t.Due, int64(t.Every), t.CreatedBy, orNow(t.Created))
+		INSERT INTO timers (session_id, note, due, every_ns, created_by, created, dedup_key)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (dedup_key) DO NOTHING
+		RETURNING `+timerCols,
+		t.Session, t.Note, t.Due, int64(t.Every), t.CreatedBy, orNow(t.Created), nullString(t.DedupKey))
 	if err != nil {
 		return daemon.Timer{}, noSession(err, t.Session)
 	}
-	got, err := pgx.CollectExactlyOneRow(rows, scanTimer)
-	return got, noSession(err, t.Session)
+	got, err := pgx.CollectRows(rows, scanTimer)
+	if err != nil {
+		return daemon.Timer{}, noSession(err, t.Session)
+	}
+	if len(got) == 1 {
+		return got[0], nil
+	}
+	rows, err = s.pool.Query(ctx, `SELECT `+timerCols+` FROM timers WHERE dedup_key = $1`, t.DedupKey)
+	if err != nil {
+		return daemon.Timer{}, wrap(err)
+	}
+	old, err := pgx.CollectExactlyOneRow(rows, scanTimer)
+	return old, wrap(err)
 }
 
 func (s *Store) CancelTimer(ctx context.Context, id int64, session string) error {

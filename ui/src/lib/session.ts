@@ -75,6 +75,8 @@ export interface SessionView {
   info: SessionInfo | null
   messages: Message[]
   approvals: Approval[]
+  /** Calls waiting for a result from outside. */
+  awaiting: Approval[]
   /** Messages waiting in the inbox for this session's next turn. */
   queued: InboxEvent[]
   live: LiveTurn | null
@@ -88,6 +90,7 @@ export function useSessionView(id: string): SessionView {
   const [info, setInfo] = useState<SessionInfo | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
   const [approvals, setApprovals] = useState<Approval[]>([])
+  const [awaiting, setAwaiting] = useState<Approval[]>([])
   const [queued, setQueued] = useState<InboxEvent[]>([])
   const [live, setLive] = useState<LiveTurn | null>(null)
   const [missing, setMissing] = useState(false)
@@ -108,9 +111,9 @@ export function useSessionView(id: string): SessionView {
 
     const load = async () => {
       const [i, m, q] = await Promise.all([api.getSession(id), api.getMessages(id), api.listInbox({ session: id, status: 'pending', limit: 50 })])
-      const ap = i.state === 'approving' ? await api.listApprovals(id) : []
+      const w = i.state === 'approving' || i.state === 'awaiting' ? await api.listWaiting(id) : { approvals: [], awaiting: [] }
       if (!run.alive) return undefined
-      setInfo(i); setMessages(m); setApprovals(ap); setQueued(q.filter(e => e.kind === 'message').reverse())
+      setInfo(i); setMessages(m); setApprovals(w.approvals); setAwaiting(w.awaiting); setQueued(q.filter(e => e.kind === 'message').reverse())
       return i
     }
     loadRef.current = load
@@ -147,5 +150,5 @@ export function useSessionView(id: string): SessionView {
     }
   }, [id, refresh])
 
-  return { info, messages, approvals, queued, live, missing, error, refresh }
+  return { info, messages, approvals, awaiting, queued, live, missing, error, refresh }
 }

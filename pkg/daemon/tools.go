@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -39,10 +40,11 @@ func scopeFrom(ctx context.Context) (*scope, error) {
 
 // The names of the daemon's tools.
 const (
-	ToolSendMessage = "send_message"
-	ToolSetTimer    = "set_timer"
-	ToolCancelTimer = "cancel_timer"
-	ToolListTimers  = "list_timers"
+	ToolSendMessage   = "send_message"
+	ToolSetTimer      = "set_timer"
+	ToolCancelTimer   = "cancel_timer"
+	ToolListTimers    = "list_timers"
+	ToolWaitForResult = "wait_for_result"
 )
 
 // ToolNames lists the names of [Tools], for a permission policy to let
@@ -50,16 +52,21 @@ const (
 // before it may say anything, or before it may remind itself of something,
 // is not one anybody can leave running.
 func ToolNames() []string {
-	return []string{ToolSendMessage, ToolSetTimer, ToolCancelTimer, ToolListTimers}
+	return []string{ToolSendMessage, ToolSetTimer, ToolCancelTimer, ToolListTimers, ToolWaitForResult}
 }
 
 // Tools are how the agent of a daemon session speaks, and how it wakes
-// itself up: send_message posts to the outbox, and set_timer, cancel_timer
-// and list_timers manage the session's timers. Install them in the agent
-// [ManagerConfig.Build] makes; they work only in a turn the daemon runs,
-// which is where they find their session.
+// itself up: send_message posts to the outbox; set_timer, cancel_timer and
+// list_timers manage the session's timers; and wait_for_result ends the turn
+// until a result from outside comes in for the call. Install them in the
+// agent [ManagerConfig.Build] makes; they work only in a turn the daemon
+// runs, which is where they find their session.
+//
+// All of them are safe to run again — the same call sends once, sets one
+// timer and cancels it once, however often it runs — so a turn carried on
+// after its daemon stopped simply runs them again.
 func Tools() []tool.Def {
-	return []tool.Def{sendMessage(), setTimer(), cancelTimer(), listTimers()}
+	return []tool.Def{sendMessage(), setTimer(), cancelTimer(), listTimers(), waitForResult()}
 }
 
 func sendMessage() tool.Def {
@@ -72,7 +79,8 @@ func sendMessage() tool.Def {
 		InputSchema: json.RawMessage(`{"type":"object","properties":{
 			"text":{"type":"string","description":"What to say: plain text or Markdown."}},
 			"required":["text"],"additionalProperties":false}`),
-		Caps: tool.CapNetwork,
+		Caps:       tool.CapNetwork,
+		Idempotent: true,
 		Fn: func(ctx context.Context, in json.RawMessage) (string, error) {
 			sc, err := scopeFrom(ctx)
 			if err != nil {
@@ -88,9 +96,10 @@ func sendMessage() tool.Def {
 				return "", errors.New("text is empty")
 			}
 			msg := Message{Session: sc.session, Thread: sc.thread, Kind: MessageSent, Text: args.Text}
-			if id := tool.InfoFrom(ctx).UseID; id != "" {
-				// The same call, retried, sends once.
-				msg.DedupKey = "send:" + sc.session + ":" + string(id)
+			if key := tool.CallKey(ctx); key != "" {
+				// The same call, retried or run again by a turn carried on,
+				// sends once.
+				msg.DedupKey = "send:" + sc.session + ":" + key
 			}
 			got, _, err := sc.m.post(ctx, msg)
 			if err != nil {
@@ -113,7 +122,8 @@ func setTimer() tool.Def {
 			"at":{"type":"string","description":"When, as an RFC 3339 time: \"2026-11-16T09:00:00Z\"."},
 			"every":{"type":"string","description":"Fire again at this interval after the first time, as a Go duration of at least 1m: \"24h\". Leave it out for a one-off follow-up."}},
 			"required":["note"],"additionalProperties":false}`),
-		Caps: tool.CapMeta,
+		Caps:       tool.CapMeta,
+		Idempotent: true,
 		Fn: func(ctx context.Context, in json.RawMessage) (string, error) {
 			sc, err := scopeFrom(ctx)
 			if err != nil {
@@ -129,6 +139,10 @@ func setTimer() tool.Def {
 				return "", fmt.Errorf("bad arguments: %w", err)
 			}
 			t := Timer{Session: sc.session, Note: args.Note, CreatedBy: "agent"}
+			if key := tool.CallKey(ctx); key != "" {
+				// The same call, run again, sets one timer.
+				t.DedupKey = "timer:" + sc.session + ":" + key
+			}
 			if t.Due, err = DueAt(args.In, args.At, time.Now()); err != nil {
 				return "", err
 			}
@@ -146,6 +160,12 @@ func setTimer() tool.Def {
 	}
 }
 
+// cancelled reports whether the session's timer id is cancelled.
+func cancelled(ctx context.Context, sc *scope, id int64) bool {
+	timers, err := sc.m.Timers(ctx, TimerFilter{Session: sc.session, Status: TimerCancelled})
+	return err == nil && slices.ContainsFunc(timers, func(t Timer) bool { return t.ID == id })
+}
+
 func cancelTimer() tool.Def {
 	return tool.Def{
 		Name:        ToolCancelTimer,
@@ -153,7 +173,8 @@ func cancelTimer() tool.Def {
 		InputSchema: json.RawMessage(`{"type":"object","properties":{
 			"id":{"type":"integer","description":"The timer's id."}},
 			"required":["id"],"additionalProperties":false}`),
-		Caps: tool.CapMeta,
+		Caps:       tool.CapMeta,
+		Idempotent: true,
 		Fn: func(ctx context.Context, in json.RawMessage) (string, error) {
 			sc, err := scopeFrom(ctx)
 			if err != nil {
@@ -166,7 +187,11 @@ func cancelTimer() tool.Def {
 				return "", fmt.Errorf("bad arguments: %w", err)
 			}
 			if err := sc.m.CancelTimer(ctx, args.ID, sc.session); err != nil {
-				return "", err
+				// Cancelled already — by this same call, run again by a turn
+				// carried on — is cancelled.
+				if !errors.Is(err, ErrNoSuchTimer) || !cancelled(ctx, sc, args.ID) {
+					return "", err
+				}
 			}
 			return fmt.Sprintf("cancelled timer %d", args.ID), nil
 		},
@@ -196,6 +221,39 @@ func listTimers() tool.Def {
 				lines[i] = describeTimer(t)
 			}
 			return strings.Join(lines, "\n"), nil
+		},
+	}
+}
+
+func waitForResult() tool.Def {
+	return tool.Def{
+		Name: ToolWaitForResult,
+		Description: "Wait for a result that arrives from outside this session: a build or a job you started, " +
+			"a check someone runs, an answer that comes back later. Your turn ends here, and nothing runs " +
+			"meanwhile; when the result is posted for this call, the turn carries on with it as this call's " +
+			"output. Give the handle of what you wait for — a job id, a URL — and a note saying what the result " +
+			"should be, for whoever posts it.",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{
+			"handle":{"type":"string","description":"What you wait for: a job id, a build URL, a ticket."},
+			"note":{"type":"string","description":"What result you need, for whoever or whatever posts it."}},
+			"required":["note"],"additionalProperties":false}`),
+		Caps:       tool.CapMeta,
+		Idempotent: true,
+		Fn: func(ctx context.Context, in json.RawMessage) (string, error) {
+			if _, err := scopeFrom(ctx); err != nil {
+				return "", err
+			}
+			var args struct {
+				Handle string `json:"handle"`
+				Note   string `json:"note"`
+			}
+			if err := json.Unmarshal(in, &args); err != nil {
+				return "", fmt.Errorf("bad arguments: %w", err)
+			}
+			if strings.TrimSpace(args.Note) == "" {
+				return "", errors.New("note is empty")
+			}
+			return "", tool.Await(args.Handle, args.Note)
 		},
 	}
 }

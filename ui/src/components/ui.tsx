@@ -43,7 +43,7 @@ export function Toasts() {
 }
 
 const STATE_LABEL: Record<SessionState, string> = {
-  idle: '空闲', running: '运行中', waiting: '等你回答', approving: '待确认', done: '已结束', failed: '出错',
+  idle: '空闲', running: '运行中', waiting: '等你回答', approving: '待确认', awaiting: '等结果', done: '已结束', failed: '出错',
 }
 
 /** A session's state as a small badge. */

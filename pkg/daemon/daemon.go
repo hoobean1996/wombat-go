@@ -20,12 +20,13 @@ var (
 	// ErrNoSuchSession reports that the id names nothing.
 	ErrNoSuchSession = errors.New("daemon: no such session")
 
-	// ErrNoSuchApproval reports that no call is waiting on that tool_use id.
+	// ErrNoSuchApproval reports that no call is waiting on that tool_use id
+	// — for a decision, or for a result.
 	ErrNoSuchApproval = errors.New("daemon: no such approval")
 
-	// ErrAlreadyAnswered reports a second verdict on one call. A double click
-	// on a slow network is ordinary, so this is a status code and never a
-	// second decision.
+	// ErrAlreadyAnswered reports a second verdict on one call, or a second
+	// result. A double click on a slow network is ordinary, so this is a
+	// status code and never a second decision.
 	ErrAlreadyAnswered = errors.New("daemon: approval already answered")
 
 	// ErrDone reports an event for a conversation that has ended.
@@ -107,9 +108,15 @@ const (
 
 	// Approving is a turn that ended in [core.Deferred]: a call is waiting
 	// for a person's decision, and the session takes nothing but decisions
-	// until they are all in. Whatever else arrives meanwhile waits in the
-	// inbox, for the turn after.
+	// — and results, for calls that wait on one — until they are all in.
+	// Whatever else arrives meanwhile waits in the inbox, for the turn after.
 	Approving State = "approving"
+
+	// Awaiting is a turn that ended in [core.Deferred] on calls that only
+	// wait for results from outside the session ([tool.Await]): a build, a
+	// job, a reply. It takes nothing but the results until they are all in;
+	// see [Session.Complete].
+	Awaiting State = "awaiting"
 
 	// Done is a finished conversation with nothing left to continue from.
 	Done State = "done"
@@ -160,6 +167,15 @@ type Spend struct {
 	ElapsedSec   float64 `json:"elapsed_sec"`
 }
 
+// minus is s less o, field by field.
+func (s Spend) minus(o Spend) Spend {
+	return Spend{
+		CostUSD: s.CostUSD - o.CostUSD, InputTokens: s.InputTokens - o.InputTokens,
+		OutputTokens: s.OutputTokens - o.OutputTokens, CacheRead: s.CacheRead - o.CacheRead,
+		Calls: s.Calls - o.Calls, ElapsedSec: s.ElapsedSec - o.ElapsedSec,
+	}
+}
+
 // add accumulates one turn's spend.
 func (s *Spend) add(o Spend) {
 	s.CostUSD += o.CostUSD
@@ -194,4 +210,9 @@ type Approval struct {
 
 	// Since is when the turn stopped for it.
 	Since time.Time `json:"since"`
+
+	// Awaiting is a call that waits for a result rather than a decision —
+	// see [Session.Complete] — and Handle names what for.
+	Awaiting bool   `json:"awaiting,omitempty"`
+	Handle   string `json:"handle,omitempty"`
 }

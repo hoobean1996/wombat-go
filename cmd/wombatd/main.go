@@ -158,6 +158,9 @@ func newManager(cfg config, st daemon.Store, name, addr string, build func(daemo
 		Attempts: cfg.Daemon.Attempts,
 		Idle:     cfg.Daemon.Idle,
 		Logger:   logger,
+		// store.ledger_retention: 0 keeps every call, which the manager
+		// spells as a negative retention.
+		LedgerRetention: cmp.Or(cfg.Store.LedgerRetention, -1),
 	}
 	if cfg.Outbox.Webhook != "" {
 		mc.Deliver = daemon.Webhook(cfg.Outbox.Webhook, cfg.Outbox.Headers, nil)

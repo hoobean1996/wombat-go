@@ -25,6 +25,10 @@ type SubagentStart struct {
 	Name  string `json:"name"`
 	Task  string `json:"task"`
 	Depth int    `json:"depth"`
+
+	// Resumed is a child carried on from where its journal last wrote it
+	// down, by a delegate call running again after its parent was resumed.
+	Resumed bool `json:"resumed,omitempty"`
 }
 
 // SubagentEnd closes one delegated task.
@@ -236,6 +240,12 @@ func DelegateTool(child *Agent, opts ...DelegateOption) tool.Def {
 		// guarantee. See the package note about the dispatcher's fallback.
 		Timeout:  0,
 		Category: "meta",
+
+		// Run again when the run it belongs to is resumed, if its journal
+		// journals sub-agents: that carries the child on from where it got
+		// to, and the child's own calls are each recovered as their tools
+		// say. Without one, running it again would start the child over.
+		Reconcile: resumesChild,
 	}, func(ctx context.Context, in delegateIn) (string, error) {
 		task := strings.TrimSpace(in.Task)
 		if task == "" {
@@ -249,12 +259,28 @@ func DelegateTool(child *Agent, opts ...DelegateOption) tool.Def {
 		defer b.ExitSubagent()
 
 		depth := b.Progress().Depth
-		out, err := runChild(ctx, child, cfg.name, depth, task)
+		out, err := runChild(ctx, child, cfg.name, depth, task, 0)
 		if err != nil {
 			return "", err
 		}
 		return out, nil
 	})
+}
+
+// errNoNesting is a delegate call's Reconcile saying it cannot tell: its run
+// does not journal sub-agents, so running it again would start the child
+// over, and the call's Recovery decides.
+var errNoNesting = errors.New("the run does not journal its sub-agents")
+
+// resumesChild is the Reconcile of the delegate tools: not done, so run it
+// again — which carries its children on — when the run journals them.
+func resumesChild(ctx context.Context, _ json.RawMessage) (string, bool, error) {
+	if rj := runJournalFrom(ctx); rj != nil {
+		if _, ok := rj.j.(Nester); ok {
+			return "", false, nil
+		}
+	}
+	return "", false, errNoNesting
 }
 
 // ===== parallel_delegate =====
@@ -329,6 +355,9 @@ func ParallelDelegateTool(child *Agent, opts ...DelegateOption) tool.Def {
 		Idempotent:  false,
 		Timeout:     0,
 		Category:    "meta",
+		// As for DelegateTool: run again, each task carrying its child on
+		// from where it got to, when the run journals sub-agents.
+		Reconcile: resumesChild,
 	}, func(ctx context.Context, in parallelDelegateIn) (string, error) {
 		tasks := make([]string, len(in.Tasks))
 		for i, t := range in.Tasks {
@@ -382,13 +411,21 @@ func ParallelDelegateTool(child *Agent, opts ...DelegateOption) tool.Def {
 					return
 				}
 				defer func() { <-sem }()
+				// A slot freed by a branch the cancellation ended is no reason
+				// to start: select picks at random between a slot and a done
+				// context when both are ready, and used to start this one
+				// about one time in five.
+				if ctx.Err() != nil {
+					results[i] = branch{err: context.Cause(ctx)}
+					return
+				}
 
 				// Branches emit into the parent's stream concurrently, so
 				// their events WILL interleave. That is what the name on
 				// SubagentEvent is for — it is the only thing a consumer can
 				// demultiplex on.
 				label := fmt.Sprintf("%s[%d]", cfg.name, i)
-				out, err := runChild(ctx, child, label, depth, task)
+				out, err := runChild(ctx, child, label, depth, task, i)
 				results[i] = branch{out: out, err: err}
 			}()
 		}
@@ -436,23 +473,60 @@ func ParallelDelegateTool(child *Agent, opts ...DelegateOption) tool.Def {
 // events raised inside the child land in the child's channel and never in the
 // parent's. Draining that channel here and re-emitting on the parent's ctx is
 // therefore a clean hand-off rather than a race between two sinks.
-func runChild(ctx context.Context, child *Agent, label string, depth int, task string) (string, error) {
+//
+// The journal is the one exception, and it is deliberate: a child does not
+// write into its parent's journal, whose steps are the parent's. When the
+// parent's journal is a [Nester], the child gets one of its own, for the n-th
+// child of this call — and, when the call is running again after its parent
+// was resumed, starts from where that child had got to.
+func runChild(ctx context.Context, child *Agent, label string, depth int, task string, n int) (string, error) {
 	ctx, span := trace.FromContext(ctx).Start(ctx, trace.KindSubagent, label)
 	span.Set("wombat.subagent.depth", depth)
 	var spanErr error
 	defer func() { span.End(spanErr) }()
 
-	out, err := runChildInner(ctx, child, label, depth, task)
+	out, err := runChildInner(ctx, child, label, depth, task, n)
 	spanErr = err
 	return out, err
 }
 
-func runChildInner(ctx context.Context, child *Agent, label string, depth int, task string) (string, error) {
-	Emit(ctx, SubagentStart{Name: label, Task: task, Depth: depth})
+// childInput is what the n-th child of the call ctx belongs to starts from,
+// and the context it starts on: its own journal, when its parent's journals
+// sub-agents, and where it had got to when the call last ran.
+func childInput(ctx context.Context, task string, n int) (context.Context, Input, bool, error) {
+	in := Ask(task)
+	rj := runJournalFrom(ctx)
+	if rj == nil {
+		return ctx, in, false, nil
+	}
+	nester, ok := rj.j.(Nester)
+	if !ok {
+		return ctx, in, false, nil
+	}
+	j, cp, err := nester.Nest(ctx, tool.CallKey(ctx), n)
+	if err != nil {
+		return ctx, in, false, journalErr("opening the sub-agent's journal", err)
+	}
+	if j == nil {
+		return ctx, in, false, nil
+	}
+	resumed := cp != nil && len(cp.Messages) > 0
+	if resumed {
+		in = Recover(*cp)
+	}
+	return WithJournal(ctx, j), in, resumed, nil
+}
+
+func runChildInner(ctx context.Context, child *Agent, label string, depth int, task string, n int) (string, error) {
+	cctx, in, resumed, err := childInput(ctx, task, n)
+	if err != nil {
+		return "", fmt.Errorf("sub-agent %q did not start: %w", label, err)
+	}
+	Emit(ctx, SubagentStart{Name: label, Task: task, Depth: depth, Resumed: resumed})
 	started := time.Now()
 
 	out, err := func() (string, error) {
-		run := child.Start(ctx, Ask(task))
+		run := child.Start(cctx, in)
 		defer run.Close()
 
 		for run.Next() {

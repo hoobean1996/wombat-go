@@ -145,6 +145,13 @@ func (f *factory) agent(s session, r role) (*core.Agent, error) {
 	if len(f.cfg.Tools.Disable) > 0 {
 		tools = tool.Filter(tools, func(d tool.Def) bool { return !slices.Contains(f.cfg.Tools.Disable, d.Name) })
 	}
+	// tools.recovery: a call that was running when its daemon stopped, of a
+	// tool not safe to run again, is a question for a person rather than a
+	// report to the model. Before the delegate too: its sub-agent's calls
+	// are journaled under the call that started it.
+	if f.cfg.Tools.Recovery == recoveryAsk {
+		tools = askOnRecovery(tools)
+	}
 
 	// ask_user suspends the run, and this front end has somewhere to put the
 	// answer — a paused turn leaves the session Waiting and the next prompt is
@@ -450,4 +457,17 @@ func defaultPolicy(mode, root string) (tool.Middleware, error) {
 	}
 	p.Rules = append([]permission.Rule{permission.AllowTools(daemon.ToolNames()...)}, p.Rules...)
 	return permission.Gate(p, permission.Defer()), nil
+}
+
+// askOnRecovery has every tool whose interrupted call would be reported to
+// the model ask a person instead whether it runs again; see tools.recovery.
+// A tool that says what becomes of it keeps what it says.
+func askOnRecovery(tools []tool.Def) []tool.Def {
+	out := slices.Clone(tools)
+	for i, d := range out {
+		if d.Recovery == tool.RecoverAuto && tool.RecoveryOf(d) == tool.RecoverReport {
+			out[i].Recovery = tool.RecoverAsk
+		}
+	}
+	return out
 }

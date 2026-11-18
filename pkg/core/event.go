@@ -333,6 +333,7 @@ func EventTypes() []Event {
 		SubagentStart{},
 		SubagentEvent{},
 		SubagentEnd{},
+		ToolRecovered{},
 	}
 }
 

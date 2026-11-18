@@ -95,14 +95,56 @@ type budgetKey struct{}
 // any limit is breached. The returned CancelFunc must be called to release
 // resources, as with context.WithCancel.
 func WithBudget(parent context.Context, l Limits) (context.Context, context.CancelFunc) {
+	return WithBudgetFrom(parent, l, Used{})
+}
+
+// Used is what a run had used of its budget, for a run that carries on from
+// it; see [WithBudgetFrom]. It survives a process boundary.
+type Used struct {
+	CostUSD      float64       `json:"cost_usd,omitempty"`
+	Calls        int           `json:"calls,omitempty"`
+	Steps        int           `json:"steps,omitempty"`
+	ToolCalls    int           `json:"tool_calls,omitempty"`
+	InputTokens  int           `json:"input_tokens,omitempty"`
+	OutputTokens int           `json:"output_tokens,omitempty"`
+	CacheWrite   int           `json:"cache_write_tokens,omitempty"`
+	CacheRead    int           `json:"cache_read_tokens,omitempty"`
+	Elapsed      time.Duration `json:"elapsed_ns,omitempty"`
+}
+
+// Used is what p has used, to carry on from.
+func (p Progress) Used() Used {
+	return Used{
+		CostUSD: p.CostUSD, Calls: p.Calls, Steps: p.Steps, ToolCalls: p.ToolCalls,
+		InputTokens: p.Tokens.In, OutputTokens: p.Tokens.Out, CacheWrite: p.Tokens.CacheWrite, CacheRead: p.Tokens.CacheRead,
+		Elapsed: p.Elapsed,
+	}
+}
+
+// WithBudgetFrom is [WithBudget] for a run that carries on from an earlier
+// one — the same turn, resumed after its process died — and starts out
+// charged with what that one used, so a limit caps the two together rather
+// than starting again at every resume. The wall clock counts the earlier
+// run's elapsed time, not the time between the two. A cost cap the earlier
+// run had reached cancels the context at once; a count is refused at the
+// next unit, as it always is.
+func WithBudgetFrom(parent context.Context, l Limits, u Used) (context.Context, context.CancelFunc) {
 	ctx := parent
+	start := time.Now().Add(-max(u.Elapsed, 0))
 	var deadlineCancel context.CancelFunc
 	if l.Wall > 0 {
-		ctx, deadlineCancel = context.WithDeadlineCause(ctx, time.Now().Add(l.Wall), ErrWallClock)
+		ctx, deadlineCancel = context.WithDeadlineCause(ctx, start.Add(l.Wall), ErrWallClock)
 	}
 
 	ctx, cancelCause := context.WithCancelCause(ctx)
-	b := &Budget{limits: l, start: time.Now(), cancel: cancelCause}
+	b := &Budget{
+		limits: l, start: start, cancel: cancelCause,
+		usd: u.CostUSD, calls: u.Calls, steps: u.Steps, toolCalls: u.ToolCalls,
+		tokens: Tokens{In: u.InputTokens, Out: u.OutputTokens, CacheWrite: u.CacheWrite, CacheRead: u.CacheRead},
+	}
+	if l.CostUSD > 0 && b.usd >= l.CostUSD {
+		cancelCause(ErrBudgetExhausted)
+	}
 	ctx = context.WithValue(ctx, budgetKey{}, b)
 
 	return ctx, func() {

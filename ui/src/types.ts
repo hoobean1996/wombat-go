@@ -7,7 +7,7 @@
 // ── sessions ─────────────────────────────────────────────────────────────
 
 /** pkg/daemon.State */
-export type SessionState = 'idle' | 'running' | 'waiting' | 'approving' | 'done' | 'failed'
+export type SessionState = 'idle' | 'running' | 'waiting' | 'approving' | 'awaiting' | 'done' | 'failed'
 
 /** pkg/daemon.Spend */
 export interface Spend {
@@ -46,13 +46,16 @@ export interface SessionInfo {
   error_kind?: string
 }
 
-/** pkg/daemon.Approval: a tool call waiting for a person's decision. */
+/** pkg/daemon.Approval: a tool call waiting for a person's decision — or, with awaiting, for a result from outside. */
 export interface Approval {
   use_id: string
   tool: string
   reason: string
   input?: unknown
   since: string
+  /** It waits for a result (POST /api/sessions/{id}/results/{use_id}), not a decision; handle names what for. */
+  awaiting?: boolean
+  handle?: string
 }
 
 // ── the transcript (pkg/core/llm's persistence shape) ────────────────────
@@ -71,7 +74,7 @@ export interface Message {
 
 // ── the event stream: GET /api/sessions/{id}/events ──────────────────────
 
-export interface TurnStarted { type: 'turn_started'; turn: number; prompt?: string; events: number[] }
+export interface TurnStarted { type: 'turn_started'; turn: number; prompt?: string; events: number[]; resumed?: boolean }
 export interface TurnEnded {
   type: 'turn_ended'
   turn: number
@@ -82,6 +85,7 @@ export interface TurnEnded {
   question?: string
   tool?: string
   approvals?: Approval[]
+  awaiting?: Approval[]
   error?: string
   error_kind?: string
   retry_at?: string
@@ -104,7 +108,7 @@ export type StreamEvent =
   | TurnStarted | TurnEnded | TextDelta | ReasoningDelta | IterStart | ToolStart | ToolDone
   | PermissionRequested | PermissionDecided | SubagentEvent | SteerSent | CompletionChecked
   | { type: 'subagent_start' | 'subagent_end' | 'llm_start' | 'llm_done' | 'llm_retry' | 'spend' | 'steered' | 'tool_args_delta' | 'tool_result'
-      | 'empty_turn' | 'turn_truncated' | 'context_trimmed' | 'context_overflow' | 'transcript_compacted' | 'reviewed'; [k: string]: unknown }
+      | 'empty_turn' | 'turn_truncated' | 'context_trimmed' | 'context_overflow' | 'transcript_compacted' | 'reviewed' | 'tool_recovered'; [k: string]: unknown }
 
 /** The `event:` names to listen for on the stream: EventSource only hands named events to their own listeners. */
 export const STREAM_EVENT_TYPES = [
@@ -112,6 +116,7 @@ export const STREAM_EVENT_TYPES = [
   'text_delta', 'reasoning_delta', 'tool_args_delta', 'tool_start', 'tool_done', 'tool_result', 'spend', 'steered',
   'empty_turn', 'context_trimmed', 'context_overflow', 'transcript_compacted', 'completion_checked',
   'permission_requested', 'permission_decided', 'reviewed', 'subagent_start', 'subagent_event', 'subagent_end',
+  'tool_recovered',
 ] as const
 
 // ── the inbox, the outbox and timers ─────────────────────────────────────
@@ -136,7 +141,7 @@ export interface InboxEvent {
 }
 
 export type OutboxStatus = 'pending' | 'delivered' | 'failed'
-export type OutboxKind = 'reply' | 'question' | 'approval' | 'error' | 'message'
+export type OutboxKind = 'reply' | 'question' | 'approval' | 'awaiting' | 'error' | 'message'
 
 /** pkg/daemon.Message: something the agent said. */
 export interface OutboxMessage {
@@ -167,6 +172,43 @@ export interface Timer {
   created_by: string
   created: string
   fired: number
+}
+
+// ── the ledger: GET /api/tool-calls ──────────────────────────────────────
+
+/** pkg/core/tool.State: where a tool call is. succeeded, failed, denied and cancelled are final. */
+export type CallState = 'pending' | 'running' | 'succeeded' | 'failed' | 'denied' | 'deferred' | 'waiting' | 'interrupted' | 'cancelled'
+
+/** pkg/daemon.Origin: an inbox event — here, the decision on a call. */
+export interface Origin { event: number; kind: string; source: string; from?: string; at: string }
+
+/** pkg/daemon.ToolCall: one call a session's turn made, as the ledger keeps it. */
+export interface ToolCall {
+  session_id: string
+  /** The call is the index-th of the session's step-th model reply: steps are numbered across the session. */
+  step: number
+  index: number
+  turn: number
+  /** For a call a sub-agent made: the key ("<session>/<step>.<index>") of the call that started it, and which of its sub-agents. */
+  parent?: string
+  run?: number
+  use_id: string
+  tool: string
+  input?: unknown
+  state: CallState
+  /** How many times it started to run. */
+  attempts: number
+  output?: string
+  is_error?: boolean
+  tags?: string[]
+  /** Why it waits — for a decision, a result — or why it did not run; handle names what a waiting call waits for. */
+  reason?: string
+  handle?: string
+  decision?: { allow: boolean; by: Origin }
+  owner?: string
+  created: string
+  started?: string
+  finished?: string
 }
 
 // ── the server ───────────────────────────────────────────────────────────

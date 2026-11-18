@@ -66,6 +66,11 @@ store:
   # server.advertise and daemon.name). `make pg-up` starts one in podman.
   dsn: ""
 
+  # How long the ledger — every tool call a session's turns make, what came
+  # of it, and how many times it ran (GET /api/tool-calls) — keeps a call
+  # once it has ended. 0 keeps every call.
+  ledger_retention: 720h0m0s
+
 # ── how the inbox is worked ──────────────────────────────────────────────
 # Nothing runs a turn but an event: a message, a decision, a timer, a webhook.
 # A session takes every event waiting for it at once, as one turn, and never
@@ -198,6 +203,15 @@ tools:
   # or an MCP server's (<server>__<tool>). A name that is no tool's keeps
   # wombatd from starting, so a typo cannot leave the tool on offer.
   disable: []
+
+  # A turn is written down as it goes, and a wombatd that takes it over after
+  # another stopped carries it on from there. A call that was running when
+  # the other stopped may or may not have taken effect: one safe to run
+  # again — a read, or a tool that says so — runs again, and of any other,
+  # report tells the model it may have taken effect, so it checks before it
+  # tries again, and ask stops the turn for a person to decide whether it
+  # runs again (under Full Access nobody is asked, and it does).
+  recovery: report
 
   # A JSON file of MCP servers, in the usual {"mcpServers": {...}} form,
   # whose tools every session is offered — named <server>__<tool>, and held

@@ -10,7 +10,7 @@ import type { OutboxMessage } from '../types'
 import { Icon, Link } from '../components/ui'
 import { Markdown } from '../components/Markdown'
 
-const KIND_LABEL: Record<string, string> = { reply: '回复', question: '提问', approval: '等待确认', error: '出错', message: '主动消息' }
+const KIND_LABEL: Record<string, string> = { reply: '回复', question: '提问', approval: '等待确认', awaiting: '等待结果', error: '出错', message: '主动消息' }
 const STATUS_LABEL: Record<string, string> = { '': '全部', pending: '未处理', delivered: '已处理', failed: '投递失败' }
 
 export function OutboxPage() {

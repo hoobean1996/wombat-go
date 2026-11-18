@@ -23,6 +23,17 @@ type Input struct {
 	// decisions is set by Decide: the deferred calls the transcript ends on,
 	// and what people decided about them.
 	decisions *decisions
+
+	// resume is set by Recover: the transcript is where a journal last wrote
+	// the run down, and the step it ends on is settled before the model is
+	// called. recorded is what the journal knows of that step's calls, and
+	// iterations how many iterations the run had made.
+	resume     bool
+	recorded   []Call
+	iterations int
+
+	// completed are results posted for calls that waited for one, by id.
+	completed map[llm.ToolUseID]llm.ToolResult
 }
 
 // decisions is a Deferred run's pending turn, and the verdicts on it.
@@ -203,6 +214,20 @@ type Run struct {
 	// it settles before calling the model. Loop-owned.
 	decisions *decisions
 
+	// resume, recorded, completed and iterations are the rest of what the
+	// run was started with to settle the step its transcript ends on; see
+	// Recover and Input.Completed. folds are the compactions it has made, for
+	// its journal. Loop-owned.
+	resume     bool
+	recorded   []Call
+	completed  map[llm.ToolUseID]llm.ToolResult
+	iterations int
+	folds      []int
+
+	// journal is the run's side of the Journal it was started with, nil
+	// without one.
+	journal *runJournal
+
 	// emptyTurns counts CONSECUTIVE turns that said nothing and called
 	// nothing; see the retry in iterate. Reset by any turn with content, so
 	// two empty turns an hour apart never add up to a failure. Loop-owned.
@@ -247,14 +272,32 @@ func (a *Agent) Start(ctx context.Context, in Input) *Run {
 	ctx, cancel := context.WithCancel(ctx)
 
 	r := &Run{
-		a:         a,
-		cancel:    cancel,
-		events:    make(chan Event, a.cfg.eventBuffer),
-		convo:     Convo(in.Messages),
-		decisions: in.decisions,
-		results:   make(map[llm.ToolUseID]ResultInfo),
-		tokens:    newTokenEstimator(),
+		a:          a,
+		cancel:     cancel,
+		events:     make(chan Event, a.cfg.eventBuffer),
+		convo:      Convo(in.Messages),
+		decisions:  in.decisions,
+		resume:     in.resume,
+		recorded:   in.recorded,
+		completed:  in.completed,
+		iterations: max(in.iterations, 0),
+		results:    make(map[llm.ToolUseID]ResultInfo),
+		tokens:     newTokenEstimator(),
 	}
+
+	// The journal is this run's, and only this run's: taken off the context,
+	// so a run started from inside this one — a sub-agent, a completion
+	// check's reviewer — does not write its steps into this one's, and its
+	// state put back on, nil when there is none, so a sub-agent never finds
+	// its parent's there and mistakes it for its own.
+	if j := journalFrom(ctx); j != nil {
+		r.journal = &runJournal{j: j}
+		ctx = context.WithValue(ctx, journalKey{}, nil)
+		if _, ok := j.(Keyer); ok {
+			ctx = tool.WithCallKeys(ctx, r.journal.key)
+		}
+	}
+	ctx = withRunJournal(ctx, r.journal)
 
 	// Every run has a budget, even one given no limits, so that what it spends
 	// is tallied as ITS spend: Progress, the Spend events and the sub-agent
@@ -524,9 +567,9 @@ func (r *Run) loop() {
 	}
 
 	convo := r.snapshot()
-	if r.decisions != nil {
+	if r.decisions != nil || r.resume {
 		var stop bool
-		if convo, stop = r.settleDeferred(ctx, convo); stop {
+		if convo, stop = r.settle(ctx, convo); stop {
 			return
 		}
 	}
@@ -535,7 +578,9 @@ func (r *Run) loop() {
 		return
 	}
 
-	for iter := 1; ; iter++ {
+	// A resumed run counts the iterations of the run it carries on, so the
+	// cap is on the whole of it.
+	for iter := r.iterations + 1; ; iter++ {
 		if ctx.Err() != nil {
 			r.finish(nil, r.causeOr(ctx.Err()))
 			return
@@ -612,6 +657,9 @@ func (r *Run) iterate(parent context.Context, iter int, convo Convo) (Convo, boo
 	// Compaction first, because it rewrites the STORED transcript: what it
 	// folds away is gone for every later call, not just this one.
 	if folded, ok := r.compact(ctx, convo); ok {
+		// The journal is told on the next step: a transcript it keeps as a
+		// tail after one it already has has to be kept whole from now on.
+		r.folds = append(r.folds, len(convo)-len(folded))
 		convo = folded
 		r.setConvo(convo)
 	}
@@ -822,13 +870,18 @@ func (r *Run) iterate(parent context.Context, iter int, convo Convo) (Convo, boo
 			r.setConvo(convo)
 			return convo, false
 		}
-		answer := llm.TextOf(resp.Content)
-		if feedback := r.checkCompletion(ctx, Completion{Answer: answer, Messages: convo}); feedback != "" {
-			convo = convo.PushUserText(notDoneYet(feedback))
-			r.setConvo(convo)
-			return convo, false
+		// Written down before it is checked, which can take as long as a
+		// test suite: a run resumed after this checks the answer again
+		// rather than asking the model for another.
+		if err := r.journal.open(ctx, Step{Messages: convo, Iteration: iter, Folds: r.folds}); err != nil {
+			return fail(err)
 		}
-		return done(Answer{Text: answer})
+		next, o := r.answered(ctx, convo, resp.Content)
+		if o == nil {
+			return next, false
+		}
+		convo = next
+		return done(o)
 
 	case llm.StopRefusal:
 		return fail(&RefusalError{Reason: llm.TextOf(resp.Content)})
@@ -840,8 +893,26 @@ func (r *Run) iterate(parent context.Context, iter int, convo Convo) (Convo, boo
 		}
 
 		span.Set("wombat.tool_calls", len(uses))
+		// The write-ahead: the reply and its calls are written down before
+		// any of them runs, so a run resumed after a crash answers these
+		// calls rather than asking the model for new ones.
+		pendingCalls := make([]Call, len(uses))
+		for i, u := range uses {
+			pendingCalls[i] = Call{Index: i, Use: u, State: tool.StatePending}
+		}
+		if err := r.journal.open(ctx, Step{Messages: convo, Calls: pendingCalls, Iteration: iter, Folds: r.folds}); err != nil {
+			return fail(err)
+		}
 		results, stop := r.dispatch(ctx, convo, uses)
+		jerr := r.closeStep(ctx, uses, results, stop)
+		if jerr != nil && ctx.Err() != nil {
+			// The run is stopping anyway, and that is what it reports.
+			jerr = nil
+		}
 		if stop != nil {
+			if jerr != nil {
+				return fail(jerr)
+			}
 			return done(stop)
 		}
 		for _, res := range results {
@@ -851,8 +922,15 @@ func (r *Run) iterate(parent context.Context, iter int, convo Convo) (Convo, boo
 				Bytes: res.Size(),
 			}
 		}
+		// Kept even when the journal failed: these are real results, a call
+		// the journal kept from running says so in its own, and a transcript
+		// left ending on unanswered calls could only be closed with
+		// "(cancelled)", which is a lie about the ones that ran.
 		convo = convo.PushToolResults(tool.Blocks(results))
 		r.setConvo(convo)
+		if jerr != nil {
+			return fail(jerr)
+		}
 		return convo, false
 
 	default:
@@ -893,17 +971,16 @@ func (r *Run) iterate(parent context.Context, iter int, convo Convo) (Convo, boo
 // A terminal call the chain lets through still has to satisfy the agent's
 // [CompletionCheck], when it has one. One the check rejects is answered with
 // the check's feedback and handled from there exactly like a refused call.
+//
+// The results come back one per call, in order, either way: a call the run
+// stopped before dispatching has the zero Result, and one it stopped at has
+// what its accepting handler said.
 func (r *Run) dispatch(ctx context.Context, convo Convo, uses []llm.ToolUse) ([]tool.Result, Outcome) {
 	a := r.a
-	order := controlOrder(a.set, uses)
-	if len(order) == 0 {
-		return deferrals(uses, a.disp.Dispatch(ctx, a.set, uses))
-	}
-
 	results := make([]tool.Result, len(uses))
 	decided := make([]bool, len(uses))
 	verdicts := controlSet{a.set}
-	for _, i := range order {
+	for _, i := range controlOrder(a.set, uses) {
 		u := uses[i]
 		res := dispatchOne(ctx, a.disp, verdicts, u)
 		if res.Err == nil {
@@ -911,13 +988,15 @@ func (r *Run) dispatch(ctx context.Context, convo Convo, uses []llm.ToolUse) ([]
 				sub := Submitted{Tool: u.Name, Payload: u.Input}
 				feedback := r.checkCompletion(ctx, Completion{Submitted: &sub, Messages: convo})
 				if feedback == "" {
-					return nil, sub
+					results[i] = res
+					return results, sub
 				}
 				// Not done, says the check: the submission is answered with
 				// why, and the turn carries on like one the gate refused.
 				res = tool.Result{UseID: u.ID, Name: u.Name, Err: errNotAccepted(feedback)}
 			} else {
-				return nil, Paused{ToolUseID: u.ID, Schema: ParsePauseSchema(u.Input)}
+				results[i] = res
+				return results, Paused{ToolUseID: u.ID, Schema: ParsePauseSchema(u.Input)}
 			}
 		}
 		results[i], decided[i] = res, true
@@ -943,100 +1022,53 @@ func (r *Run) dispatch(ctx context.Context, convo Convo, uses []llm.ToolUse) ([]
 			}
 		}
 	}
-	return deferrals(uses, results)
+	return results, deferrals(uses, results)
 }
 
-// controlOrder lists the indices of the calls that would end or suspend the
-// run: terminal calls first, then pause calls, each in the order made.
-// deferrals turns a batch with deferred calls in it into a Deferred outcome:
-// the calls waiting for a decision, and the results of the ones that ran,
-// kept to be answered together with the rest. A batch with none passes
-// through.
-func deferrals(uses []llm.ToolUse, results []tool.Result) ([]tool.Result, Outcome) {
+// deferrals turns a batch with calls in it that wait — for a person's
+// decision, or for a result from outside the run — into a Deferred outcome:
+// the calls waiting, and the results of the ones that ran, kept to be
+// answered together with the rest. A batch with none is nil.
+func deferrals(uses []llm.ToolUse, results []tool.Result) Outcome {
 	var d Deferred
 	for i, res := range results {
-		reason, deferred := tool.DeferralReason(res.Err)
-		if !deferred {
+		call := DeferredCall{UseID: res.UseID, Tool: res.Name}
+		if handle, note, ok := tool.Awaiting(res.Err); ok {
+			call.Awaiting, call.Handle, call.Reason = true, handle, note
+		} else if reason, ok := tool.DeferralReason(res.Err); ok {
+			call.Reason = reason
+		} else {
 			continue
 		}
-		call := DeferredCall{UseID: res.UseID, Tool: res.Name, Reason: reason}
 		if i < len(uses) {
 			call.Input = uses[i].Input
 		}
 		d.Calls = append(d.Calls, call)
 	}
 	if len(d.Calls) == 0 {
-		return results, nil
+		return nil
 	}
 	for _, res := range results {
-		if _, deferred := tool.DeferralReason(res.Err); !deferred {
+		if !waits(res.Err) {
 			if blk, ok := res.Block().(llm.ToolResult); ok {
 				d.Done = append(d.Done, blk)
 			}
 		}
 	}
-	return nil, d
+	return d
 }
 
-// settleDeferred runs the calls a Deferred run stopped on, now that people
-// have decided them, and answers every call of that turn in one message, in
-// the order the model made them: the ones that ran before the run stopped,
-// and the decided ones.
-//
-// The decided calls go through dispatch like any other, with the verdicts on
-// the context, so a gate that would have asked finds its answer there — and a
-// call that still has none defers again, and the run ends in a new Deferred
-// that keeps what has run so far.
-func (r *Run) settleDeferred(ctx context.Context, convo Convo) (Convo, bool) {
-	d := r.decisions
-	if len(convo) == 0 || convo[len(convo)-1].Role != llm.RoleAssistant {
-		r.finish(nil, errors.New("core: Decide was given a transcript that does not end on the deferred turn"))
-		return convo, true
+// waits reports a call that ended waiting, for a decision or for a result.
+func waits(err error) bool {
+	if _, _, ok := tool.Awaiting(err); ok {
+		return true
 	}
-	waiting := make(map[llm.ToolUseID]bool, len(d.deferred.Calls))
-	for _, c := range d.deferred.Calls {
-		waiting[c.UseID] = true
-	}
-	uses := llm.ToolUses(convo[len(convo)-1].Content)
-	var pending []llm.ToolUse
-	for _, u := range uses {
-		if waiting[u.ID] {
-			pending = append(pending, u)
-		}
-	}
-
-	results, stop := r.dispatch(tool.WithDecisions(ctx, d.verdicts), convo, pending)
-	if again, ok := stop.(Deferred); ok {
-		again.Done = append(append([]llm.ToolResult(nil), d.deferred.Done...), again.Done...)
-		stop = again
-	}
-	if stop != nil {
-		r.finish(stop, nil)
-		return convo, true
-	}
-
-	answers := make(map[llm.ToolUseID]llm.ContentBlock, len(uses))
-	for _, done := range d.deferred.Done {
-		answers[done.ToolUseID] = done
-	}
-	for _, res := range results {
-		answers[res.UseID] = res.Block()
-		r.results[res.UseID] = ResultInfo{Tool: res.Name, Tags: res.Tags, Bytes: res.Size()}
-	}
-	blocks := make([]llm.ContentBlock, 0, len(uses))
-	for _, u := range uses {
-		blk, ok := answers[u.ID]
-		if !ok {
-			blk = llm.ToolResult{ToolUseID: u.ID, IsError: true,
-				Content: "not run: the run stopped for a decision before this call was dispatched"}
-		}
-		blocks = append(blocks, blk)
-	}
-	convo = convo.PushToolResults(blocks)
-	r.setConvo(convo)
-	return convo, false
+	_, ok := tool.DeferralReason(err)
+	return ok
 }
 
+// controlOrder lists the indices of the calls that would end or suspend the
+// run: terminal calls first, then pause calls, each in the order made.
 func controlOrder(set tool.Set, uses []llm.ToolUse) []int {
 	var terminal, pause []int
 	for i, u := range uses {

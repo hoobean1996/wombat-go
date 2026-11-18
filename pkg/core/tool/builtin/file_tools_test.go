@@ -550,3 +550,56 @@ func TestSaveToolResult(t *testing.T) {
 		}
 	})
 }
+
+// ===== reconciling an interrupted call =====
+
+func TestWriteFileReconcilesFromTheFile(t *testing.T) {
+	dir := t.TempDir()
+	d := WriteFile(OSFS(dir))
+	p := filepath.Join(dir, "a.txt")
+	in := json.RawMessage(fmt.Sprintf(`{"path":%q,"content":"new"}`, p))
+
+	if _, landed, err := d.Reconcile(context.Background(), in); err != nil || landed {
+		t.Errorf("no file yet: landed=%v err=%v, want not landed", landed, err)
+	}
+	if err := os.WriteFile(p, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, landed, err := d.Reconcile(context.Background(), in); err != nil || landed {
+		t.Errorf("other content: landed=%v err=%v, want not landed", landed, err)
+	}
+	if err := os.WriteFile(p, []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, landed, err := d.Reconcile(context.Background(), in); err != nil || !landed || !strings.Contains(out, "wrote 3 bytes") {
+		t.Errorf("the content it was to write: %q landed=%v err=%v, want landed", out, landed, err)
+	}
+}
+
+func TestStrReplaceReconcilesFromTheFile(t *testing.T) {
+	dir := t.TempDir()
+	d := StrReplace(OSFS(dir))
+	p := filepath.Join(dir, "a.go")
+	edit := func(old, new string) json.RawMessage {
+		return json.RawMessage(fmt.Sprintf(`{"path":%q,"old_str":%q,"new_str":%q}`, p, old, new))
+	}
+	for _, tc := range []struct {
+		name, file, old, new string
+		landed, cannot       bool
+	}{
+		{"old text still there once", "a := 1", "a := 1", "a := 2", false, false},
+		{"replaced", "a := 2", "a := 1", "a := 2", true, false},
+		{"deleted", "x\n", "y\n", "", true, false},
+		{"new contains old", "foo bar", "foo", "foo bar", false, true},
+		{"neither there", "z", "a := 1", "a := 2", false, true},
+		{"old twice", "a a", "a", "b", false, true},
+	} {
+		if err := os.WriteFile(p, []byte(tc.file), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_, landed, err := d.Reconcile(context.Background(), edit(tc.old, tc.new))
+		if landed != tc.landed || (err != nil) != tc.cannot {
+			t.Errorf("%s: landed=%v err=%v, want landed=%v cannot-tell=%v", tc.name, landed, err, tc.landed, tc.cannot)
+		}
+	}
+}

@@ -250,7 +250,7 @@ review:
 - **收件箱。** 用户的消息、对某个等待决定的调用做出的决定、一个触发的计时器，以及客户端发到 `POST /api/events` 的任何东西——webhook、告警——都是一行记录，请求一返回就已安全保存。带 `dedup_key` 的事件无论投递多少次都只接收一次；关于某个 `thread`（一个 issue、一个聊天线程）的事件会找到该线程对应的会话，没有就新建一个。
 - **谁说了什么。** 每个事件都写明它是什么（`kind`）、从哪里来（`source`），以及在发送方知道时，是谁发的（`from`）。由桥接程序转发的聊天是 `"kind": "message"`，payload 为 `{"text": "..."}`，`source` 是桥接程序自己的名字，`from` 是说话的人。直接消息——`source` 为 `api`、没有 `from`——模型读到的就是纯文本；其他事件都包在一个写明这三项的标签里，所以 webhook 的 payload 不会被当成你的指令，一个说话人也不会被当成另一个。对话记录保持模型收到时的原样；`GET /api/sessions/{id}/messages` 在它旁边返回 `origins`，说明哪条消息是由哪些事件产生的。
 - **每次一轮。** worker 取出一个会话的全部待处理事件，针对它们执行一轮；期间新到的事件留给下一轮。`daemon.max_runs` 限制所有会话同时执行的轮数。
-- **重试。** 被守护进程中止的一轮，或者因模型服务表明是暂时性的错误（限流、5xx、网络问题）而失败的一轮，会重新执行——从这一轮开始时的对话记录重来，所以对话中不会出现重复内容——最多执行 `daemon.attempts` 次。守护进程如果在一轮中途退出，下一个守护进程启动时会把这些事件放回收件箱。
+- **重试。** 被守护进程中止的一轮，或者因模型服务表明是暂时性的错误（限流、5xx、网络问题）而失败的一轮，会再试一次，最多 `daemon.attempts` 次——而且是从它做到的地方接着做，而不是从头再来。每个工具调用在执行之前都会先记进一本账（ledger，`GET /api/tool-calls`，界面上的「工具调用」页）：已经完成的调用不会再执行；守护进程停下时正在运行、不知道有没有生效的调用，只有能安全重跑的（只读的，或者工具声明可以重跑的）才会重跑，其余的会告诉模型「它可能已经生效」，让模型先检查再决定——或者设置 `tools.recovery: ask`，由人来决定。守护进程如果在一轮中途退出，下一个守护进程启动时会把这些事件放回收件箱，并从记下的地方接着跑这一轮。
 - **计时器。** Agent 用 `set_timer` 给自己设置计时器——一次性的，用于跟进；或者每隔一段时间触发一次——客户端则用 `POST /api/timers` 设置。到期的计时器会往收件箱里放入一个事件；守护进程停机后恢复时，每个计时器只触发一次，而不是把错过的每个周期都补触发一遍。
 - **审批决定。** 权限策略需要人工审批的调用会结束当前这一轮，而不是让它一直挂起：会话在调用中途被保存，之后只接收决定，等所有决定都到齐后才恢复——被批准的调用这时才执行，模型读到的是它们的真实输出。
 - **发件箱。** 对消息的回复、模型提出的问题、等待决定的调用，以及 Agent 选择用 `send_message` 说的话——由计时器触发的一轮，除非调用了它，否则什么也不说。客户端用 `GET /api/outbox?after=<last id>&wait=30s` 长轮询，并用 `POST /api/outbox/{id}/ack` 确认；设置了 `outbox.webhook` 时，wombatd 会按顺序自己 POST 每条消息，每条最多尝试 10 次、间隔逐次加长，之后才继续投递排在后面的消息。
@@ -265,7 +265,7 @@ curl -s localhost:8080/api/timers -H 'Content-Type: application/json' -d '{
   "session_id": "<id>", "note": "check whether the fix went out", "at": "2026-11-16T09:00:00Z"}'
 ```
 
-**持久保存。** 使用默认的 `store.driver: memory` 时，wombatd 一停止，所有数据都会丢失。使用 `postgres` 时，数据保存在四张表中——`sessions`、`inbox`、`timers` 和 `outbox`——wombatd 首次启动时会创建它们，重启后从中断处继续。本地数据库可以这样启动：
+**持久保存。** 使用默认的 `store.driver: memory` 时，wombatd 一停止，所有数据都会丢失。使用 `postgres` 时，数据保存在六张表中——`sessions`、`inbox`、`timers`、`outbox`，以及工具调用账本的 `tool_calls` 和 `tool_runs`——wombatd 首次启动时会创建它们，重启后从中断处继续，包括被打断的那一轮。账本里的调用在结束后保留 `store.ledger_retention`（默认 30 天）。本地数据库可以这样启动：
 
 ```bash
 make pg-up        # 在 podman 中运行 Postgres 17，监听 127.0.0.1:55432
@@ -304,8 +304,10 @@ store:
 | `GET /api/sessions/{id}/messages` | 对话记录，以及旁边的 `origins`：对每条由收件箱事件产生的消息，按其下标给出这些事件的 `kind`、`source` 和 `from` |
 | `POST /api/sessions/{id}/messages` | 发送一条消息，留给下一轮处理：`{"prompt": "...", "from": "..."}`——`from` 可选，写明是谁说的 |
 | `POST /api/sessions/{id}/steer` | 给仍在运行的这一轮发送消息 |
-| `GET /api/sessions/{id}/approvals` | 列出等待决定的调用 |
+| `GET /api/sessions/{id}/approvals` | 列出等待决定的调用（`approvals`），以及等待外部结果的调用（`awaiting`） |
 | `POST /api/sessions/{id}/approvals/{use_id}` | 对其中一个做出决定：`{"allow": true, "from": "..."}` |
+| `POST /api/sessions/{id}/results/{use_id}` | 提交一个调用在等的结果——比如 Agent 用 `wait_for_result` 等待的构建、任务：`{"output": "...", "is_error": false, "from": "..."}`。这个调用会把它当作返回值，没有别的在等时这一轮就继续 |
+| `GET /api/tool-calls` | 工具调用账本，最新的在前：每个调用的状态（`pending`、`running`、`succeeded`、`failed`、`denied`、`deferred`、`waiting`、`interrupted`、`cancelled`）、执行了几次、结果是什么。`?session=`、`?state=`（可重复，或用逗号分隔）、`?turn=`、`?step=`、`?parent=`（`-` 表示只看会话自己的调用）、`?limit=` |
 | `POST /api/events` | 来自外部的事件：`{"session_id" or "thread", "kind", "source", "from", "dedup_key", "payload"}` |
 | `GET /api/inbox` | 事件，最新的在前：`?session=`、`?status=`、`?limit=` |
 | `GET /api/outbox` | 消息，最早的在前：`?after=`、`?wait=`（最长 60 秒）、`?session=`、`?status=`、`?limit=` |

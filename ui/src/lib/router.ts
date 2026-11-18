@@ -24,6 +24,7 @@ export type Route =
   | { name: 'inbox' }
   | { name: 'outbox' }
   | { name: 'timers' }
+  | { name: 'calls' }
   | { name: 'settings' }
   | { name: 'notfound' }
 
@@ -31,7 +32,7 @@ export function matchRoute(path: string): Route {
   if (path === '/' || path === '') return { name: 'home' }
   const chat = path.match(/^\/c\/([^/]+)\/?$/)
   if (chat) return { name: 'chat', id: decodeURIComponent(chat[1]) }
-  for (const name of ['inbox', 'outbox', 'timers', 'settings'] as const) {
+  for (const name of ['inbox', 'outbox', 'timers', 'calls', 'settings'] as const) {
     if (new RegExp(`^/${name}/?$`).test(path)) return { name }
   }
   return { name: 'notfound' }

@@ -878,3 +878,45 @@ func TestConcurrentSubagentDepthCap(t *testing.T) {
 		t.Errorf("context.Cause = %v, want nil: refusals must never cancel", cause)
 	}
 }
+
+// ===== carrying on =====
+
+// A budget carried on from an earlier run starts out charged with what that
+// one used: its counts go on from there, its wall clock counts the earlier
+// run's time, and a cost cap it had reached stops it at once.
+func TestWithBudgetFromCarriesOn(t *testing.T) {
+	used := Used{CostUSD: 0.5, Calls: 3, Steps: 2, ToolCalls: 4, InputTokens: 100, OutputTokens: 10, CacheRead: 7, Elapsed: time.Minute}
+	ctx, cancel := WithBudgetFrom(context.Background(), Limits{CostUSD: 1, Steps: 3}, used)
+	defer cancel()
+	p := FromContext(ctx).Progress()
+	if p.CostUSD != 0.5 || p.Calls != 3 || p.Steps != 2 || p.ToolCalls != 4 || p.Tokens.In != 100 || p.Tokens.CacheRead != 7 || p.Elapsed < time.Minute {
+		t.Fatalf("progress = %+v, want it to start from what was used", p)
+	}
+	if got := p.Used(); got.Steps != 2 || got.CostUSD != 0.5 || got.Elapsed < time.Minute {
+		t.Errorf("Used round trip = %+v", got)
+	}
+	b := FromContext(ctx)
+	b.Step()
+	if ctx.Err() != nil {
+		t.Fatal("the third step of three was refused")
+	}
+	b.Step()
+	waitDone(t, ctx)
+	if !errors.Is(context.Cause(ctx), ErrStepLimit) {
+		t.Errorf("cause = %v, want the step limit counting the earlier run's steps", context.Cause(ctx))
+	}
+
+	spent, cancel2 := WithBudgetFrom(context.Background(), Limits{CostUSD: 0.5}, Used{CostUSD: 0.5})
+	defer cancel2()
+	waitDone(t, spent)
+	if !errors.Is(context.Cause(spent), ErrBudgetExhausted) {
+		t.Errorf("cause = %v, want the cost cap the earlier run reached", context.Cause(spent))
+	}
+
+	late, cancel3 := WithBudgetFrom(context.Background(), Limits{Wall: time.Minute}, Used{Elapsed: time.Minute})
+	defer cancel3()
+	waitDone(t, late)
+	if !errors.Is(context.Cause(late), ErrWallClock) {
+		t.Errorf("cause = %v, want the wall clock the earlier run used up", context.Cause(late))
+	}
+}
