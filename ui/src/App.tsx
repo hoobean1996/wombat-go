@@ -13,9 +13,10 @@ import { ChatPage } from './pages/ChatPage'
 import { InboxPage } from './pages/InboxPage'
 import { OutboxPage } from './pages/OutboxPage'
 import { TimersPage } from './pages/TimersPage'
+import { ToolCallsPage } from './pages/ToolCallsPage'
 import { SettingsPage, TokenForm } from './pages/SettingsPage'
 
-const TITLES = { home: '新对话', inbox: 'Inbox', outbox: 'Outbox', timers: '计时器', settings: '设置', notfound: '找不到页面' } as const
+const TITLES = { home: '新对话', inbox: 'Inbox', outbox: 'Outbox', timers: '计时器', calls: '工具调用', settings: '设置', notfound: '找不到页面' } as const
 
 /** Until wombatd answers. */
 function Connecting({ down, error }: { down: boolean; error?: string }) {
@@ -93,6 +94,7 @@ function Workbench() {
       {route.name === 'inbox' && <InboxPage />}
       {route.name === 'outbox' && <OutboxPage />}
       {route.name === 'timers' && <TimersPage />}
+      {route.name === 'calls' && <ToolCallsPage />}
       {route.name === 'settings' && <SettingsPage />}
       {route.name === 'notfound' && (
         <div className="main"><div className="empty"><div><div className="big">找不到这个页面</div><Link to="/">回到新对话</Link></div></div></div>

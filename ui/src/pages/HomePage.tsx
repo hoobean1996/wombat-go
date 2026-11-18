@@ -14,7 +14,7 @@ export function HomePage() {
   const sessions = useApp(s => s.sessions)
   const [draft, setDraft] = useState<{ text: string; n: number }>()
   const busy = sessions.filter(s => s.state === 'running').length
-  const waiting = sessions.filter(s => s.state === 'approving' || s.state === 'waiting').length
+  const waiting = sessions.filter(s => s.state === 'approving' || s.state === 'awaiting' || s.state === 'waiting').length
 
   return (
     <div className="main">

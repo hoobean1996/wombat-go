@@ -34,7 +34,7 @@
 .badge { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; line-height: 20px; padding: 0 8px; border-radius: 999px; background: #f2f2f0; color: var(--a-muted); }
 .badge .run-ind { width: 9px; height: 9px; }
 .badge.st-running { background: #eaf6ef; color: #1d7d47; }
-.badge.st-approving, .badge.st-waiting { background: #fdf2e2; color: #b56a06; }
+.badge.st-approving, .badge.st-waiting, .badge.st-awaiting { background: #fdf2e2; color: #b56a06; }
 .badge.st-failed { background: #fbeced; color: #c4373d; }
 .sb-fail { flex: none; font-size: 10.5px; font-weight: 600; line-height: 17px; padding: 0 6px; border-radius: 999px; background: #fbeced; color: #c4373d; }
 .badge-n { background: var(--tsubaki); color: #fff !important; border-radius: 999px; padding: 0 6px; font-size: 11px; line-height: 17px; }
@@ -49,6 +49,15 @@
 .pill.s-pending, .pill.s-active, .pill.s-running { background: #fdf2e2; color: #b56a06; }
 .pill.s-done, .pill.s-delivered, .pill.s-fired { background: #eaf6ef; color: #1d7d47; }
 .pill.s-failed { background: #fbeced; color: #c4373d; }
+/* the ledger's call states */
+.pill.s-deferred, .pill.s-waiting { background: #fdf2e2; color: #b56a06; }
+.pill.s-succeeded { background: #eaf6ef; color: #1d7d47; }
+.pill.s-interrupted { background: #fbeced; color: #c4373d; }
+.pill.s-denied, .pill.s-cancelled { background: #f2f2f0; color: var(--a-muted); }
+.tag.k-awaiting { background: #fdf2e2; color: #b56a06; }
+.approve.await textarea { width: 100%; margin: 6px 0; font: inherit; }
+.calls-out { max-width: 420px; }
+.calls-out pre { margin: 4px 0 0; white-space: pre-wrap; word-break: break-word; font: 12px/1.45 var(--mono); max-height: 180px; overflow: auto; }
 
 /* ── pages ──────────────────────────────────────────────────────────────── */
 

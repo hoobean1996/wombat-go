@@ -1,4 +1,4 @@
-import type { Approval, FileInfo, Health, InboxEvent, Message, OutboxMessage, ServerConfig, SessionInfo, SessionOptions, Timer } from '../types'
+import type { Approval, FileInfo, Health, InboxEvent, Message, OutboxMessage, ServerConfig, SessionInfo, SessionOptions, Timer, ToolCall } from '../types'
 
 /*
  * wombatd's HTTP API. The page is served by wombatd itself, so every path is
@@ -87,14 +87,24 @@ export const fileInfo = (id: string, path: string) => call<FileInfo>('GET', `/ap
 export const sendMessage = (id: string, prompt: string) => call<unknown>('POST', `/api/sessions/${enc(id)}/messages`, { prompt })
 /** A message for the turn that is running now. */
 export const steer = (id: string, prompt: string) => call<unknown>('POST', `/api/sessions/${enc(id)}/steer`, { prompt })
-export const listApprovals = (id: string) => call<{ approvals: Approval[] }>('GET', `/api/sessions/${enc(id)}/approvals`).then(r => r.approvals ?? [])
+/** What the session waits on: calls for a decision, and calls for a result from outside. */
+export const listWaiting = (id: string) => call<{ approvals?: Approval[]; awaiting?: Approval[] }>('GET', `/api/sessions/${enc(id)}/approvals`)
+  .then(r => ({ approvals: r.approvals ?? [], awaiting: r.awaiting ?? [] }))
 export const decide = (id: string, useId: string, allow: boolean) => call<unknown>('POST', `/api/sessions/${enc(id)}/approvals/${enc(useId)}`, { allow })
+/** The result of a call waiting for one: what the call returns, or the error it fails with. */
+export const postResult = (id: string, useId: string, output: string, isError = false) =>
+  call<unknown>('POST', `/api/sessions/${enc(id)}/results/${enc(useId)}`, { output, is_error: isError || undefined })
 
 /** The URL of a session's event stream. EventSource cannot set a header, so the token rides in the query (only here). */
 export function eventsURL(id: string, from: number): string {
   const token = getToken()
   return `/api/sessions/${enc(id)}/events${qs({ from, access_token: token || undefined })}`
 }
+
+// ── the ledger ───────────────────────────────────────────────────────────
+/** Tool calls, newest first. state may be several, comma-separated; parent "-" is the sessions' own calls only. */
+export const listToolCalls = (q: { session?: string; state?: string; turn?: number; step?: number; parent?: string; limit?: number } = {}, signal?: AbortSignal) =>
+  call<{ calls: ToolCall[] }>('GET', `/api/tool-calls${qs(q)}`, undefined, signal).then(r => r.calls ?? [])
 
 // ── the inbox ────────────────────────────────────────────────────────────
 export const listInbox = (q: { session?: string; status?: string; limit?: number } = {}, signal?: AbortSignal) =>
