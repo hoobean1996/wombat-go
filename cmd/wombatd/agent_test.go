@@ -20,6 +20,7 @@ import (
 	"wombat/pkg/core/mcp"
 	"wombat/pkg/core/review"
 	"wombat/pkg/core/tape"
+	"wombat/pkg/core/tool"
 	"wombat/pkg/core/trace"
 	"wombat/pkg/daemon"
 )
@@ -582,5 +583,26 @@ func TestFullAccessIsTheOperatorsToOffer(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(root, "made-it")); err == nil {
 		t.Fatal("the command ran on a server that does not offer full access")
+	}
+}
+
+// tools.recovery: ask turns the report of an interrupted call into a
+// question, for the tools whose calls would be reported, and only those.
+func TestAskOnRecoveryAsksOnlyWhatWouldBeReported(t *testing.T) {
+	in := []tool.Def{
+		{Name: "write", Caps: tool.CapMutating},
+		{Name: "read", Caps: tool.CapReadOnly},
+		{Name: "send", Caps: tool.CapNetwork, Idempotent: true},
+		{Name: "pay", Caps: tool.CapNetwork, Recovery: tool.RecoverReport},
+	}
+	got := askOnRecovery(in)
+	want := map[string]tool.Recovery{"write": tool.RecoverAsk, "read": tool.RecoverRerun, "send": tool.RecoverRerun, "pay": tool.RecoverReport}
+	for _, d := range got {
+		if r := tool.RecoveryOf(d); r != want[d.Name] {
+			t.Errorf("%s recovers by %v, want %v", d.Name, r, want[d.Name])
+		}
+	}
+	if in[0].Recovery != tool.RecoverAuto {
+		t.Error("the list it was given was changed")
 	}
 }
