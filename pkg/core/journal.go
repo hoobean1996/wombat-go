@@ -116,6 +116,12 @@ type Call struct {
 
 	// Handle names what a waiting call waits for ([tool.Await]).
 	Handle string
+
+	// Ran reports, of a call as it ended, whether this run got it to its
+	// tool — rather than answering it from the record, refusing it, or not
+	// running it at all — so that a journal can count the times it ran,
+	// those it did not Track included.
+	Ran bool
 }
 
 // Checkpoint is where a journaled run had got to, as its journal last wrote
@@ -312,6 +318,7 @@ func journalCalls(next tool.Handler) tool.Handler {
 		}
 		out, err := next(ctx, d, use)
 		c := outcome(ctx, i, use, d.Name, out, err, tool.Tagged(ctx), tool.Attached(ctx), true)
+		c.Ran = true
 		if werr := rj.j.Track(ctx, c); werr != nil {
 			rj.failedFinish(werr)
 		}
@@ -353,12 +360,14 @@ func outcome(ctx context.Context, i int, use llm.ToolUse, name, out string, err 
 	return c
 }
 
-// settled is what became of one call of a step, for the step's Close.
+// settled is what became of one call of a step, for the step's Close; ran
+// is whether this run got it to its tool.
 type settled struct {
 	state  tool.State
 	res    *tool.Result
 	reason string
 	handle string
+	ran    bool
 }
 
 func settledResult(state tool.State, res tool.Result) settled {
@@ -370,7 +379,7 @@ func stepCalls(uses []llm.ToolUse, st []settled) []Call {
 	out := make([]Call, len(uses))
 	for i, u := range uses {
 		s := st[i]
-		c := Call{Index: i, Use: u, State: s.state, Reason: s.reason, Handle: s.handle}
+		c := Call{Index: i, Use: u, State: s.state, Reason: s.reason, Handle: s.handle, Ran: s.ran}
 		if s.res != nil {
 			blk, _ := s.res.Block().(llm.ToolResult)
 			c.Result, c.Tags = &blk, s.res.Tags
@@ -385,7 +394,7 @@ func stepCalls(uses []llm.ToolUse, st []settled) []Call {
 func (r *Run) dispatched(ctx context.Context, i int, res tool.Result) settled {
 	began := r.journal != nil && r.journal.hasBegun(i)
 	c := outcome(ctx, i, llm.ToolUse{ID: res.UseID}, res.Name, res.Output, res.Err, res.Tags, res.Media, began)
-	s := settled{state: c.State, reason: c.Reason, handle: c.Handle}
+	s := settled{state: c.State, reason: c.Reason, handle: c.Handle, ran: began}
 	if c.Result != nil {
 		res := res
 		s.res = &res

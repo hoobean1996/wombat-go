@@ -218,6 +218,9 @@ func TestCloseSaysHowEachCallEnded(t *testing.T) {
 	if got[0].Result == nil || !got[0].Result.IsError || got[0].Result.Content != "boom" {
 		t.Errorf("the failed call = %+v, want its error as its result", got[0])
 	}
+	if !got[0].Ran || got[1].Ran || got[2].Ran {
+		t.Errorf("Ran = %v, %v, %v; want only the call that got to its tool", got[0].Ran, got[1].Ran, got[2].Ran)
+	}
 }
 
 // A journal that cannot write the step down stops the run before anything
@@ -322,13 +325,18 @@ func TestRecoverHandlesAnInterruptedCallAsItsToolSays(t *testing.T) {
 			def.Recovery = tc.recovery
 			cl := scripted(textTurn("ok"))
 			a := newAgent(t, cl, []tool.Def{def})
-			r := a.Start(context.Background(), Recover(reply(use("x1", "x"))))
+			j := &memJournal{}
+			r := a.Start(journaled(j), Recover(reply(use("x1", "x"))))
 			_, evs := drain(t, r)
 			if r.Err() != nil {
 				t.Fatal(r.Err())
 			}
 			if c.n.Load() != tc.ran {
 				t.Errorf("ran %d times, want %d", c.n.Load(), tc.ran)
+			}
+			// The journal is told which: a call reported is not one that ran.
+			if len(j.closes) == 0 || j.closes[0][0].Ran != (tc.ran == 1) {
+				t.Errorf("closed with %+v; want Ran %v", j.closes, tc.ran == 1)
 			}
 			if got := allText(cl.request(t, 0).Messages); !strings.Contains(got, tc.want) {
 				t.Errorf("the model read %q, want %q", got, tc.want)
