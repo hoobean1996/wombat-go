@@ -23,6 +23,8 @@
 //	POST   /api/sessions/{id}/approvals/{use_id}  {"allow": true|false, "from": "..."}
 //	POST   /api/sessions/{id}/results/{use_id}    {"output": "...", "is_error": false, "from": "..."}
 //	GET    /api/tool-calls                        the ledger, newest first; ?session= ?state= ?turn= ?step= ?parent=
+//	POST   /api/advance                           {"session_id"}: run its next slice (a Stateless daemon's queue)
+//	POST   /api/tick                              fire timers, wake what is ready, deliver; ?advance=true runs it too
 //	POST   /api/events                            an event from outside: a webhook, an alert, a relayed chat
 //	GET    /api/inbox                             events, newest first; ?session= ?status=
 //	GET    /api/outbox                            messages, oldest first; ?after= ?wait=
@@ -264,6 +266,26 @@ type ResultRequest struct {
 	// From names who, or what, posted it; kept with the call's result in the
 	// transcript's origins. Optional.
 	From string `json:"from,omitempty"`
+}
+
+// AdvanceRequest is the body of POST /api/advance: the session whose next
+// slice to run.
+type AdvanceRequest struct {
+	SessionID string `json:"session_id"`
+}
+
+// Advanced is the answer to POST /api/advance: whether the session has more
+// work — which the daemon has asked to be woken for already.
+type Advanced struct {
+	SessionID string `json:"session_id"`
+	More      bool   `json:"more"`
+}
+
+// Ticked is the answer to POST /api/tick: the sessions it found work for,
+// and those it ran a slice of itself, with ?advance=true.
+type Ticked struct {
+	Ready    []string `json:"ready"`
+	Advanced []string `json:"advanced,omitempty"`
 }
 
 // ToolCallList is the body of GET /api/tool-calls: calls of the ledger, the

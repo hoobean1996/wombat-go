@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1703,4 +1704,90 @@ func TestToolCallsOverTheAPI(t *testing.T) {
 	for _, q := range []string{"state=lost", "step=x", "turn=0", "limit=-1"} {
 		h.wantErr(h.do(http.MethodGet, "/api/tool-calls?"+q, ""), http.StatusBadRequest, "bad_request")
 	}
+}
+
+// ===== a server that runs no loop =====
+
+// A Stateless server runs nothing on its own: the message asks to be woken,
+// each POST /api/advance runs a slice, a tick finds what is ready — and runs
+// it, with ?advance=true — and the event stream is read from the store and
+// ended, at its limit, for the client to come back.
+func TestAStatelessServerIsDrivenFromOutside(t *testing.T) {
+	t.Parallel()
+	var woken atomic.Int64
+	c := apiScript(apiToolCall("u1", "look", `{"q":"x"}`), apiText("seen"), apiText("again"))
+	h := apiServe(t, c, []tool.Def{apiTool("look")}, func(cfg *daemon.ManagerConfig) {
+		cfg.Stateless, cfg.Slice = true, time.Nanosecond
+		cfg.Wake = func(context.Context, string, time.Time) error { woken.Add(1); return nil }
+	}, httpapi.WithStreamLimit(500*time.Millisecond))
+
+	info := h.start(`{"prompt":"look"}`)
+	if woken.Load() == 0 {
+		t.Fatal("the first message asked nobody to run it")
+	}
+	h.wantErr(h.do(http.MethodPost, "/api/advance", `{}`), http.StatusBadRequest, "bad_request")
+	taken := 0
+	for more := true; more; taken++ {
+		var adv httpapi.Advanced
+		h.decode(h.do(http.MethodPost, "/api/advance", `{"session_id":"`+info.ID+`"}`), http.StatusOK, &adv)
+		more = adv.More
+		if taken > 20 {
+			t.Fatal("the session never ran out of work")
+		}
+	}
+	var got daemon.SessionInfo
+	h.decode(h.do(http.MethodGet, "/api/sessions/"+info.ID, ""), http.StatusOK, &got)
+	if got.State != daemon.Idle || got.Answer != "seen" || got.Turns != 1 || taken < 3 {
+		t.Fatalf("after %d slices the session is %+v", taken, got)
+	}
+
+	// The log, read from the store by whichever instance gets the request,
+	// ends at the limit: the stream is over, the conversation is not.
+	events := h.readStream(info.ID, nil, 0, -1)
+	var names []string
+	for _, e := range events {
+		if !e.ping && e.name != "" {
+			names = append(names, e.name)
+		}
+	}
+	if len(names) < 4 || names[0] != "turn_started" || names[len(names)-1] != "end" || !slices.Contains(names, "turn_suspended") || !slices.Contains(names, "turn_ended") {
+		t.Fatalf("the stream = %v", names)
+	}
+
+	// Nobody is told of a message posted straight to the inbox's store; a
+	// tick finds it, and runs it when asked to.
+	h.decode(h.do(http.MethodPost, "/api/sessions/"+info.ID+"/messages", `{"prompt":"once more"}`), http.StatusAccepted, nil)
+	var ticked httpapi.Ticked
+	h.decode(h.do(http.MethodPost, "/api/tick?advance=true", ""), http.StatusOK, &ticked)
+	if !slices.Contains(ticked.Ready, info.ID) || !slices.Contains(ticked.Advanced, info.ID) {
+		t.Fatalf("tick = %+v", ticked)
+	}
+	for i := 0; i < 20; i++ {
+		var adv httpapi.Advanced
+		h.decode(h.do(http.MethodPost, "/api/advance", `{"session_id":"`+info.ID+`"}`), http.StatusOK, &adv)
+		if !adv.More {
+			break
+		}
+	}
+	h.decode(h.do(http.MethodGet, "/api/sessions/"+info.ID, ""), http.StatusOK, &got)
+	if got.Answer != "again" || got.Turns != 2 {
+		t.Fatalf("after the tick the session is %+v", got)
+	}
+}
+
+// A permission changed while a turn of a Stateless server's session runs is
+// refused until it ends.
+func TestAStatelessServerRefusesAPermissionMidTurn(t *testing.T) {
+	t.Parallel()
+	c := apiScript(apiToolCall("u1", "look", `{}`), apiText("seen"))
+	h := apiServe(t, c, []tool.Def{apiTool("look")}, func(cfg *daemon.ManagerConfig) {
+		cfg.Stateless, cfg.Slice = true, time.Nanosecond
+	})
+	info := h.start(`{"prompt":"look"}`)
+	var adv httpapi.Advanced
+	h.decode(h.do(http.MethodPost, "/api/advance", `{"session_id":"`+info.ID+`"}`), http.StatusOK, &adv)
+	if !adv.More {
+		t.Fatal("the first slice finished the turn")
+	}
+	h.wantErr(h.do(http.MethodPatch, "/api/sessions/"+info.ID, `{"permission":"readonly"}`), http.StatusConflict, "busy")
 }
