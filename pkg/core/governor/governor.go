@@ -110,6 +110,12 @@ type Used struct {
 	CacheWrite   int           `json:"cache_write_tokens,omitempty"`
 	CacheRead    int           `json:"cache_read_tokens,omitempty"`
 	Elapsed      time.Duration `json:"elapsed_ns,omitempty"`
+
+	// LastCall and RepeatRun are where loop detection had got to (see
+	// Limits.RepeatedToolCalls): a run carried on in slices is still one
+	// run, and a loop that spans a slice is still a loop.
+	LastCall  string `json:"last_call,omitempty"`
+	RepeatRun int    `json:"repeat_run,omitempty"`
 }
 
 // Used is what p has used, to carry on from.
@@ -119,6 +125,16 @@ func (p Progress) Used() Used {
 		InputTokens: p.Tokens.In, OutputTokens: p.Tokens.Out, CacheWrite: p.Tokens.CacheWrite, CacheRead: p.Tokens.CacheRead,
 		Elapsed: p.Elapsed,
 	}
+}
+
+// Used is what b has used, loop detection included, to carry on from with
+// [WithBudgetFrom].
+func (b *Budget) Used() Used {
+	u := b.Progress().Used()
+	b.mu.Lock()
+	u.LastCall, u.RepeatRun = b.lastCall, b.repeatRun
+	b.mu.Unlock()
+	return u
 }
 
 // WithBudgetFrom is [WithBudget] for a run that carries on from an earlier
@@ -140,7 +156,8 @@ func WithBudgetFrom(parent context.Context, l Limits, u Used) (context.Context, 
 	b := &Budget{
 		limits: l, start: start, cancel: cancelCause,
 		usd: u.CostUSD, calls: u.Calls, steps: u.Steps, toolCalls: u.ToolCalls,
-		tokens: Tokens{In: u.InputTokens, Out: u.OutputTokens, CacheWrite: u.CacheWrite, CacheRead: u.CacheRead},
+		tokens:   Tokens{In: u.InputTokens, Out: u.OutputTokens, CacheWrite: u.CacheWrite, CacheRead: u.CacheRead},
+		lastCall: u.LastCall, repeatRun: u.RepeatRun,
 	}
 	if l.CostUSD > 0 && b.usd >= l.CostUSD {
 		cancelCause(ErrBudgetExhausted)

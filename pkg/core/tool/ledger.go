@@ -234,11 +234,18 @@ func Awaiting(err error) (handle, note string, ok bool) {
 	return "", "", false
 }
 
+// ErrSuspended marks a call that did not finish in its run's slice and
+// carries on in the next: a delegate call whose sub-agent stopped, at the end
+// of the slice, where its journal wrote it down. The call is not over, and has
+// not failed; the run it belongs to stops too, and runs it again — which
+// carries the sub-agent on — when it is resumed. See core.Input.Until.
+var ErrSuspended = errors.New("tool: carries on in the next slice")
+
 // pending reports an error that is not a failure: the call is waiting — for a
-// decision, or for a result — and no middleware should count it against the
-// tool, nor try it again.
+// decision, or for a result — or carries on in the next slice, and no
+// middleware should count it against the tool, nor try it again.
 func pending(err error) bool {
-	return errors.Is(err, ErrDeferred) || errors.Is(err, ErrAwait)
+	return errors.Is(err, ErrDeferred) || errors.Is(err, ErrAwait) || errors.Is(err, ErrSuspended)
 }
 
 // Tagged returns the labels the call ctx belongs to has put on its result

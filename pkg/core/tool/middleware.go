@@ -443,6 +443,30 @@ func CallStatsFrom(ctx context.Context) *CallStats {
 	return NewCallStats()
 }
 
+// MarshalState is the counters as a run suspended at the end of its slice
+// carries them to the next (see core.Carried), so a loop that spans a slice
+// is still one loop.
+func (s *CallStats) MarshalState() (json.RawMessage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return json.Marshal(s.counts)
+}
+
+// UnmarshalState puts back what MarshalState wrote.
+func (s *CallStats) UnmarshalState(b json.RawMessage) error {
+	var counts map[string]map[string]int
+	if err := json.Unmarshal(b, &counts); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.counts = counts
+	if s.counts == nil {
+		s.counts = make(map[string]map[string]int, 8)
+	}
+	return nil
+}
+
 // fail records one failure of call with the error text msg, returning how many
 // times in a row that exact pair has now been seen.
 func (s *CallStats) fail(call, msg string) int {

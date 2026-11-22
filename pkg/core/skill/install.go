@@ -39,7 +39,10 @@ func (g Gated) Install() core.Option {
 		opts = append(opts, core.WithSystemBlock("available_skills", g.Index))
 	}
 	opts = append(opts, core.WithRunContext(func(ctx context.Context) context.Context {
-		return WithState(ctx, NewState())
+		// Carried, so a run suspended at the end of its slice still has the
+		// skills it loaded when it carries on.
+		st := NewState()
+		return core.Carry(WithState(ctx, st), "skill.active", st)
 	}))
 	return core.Options(opts...)
 }

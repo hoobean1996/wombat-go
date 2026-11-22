@@ -31,7 +31,7 @@ import (
 // run checks it, as it would have, and ends. Then the run carries on as if it
 // had never stopped, counting the iterations it had made.
 func Recover(cp Checkpoint) Input {
-	return Input{Messages: cp.Messages, resume: true, recorded: cp.Calls, iterations: cp.Iterations}
+	return Input{Messages: cp.Messages, resume: true, recorded: cp.Calls, iterations: cp.Iterations, state: cp.State}
 }
 
 // Recorded tells a run resumed with [Decide] what a journal recorded of the
@@ -150,6 +150,10 @@ func (r *Run) settle(ctx context.Context, convo Convo) (Convo, bool) {
 			// what it returned is the answer, and it does not run again.
 			answer(i, settledResult(c.State, resultOf(u, *c.Result, c.Tags)))
 			r.emit(ToolRecovered{UseID: u.ID, Name: u.Name, State: c.State, Action: "replayed"})
+		case has && c.State == tool.StateRunning && c.Reason == suspendedReason:
+			// It stopped with the slice, where its journal wrote it down:
+			// run again, it carries on from there.
+			run = append(run, i)
 		case (has && c.State == tool.StateWaiting) || (isWaiting && w.Awaiting):
 			if blk, ok := r.completed[u.ID]; ok {
 				blk.ToolUseID = u.ID
@@ -196,12 +200,23 @@ func (r *Run) settle(ctx context.Context, convo Convo) (Convo, bool) {
 			dctx = tool.WithDecisions(ctx, verdicts)
 		}
 		results, stop := r.dispatch(dctx, convo, pending)
+		r.units++
 		for j, i := range run {
 			if j < len(results) && results[j].UseID != "" {
 				st[i] = r.dispatched(ctx, i, results[j])
 			} else {
 				st[i] = settledResult(tool.StateCancelled, notRun(uses[i], notRunText(stop)))
 			}
+		}
+		if suspendedIn(results) {
+			// A sub-agent stopped with the slice again: the step stays open,
+			// with what has been answered so far, until the next.
+			calls := stepCalls(uses, st)
+			if err := r.journal.close(ctx, calls); err != nil && ctx.Err() == nil {
+				r.finish(nil, err)
+				return convo, true
+			}
+			return r.suspend(ctx, convo, calls, r.iterations)
 		}
 		switch o := stop.(type) {
 		case Paused, Submitted:
