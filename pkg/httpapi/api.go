@@ -410,6 +410,7 @@ func New(m *daemon.Manager, opts ...Option) http.Handler {
 	// queue that runs a session's next slice, and the cron that ticks.
 	mux.HandleFunc("POST /api/advance", a.advance)
 	mux.HandleFunc("POST /api/tick", a.tick)
+	mux.HandleFunc("GET /api/tick", a.tick)
 	mux.HandleFunc("POST /api/events", a.postEvent)
 	mux.HandleFunc("GET /api/inbox", a.listInbox)
 	mux.HandleFunc("GET /api/outbox", a.listOutbox)
@@ -1422,7 +1423,10 @@ func (a *api) advance(w http.ResponseWriter, r *http.Request) {
 		a.fail(w, r, fmt.Errorf("%w: session_id is required", daemon.ErrBadRequest))
 		return
 	}
-	more, err := a.m.Advance(r.Context(), req.SessionID)
+	// Not cut short when the caller gives up on the answer: a queue's
+	// timeout is no reason to stop a slice half way, which is bounded on its
+	// own.
+	more, err := a.m.Advance(context.WithoutCancel(r.Context()), req.SessionID)
 	if err != nil {
 		a.fail(w, r, err)
 		return

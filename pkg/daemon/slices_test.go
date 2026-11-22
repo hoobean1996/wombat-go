@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -397,5 +400,42 @@ func TestAPermissionWaitsForTheTurn(t *testing.T) {
 	}
 	if again, _ := a.Get(testCtx(t), s.ID()); again.Info().Options.Permission != "readonly" {
 		t.Errorf("options = %+v", again.Info().Options)
+	}
+}
+
+// The wake-up webhook posts the session to advance, with the headers it was
+// given; a wake-up for later says when, in the queue's own header.
+func TestWakeWebhookAsksAQueue(t *testing.T) {
+	var got []WakeRequest
+	var delays, auth []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req WakeRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		got = append(got, req)
+		delays = append(delays, r.Header.Get("Upstash-Not-Before"))
+		auth = append(auth, r.Header.Get("Authorization"))
+	}))
+	defer srv.Close()
+	wake := WakeWebhook(srv.URL, map[string]string{"Authorization": "Bearer q"}, "Upstash-Not-Before", nil)
+	later := time.Now().Add(time.Hour).Truncate(time.Second)
+	if err := wake(testCtx(t), "s1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := wake(testCtx(t), "s2", later); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].SessionID != "s1" || !got[0].NotBefore.IsZero() || delays[0] != "" {
+		t.Fatalf("a wake-up for now: %+v, delay %q", got, delays)
+	}
+	if got[1].SessionID != "s2" || !got[1].NotBefore.Equal(later) || delays[1] != strconv.FormatInt(later.Unix(), 10) {
+		t.Fatalf("a wake-up for later: %+v, delay %q", got[1], delays[1])
+	}
+	if auth[0] != "Bearer q" || auth[1] != "Bearer q" {
+		t.Errorf("headers: %v", auth)
+	}
+	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusBadGateway) }))
+	defer failing.Close()
+	if err := WakeWebhook(failing.URL, nil, "", nil)(testCtx(t), "s1", time.Now()); err == nil {
+		t.Error("a queue that refused said nothing")
 	}
 }

@@ -25,6 +25,7 @@
 //	GET    /api/tool-calls                        the ledger, newest first; ?session= ?state= ?turn= ?step= ?parent=
 //	POST   /api/advance                           {"session_id"}: run its next slice (a Stateless daemon's queue)
 //	POST   /api/tick                              fire timers, wake what is ready, deliver; ?advance=true runs it too
+//	GET    /api/tick                              the same, for a cron that can only GET
 //	POST   /api/events                            an event from outside: a webhook, an alert, a relayed chat
 //	GET    /api/inbox                             events, newest first; ?session= ?status=
 //	GET    /api/outbox                            messages, oldest first; ?after= ?wait=
@@ -92,6 +93,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"time"
 
 	"wombat/pkg/daemon"
 )
@@ -270,8 +272,13 @@ type ResultRequest struct {
 
 // AdvanceRequest is the body of POST /api/advance: the session whose next
 // slice to run.
+//
+// It is the [daemon.WakeRequest] a daemon's wake-up webhook posts, so a queue
+// can forward that as it is: NotBefore, when the queue could not hold the
+// call until then, finds nothing to run yet.
 type AdvanceRequest struct {
-	SessionID string `json:"session_id"`
+	SessionID string    `json:"session_id"`
+	NotBefore time.Time `json:"not_before,omitzero"`
 }
 
 // Advanced is the answer to POST /api/advance: whether the session has more
