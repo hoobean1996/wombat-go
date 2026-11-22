@@ -454,3 +454,26 @@ func TestASubagentWithoutASuspenderDoesNotStop(t *testing.T) {
 		t.Fatalf("ended %#v (%v), %d reads", sliced.outcome, sliced.err, reads.n.Load())
 	}
 }
+
+// A call that carries on in the next slice — whatever tool it is — runs
+// again when the run does, rather than being reported as interrupted: it
+// stopped where its journal wrote it down, and nothing about it is in doubt.
+func TestACallThatStoppedWithTheSliceRunsAgain(t *testing.T) {
+	var runs atomic.Int64
+	job := tool.Def{Name: "job", Description: "a job in two parts", InputSchema: json.RawMessage(objSchema), Caps: tool.CapMutating,
+		Fn: func(context.Context, json.RawMessage) (string, error) {
+			if runs.Add(1) == 1 {
+				return "", fmt.Errorf("%w: part one done", tool.ErrSuspended)
+			}
+			return "both parts done", nil
+		}}
+	cl := scripted(toolTurn("j1", "job", `{}`), textTurn("done"))
+	a := newAgent(t, cl, []tool.Def{job})
+	sliced := runSliced(t, a, Ask("go"), governor.Limits{}, newSlicedJournal())
+	if ans, ok := sliced.outcome.(Answer); !ok || ans.Text != "done" {
+		t.Fatalf("ended %#v (%v)", sliced.outcome, sliced.err)
+	}
+	if got := allText(cl.request(t, 1).Messages); !strings.Contains(got, "both parts done") || strings.Contains(got, "interrupted") {
+		t.Errorf("the model read %s; want the call run again, not reported", got)
+	}
+}

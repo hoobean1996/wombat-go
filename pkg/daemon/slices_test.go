@@ -263,6 +263,13 @@ func TestSteeringATurnBetweenSlices(t *testing.T) {
 	if got := kinds(framesOf(t, again, endOfTurn(1))); count(got, "steer_sent") != 1 {
 		t.Errorf("the log = %v; want the message echoed once", got)
 	}
+	// A slice that ended before taking the message gave it back, untried.
+	events, _ := st.Events(testCtx(t), EventFilter{Session: s.ID()})
+	for _, ev := range events {
+		if ev.Kind == KindSteer && (ev.Status != EventDone || ev.Attempts != 1) {
+			t.Errorf("the steering message = %+v; want done, tried once", ev)
+		}
+	}
 	if rec, _ := st.LoadSession(testCtx(t), s.ID()); rec.Answer != "done, in v2" {
 		t.Errorf("answer %q", rec.Answer)
 	}
@@ -437,5 +444,26 @@ func TestWakeWebhookAsksAQueue(t *testing.T) {
 	defer failing.Close()
 	if err := WakeWebhook(failing.URL, nil, "", nil)(testCtx(t), "s1", time.Now()); err == nil {
 		t.Error("a queue that refused said nothing")
+	}
+}
+
+// A turn that stops before it has written a step down — a reply cut off at
+// max_tokens, asked for again — carries on from where it stopped: one turn,
+// and the retry still tells the model it was cut off.
+func TestATurnStoppedBeforeItsFirstStepCarriesOn(t *testing.T) {
+	cut := llm.Response{Content: []llm.ContentBlock{llm.Text{Text: "a very long"}}, StopReason: llm.StopMaxTokens}
+	cl := &stepModel{steps: []func() (llm.Response, error){reply(cut), reply(textTurn("short"))}}
+	m := newManager(t, ManagerConfig{Slice: aNanosecond, Build: builder(cl)})
+	s, _ := m.Create(testCtx(t), SessionOptions{})
+	e := mustSend(t, s, "write it all")
+	if ended := waitEvent(t, s, e.ID); ended.Answer != "short" {
+		t.Fatalf("the turn = %+v", ended)
+	}
+	asked := cl.asked()
+	if len(asked) != 2 || !strings.Contains(sentText(asked[1]), "cut off") {
+		t.Fatalf("the model was asked %d times; the retry carried no notice: %s", len(asked), sentText(asked[len(asked)-1]))
+	}
+	if got := kinds(framesOf(t, s, endOfTurn(1))); count(got, "turn_started") != 1 || count(got, "turn_suspended") < 1 {
+		t.Errorf("the log = %v; want one turn, suspended between its calls", got)
 	}
 }
