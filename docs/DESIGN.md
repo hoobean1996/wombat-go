@@ -695,6 +695,67 @@ its budget (the earlier runs count against it) and its spend (counted once).
 The ledger keeps a call for `store.ledger_retention` (30 days) after it
 ended, for the sessions with no turn in flight and nothing waiting.
 
+### Slices: no process has to outlive a turn
+
+A turn used to run in one goroutine for as long as it took, and a session
+lived in the memory of the daemon that held it — its log, its steering, its
+cancellation. Neither fits a host that runs a request for minutes at most and
+keeps nothing after: a serverless function. So a turn can run in slices, and a
+daemon can keep nothing between calls.
+
+**A run stops on its own** (`core.Input.Until`). At every step boundary —
+before a model call, before a batch of tool calls — it asks whether what comes
+next fits in what is left of its slice: the slowest model call it has timed
+(or `WithCallEstimate`), the longest timeout in the batch. If not, it stops
+and ends in `core.Suspended`, with a `Checkpoint` that `core.Recover` carries
+on from. A slice always does one unit of work first, so a run carried on in
+slices of any length gets somewhere; a tool call is never stopped part-way.
+
+**The checkpoint is complete.** A run carried on in slices must end exactly as
+the run in one go — the same requests to the model, the same transcript, the
+same end — and that is a test, run on every scenario that has state: a reply
+cut off at `max_tokens` and its notice, empty turns, completion-check
+rejections, loop detection, dedup counters, the overflow ladder, loaded
+skills, what a person allowed for the turn. `Checkpoint.State` holds the
+loop's own counters and every `core.Carried` registered on the run's context
+with `core.Carry`; it is written with every journal step, and with the
+suspension. A delegate's sub-agent stops with the slice too: its journal
+writes it down (`tool_runs`), the delegate call returns `tool.ErrSuspended`
+and stays running in the ledger, and on resume it runs again and the child
+carries on.
+
+**The daemon in slices** (`ManagerConfig.Slice`). A turn that stops is
+written down where it got to (`Store.SaveProgress`), its events go back to
+the inbox at once without counting a try (`Settlement.Continue`), the session
+stays running, and a `turn_suspended` frame says where the slice ended. The
+next slice — this daemon or any sharing the store — carries the turn on
+under the same number, with its budget, spend and grants. A message steering
+a turn that runs elsewhere, or a cancellation, goes through the inbox
+(`steer`, `cancel`) and is taken at the turn's next step.
+
+**A daemon that keeps nothing** (`ManagerConfig.Stateless`). No loop runs.
+`Manager.Advance` runs a session's next slice and lets it go; `Manager.Tick`
+does once what the loops would — fire timers, wake what is ready (a session
+whose slice died, once its lease is gone), deliver, prune; `ManagerConfig.
+Wake` is told whenever a session has work, now or later, so the host can
+queue the call that advances it. A request reads a session as a view, taking
+no lease. Every frame of a session's log is kept in the store, and a client
+following a session that runs elsewhere reads it from there; a stream ends
+before the host would cut it, and the client reconnects with its last id.
+
+```
+POST /api/sessions ──► inbox ──► Wake ──► queue ──► POST /api/advance ──► one slice
+                                                     ▲                    │ more?
+                                                     └──── Wake ◄─────────┘
+cron ──► GET /api/tick?advance=true ──► timers, lost wake-ups, delivery, pruning
+```
+
+`wombatd.Handler` (api/index.go, vercel.json) is the server on Vercel:
+configured from `WOMBATD_CONFIG_YAML`, a slice per request, a queue
+(QStash, with `serverless.wake`) for what comes next, and a cron as the
+backstop. Leaders are rows with an expiry, not session locks, which a pooler
+in transaction mode does not keep.
+
 ## What is kept
 
 The middleware chains, which are the best part of the original and translate
@@ -741,7 +802,8 @@ Failure is `run.Err()`, matched with `errors.Is`. One failure channel, not two.
 
 The module is `wombat`. Everything a program builds an agent from is under
 `pkg/core`; what keeps agents running is `pkg/daemon`, and its HTTP surface
-`pkg/httpapi`; the one command is `cmd/wombatd`.
+`pkg/httpapi`; the server is `internal/wombatd`, which the one command,
+`cmd/wombatd`, runs as a process and `api/index.go` as a Vercel function.
 
 ```
 pkg/core/             Agent, Run, Event, Outcome, Convo, Strategy   ← the front door
@@ -762,9 +824,11 @@ pkg/core/trace/       OTel-shaped spans, NDJSON and a self-contained HTML report
 pkg/core/metric/      Prometheus text exposition, hand-written
 pkg/daemon/           always on: sessions, the inbox, timers, deferred decisions, the outbox
 pkg/daemon/storetest/ what a daemon.Store has to do, as tests both stores pass
-pkg/store/postgres/   the sessions and the three tables in Postgres
+pkg/store/postgres/   the sessions, the three tables, the ledger and the logs in Postgres
 pkg/httpapi/          the daemon over HTTP: events in, SSE and the outbox out
-cmd/wombatd/          the agent as a service; everything configured by wombatd.yaml
+internal/wombatd/     the agent as a service; everything configured by wombatd.yaml
+cmd/wombatd/          the server as a process
+api/                  the server as a Vercel function (vercel.json)
 eval/                 does the harness work: request shape, wire conformance, judges (make judge)
 eval/rl/              episodes, verifiers, pass@k
 eval/benchmarks/      eight coding tasks as data, and the suite that runs them (make bench)

@@ -287,6 +287,42 @@ store:
 
 会话可能从一个实例转到另一个：持有它的实例空闲时把它放掉，或者挂了。所以部署多个实例时，`tools.working_dir` 要放在所有实例都能访问的存储上，否则 Agent 会发现自己写的文件在别的机器上。
 
+**分片运行一轮。** `daemon.slice` 限制一轮一次最多跑多久。下一步可能放不下时——一次模型调用可能比这一轮测到的最慢的那次还慢，或者一批工具调用的最长超时太长——这一轮就在两步之间停下，记下做到了哪里，然后立刻接着跑：在这个实例上，或者在共用同一个存储的任何实例上。事件流里会在每片结束的地方出现 `turn_suspended`，然后继续。这仍然是同一轮：轮次编号、预算、这一轮里人允许过的事、花掉的钱都接着算。两片之间发来的插话（steer）或取消，会在收件箱里等下一片来取。
+
+<a id="zh-serverless"></a>
+
+### 部署到 serverless 环境（Vercel）
+
+wombatd 也能作为 serverless 函数运行：`api/index.go` 用同一个服务处理所有 `/api`、`/files` 和 `/metrics` 请求，一次一个请求，请求之间除了 Postgres 里的东西什么都不留。没有后台循环，取而代之的是：
+
+- **一个请求跑一片。** `POST /api/advance {"session_id"}` 跑一个会话的下一片（`daemon.slice`，不设置时是 4 分钟；要明显小于函数的 `maxDuration`，`vercel.json` 里是 300 秒）。
+- **用队列安排下一片。** 一个会话只要有活要干——新消息、审批决定、停下来但还没跑完的一片、设置的计时器、到期的重试——wombatd 就把 `{"session_id", "not_before"}` POST 到 `serverless.wake.url`。把它指向一个会带着这个请求体调用 `POST /api/advance` 的队列：用 [Upstash QStash](https://upstash.com/docs/qstash) 的话，地址是 `https://qstash.upstash.io/v2/publish/https://<你的应用>/api/advance`，请求头带 `Authorization: Bearer <QStash token>` 和 `Upstash-Forward-Authorization: Bearer <server.token>`，再设 `delay_header: Upstash-Not-Before`，这样计时器的唤醒会被队列一直压到到期再发。
+- **用 cron 兜底。** `vercel.json` 每分钟调用一次 `GET /api/tick?advance=true`：触发到期的计时器，找出丢失的唤醒留下的活——比如某一片跑到一半实例没了，等它的租约过期后——然后接着跑。没有队列的话，单靠 cron 也能跑，每个会话每分钟一片。Vercel 会带上 `Authorization: Bearer $CRON_SECRET`：把 `CRON_SECRET` 设成和 `server.token` 一样。（每分钟一次的 cron 需要付费套餐。）
+- **事件流会主动结束。** 事件流会在平台掐断之前结束（`serverless.stream_limit`，不设置时是 4 分钟），发一个 `end` 事件，浏览器会带着最后收到的 id 自动重连。任何实例都能接这个流，从存储里读会话的日志。
+- **配置来自环境变量。** `WOMBATD_CONFIG_YAML` 里放 `wombatd.yaml` 的内容，其中的 `${VARS}` 会从环境变量展开，所以模型 key 和数据库地址可以各放一个变量。存储必须是 `postgres`（Neon 或 Supabase；如果走 transaction 模式的连接池，DSN 里加上 `default_query_exec_mode=simple_protocol`）。`server.addr`、`daemon.name` 和 Host 检查都不适用：每个实例都是一个独立的守护进程。
+
+```yaml
+# WOMBATD_CONFIG_YAML
+server:
+  token: ${WOMBATD_TOKEN}
+store:
+  driver: postgres
+  dsn: ${DATABASE_URL}
+model:
+  provider: anthropic
+  name: claude-sonnet-5-5
+  api_key: ${ANTHROPIC_API_KEY}
+serverless:
+  wake:
+    url: https://qstash.upstash.io/v2/publish/https://my-agent.vercel.app/api/advance
+    headers:
+      Authorization: Bearer ${QSTASH_TOKEN}
+      Upstash-Forward-Authorization: Bearer ${WOMBATD_TOKEN}
+    delay_header: Upstash-Not-Before
+```
+
+一轮正在跑的时候修改权限会被拒绝（`409 busy`），等它结束再改：否则这一轮结束时会把新权限覆盖掉。
+
 <a id="zh-http"></a>
 
 ## HTTP API
@@ -306,6 +342,8 @@ store:
 | `POST /api/sessions/{id}/steer` | 给仍在运行的这一轮发送消息 |
 | `GET /api/sessions/{id}/approvals` | 列出等待决定的调用（`approvals`），以及等待外部结果的调用（`awaiting`） |
 | `POST /api/sessions/{id}/approvals/{use_id}` | 对其中一个做出决定：`{"allow": true, "from": "..."}` |
+| `POST /api/advance` | 跑一个会话的下一片：`{"session_id": "..."}`。serverless 部署时由队列调用；会话还有活时返回 `{"more": true}`，并且已经安排好下一次唤醒 |
+| `POST /api/tick`（或 `GET`） | 触发到期的计时器、唤醒有活的会话、投递发件箱、清理过期记录；带 `?advance=true` 时顺便把找到的那些片也跑了。serverless 部署时由 cron 调用 |
 | `POST /api/sessions/{id}/results/{use_id}` | 提交一个调用在等的结果——比如 Agent 用 `wait_for_result` 等待的构建、任务：`{"output": "...", "is_error": false, "from": "..."}`。这个调用会把它当作返回值，没有别的在等时这一轮就继续 |
 | `GET /api/tool-calls` | 工具调用账本，最新的在前：每个调用的状态（`pending`、`running`、`succeeded`、`failed`、`denied`、`deferred`、`waiting`、`interrupted`、`cancelled`）、执行了几次、结果是什么。`?session=`、`?state=`（可重复，或用逗号分隔）、`?turn=`、`?step=`、`?parent=`（`-` 表示只看会话自己的调用）、`?limit=` |
 | `POST /api/events` | 来自外部的事件：`{"session_id" or "thread", "kind", "source", "from", "dedup_key", "payload"}` |
@@ -539,9 +577,11 @@ pkg/core/accept/      确定性的“是否真正完成”检查（build、vet�
 pkg/core/review/      对抗式代码审查，以失败的测试用例报告缺陷
 pkg/daemon/           常驻运行：会话、收件箱、计时器、延后的审批决定、发件箱
 pkg/daemon/storetest/ 以测试形式规定存储必须满足的行为，两种存储都要通过
-pkg/store/postgres/   保存在 Postgres 中的会话表和另外三张表
+pkg/store/postgres/   保存在 Postgres 中的会话、三张表、工具调用账本和会话日志
 pkg/httpapi/          通过 HTTP 暴露守护进程：事件进，SSE 和发件箱出；同时提供网页界面
-cmd/wombatd/          服务本体；一切都由 wombatd.yaml 配置
+internal/wombatd/     服务本体；一切都由 wombatd.yaml 配置
+cmd/wombatd/          以进程方式运行服务
+api/                  以 Vercel 函数方式运行服务（配合 vercel.json）
 ui/                   网页界面（React + Vite），通过 ui/embed.go 嵌入 wombatd
 eval/                 框架自身的评测
 eval/rl/              episode、校验器、pass@k

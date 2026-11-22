@@ -157,6 +157,12 @@ written down before it runs, so a call that finished is not run again, and
 one that was running when wombatd stopped is run again only if that is safe
 (`GET /api/tool-calls` shows the ledger).
 
+No process has to outlive a turn, either: a turn can run in slices
+(`daemon.slice`), each picking up where the last stopped, on any wombatd
+sharing the store. That is how wombatd runs on a serverless host — Vercel,
+with `api/index.go` and `vercel.json`: a slice per request, a queue for the
+next, and a cron as the backstop. See [GUIDE.md](docs/GUIDE.md#en-serverless).
+
 > [!WARNING]
 > Without `server.token`, anything that can reach the port can run the agent
 > and read every conversation. wombatd listens only on loopback by default.
