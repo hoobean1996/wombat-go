@@ -54,6 +54,10 @@ func Run(t *testing.T, open func(t *testing.T) daemon.Store) {
 		{"SubRunsAreKept", subRunsAreKept},
 		{"PruneForgetsWhatNothingCarriesOn", pruneForgetsWhatNothingCarriesOn},
 		{"TimersDedup", timersDedup},
+		{"ProgressIsSaved", progressIsSaved},
+		{"ClaimKinds", claimKinds},
+		{"ContinueDoesNotCountATry", continueDoesNotCountATry},
+		{"FramesAreKept", framesAreKept},
 	} {
 		t.Run(tc.name, func(t *testing.T) { tc.fn(t, open(t)) })
 	}

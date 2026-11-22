@@ -76,6 +76,11 @@ type Store interface {
 	// running, and has one more attempt.
 	Claim(ctx context.Context, session, owner string, now time.Time, limit int) ([]Event, error)
 
+	// ClaimKinds is Claim for the events of the kinds named alone: what a
+	// running turn takes as it goes — a message steering it, a cancellation
+	// — leaving the rest for the turn after.
+	ClaimKinds(ctx context.Context, session, owner string, kinds []string, now time.Time) ([]Event, error)
+
 	// Settle records what a turn did, all at once or not at all. A Session
 	// with Lease.Owner set is written as SaveSession writes it, and a refusal
 	// leaves everything as it was.
@@ -180,6 +185,13 @@ type Store interface {
 	// the call's key, or false when it had not got anywhere.
 	SubRun(ctx context.Context, session, parent string, n int) (SubRun, bool, error)
 
+	// SaveProgress writes down where a run had got to when it stopped at the
+	// end of its slice, without opening a step: the session's own turn
+	// (p.Inflight, as SaveSession would) or a sub-agent's (p.Sub, as
+	// SubRun reads it back), only while p.Owner holds the session under
+	// p.Epoch. The Step each names is kept as given.
+	SaveProgress(ctx context.Context, p Progress) error
+
 	// PruneCalls forgets the calls of sessions with no turn in flight and
 	// nothing waiting that ended before before — or, never having ended,
 	// were made before it: nothing will carry them on — and reports how many
@@ -187,9 +199,50 @@ type Store interface {
 	// calls that are gone or have ended had got to.
 	PruneCalls(ctx context.Context, before time.Time) (int, error)
 
+	// ===== The event log =====
+	//
+	// What a session's turns said as they ran, kept, so that a client
+	// following a session reads it wherever the turn ran: on another daemon,
+	// or in a serverless function long gone.
+
+	// AppendFrames keeps frames of a session's log, only while owner, when
+	// set, holds the session — under epoch, when that is — as SaveSession
+	// does: a daemon that lost the session has nothing left to say in it.
+	// One kept already under its sequence number stays as it was.
+	AppendFrames(ctx context.Context, session, owner string, epoch int64, frames []StoredFrame) error
+
+	// Frames lists a session's kept frames after f.After, oldest first.
+	Frames(ctx context.Context, f FrameFilter) ([]StoredFrame, error)
+
+	// LastFrame is the highest sequence number a session has a frame kept
+	// under, or -1.
+	LastFrame(ctx context.Context, session string) (int, error)
+
+	// PruneFrames forgets the frames kept before before, and reports how
+	// many.
+	PruneFrames(ctx context.Context, before time.Time) (int, error)
+
 	// Close releases what the store holds. The Manager does not call it: the
 	// store belongs to whoever opened it.
 	Close() error
+}
+
+// StoredFrame is a frame of a session's log as a store keeps it: its event
+// as the JSON a client is sent, and the event's kind.
+type StoredFrame struct {
+	Seq  int             `json:"seq"`
+	Turn int             `json:"turn"`
+	Kind string          `json:"kind"`
+	Data json.RawMessage `json:"data"`
+	At   time.Time       `json:"at"`
+}
+
+// FrameFilter selects a session's frames: those after After — -1 for all —
+// at most Limit, when set.
+type FrameFilter struct {
+	Session string
+	After   int
+	Limit   int
 }
 
 // Settlement is what one turn changed: its session, the events it was given,
@@ -206,6 +259,11 @@ type Settlement struct {
 	// Retry are events to try again, no sooner than RetryAt.
 	Retry   []int64
 	RetryAt time.Time
+
+	// Continue are events whose turn stopped at the end of its slice: back
+	// in the inbox at once, for the next, the claim that took them not
+	// counted as a try.
+	Continue []int64
 
 	// Failed are events given up on.
 	Failed []int64
@@ -451,6 +509,14 @@ const (
 	// started something that finishes outside it ([tool.Await]):
 	// {"use_id": "...", "output": "...", "is_error": false}.
 	KindResult = "result"
+
+	// KindSteer is a message for the turn in flight, {"text": "..."}, taken
+	// at its next model call. One that finds no turn in flight is a message
+	// for the next.
+	KindSteer = "steer"
+
+	// KindCancel stops the turn in flight at its next step; {}.
+	KindCancel = "cancel"
 )
 
 // The sources this package names.

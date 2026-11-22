@@ -330,4 +330,140 @@ func (m *Manager) pruneAt(now time.Time) {
 	case n > 0:
 		m.cfg.Logger.Info("ledger pruned", "calls", n)
 	}
+	n, err = m.store.PruneFrames(ctx, now.Add(-m.cfg.LedgerRetention))
+	switch {
+	case err != nil && m.ctx.Err() == nil:
+		m.cfg.Logger.Warn("daemon: pruning the session logs failed", "err", err)
+	case n > 0:
+		m.cfg.Logger.Info("session logs pruned", "frames", n)
+	}
+}
+
+// ===== Driven from outside =====
+//
+// What the loops do, one call at a time, for a host that runs none: a
+// serverless function, invoked by a queue and a cron.
+
+// wake says a session has work at at: to Wake, when the host gave one, or
+// to this daemon's own loop.
+func (m *Manager) wake(session string, at time.Time) {
+	if m.cfg.Wake == nil {
+		if !at.After(time.Now()) {
+			m.poke(m.kick)
+		}
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
+	defer cancel()
+	if err := m.cfg.Wake(ctx, session, at); err != nil {
+		m.cfg.Logger.Warn("daemon: waking a session failed; a tick will find it", "session", session, "err", err)
+	}
+}
+
+// Advance runs a session's next slice of work, if it has any: takes it,
+// claims its events, runs the turn they make — carried on from where it
+// stopped, if one is in flight — until it ends or its slice is up, and
+// settles. A Stateless daemon lets the session go after. It reports whether
+// the session has more work now, which has been asked for (Wake) already.
+//
+// A session another daemon holds, or this one is advancing already, is left
+// alone: false, and no error.
+func (m *Manager) Advance(ctx context.Context, id string) (bool, error) {
+	m.mu.Lock()
+	switch {
+	case m.closed:
+		m.mu.Unlock()
+		return false, ErrClosed
+	case m.busy[id]:
+		m.mu.Unlock()
+		return false, nil
+	}
+	m.busy[id] = true
+	m.turns.Add(1)
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		delete(m.busy, id)
+		m.mu.Unlock()
+		m.turns.Done()
+	}()
+
+	s, err := m.take(ctx, id)
+	if errors.Is(err, ErrOwned) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	batch, err := m.store.Claim(ctx, id, m.cfg.Name, time.Now(), MaxBatch)
+	if err == nil && len(batch) > 0 {
+		s.handle(batch)
+	}
+	if m.cfg.Stateless {
+		s.close()
+		m.release(id)
+	}
+	if err != nil {
+		return false, err
+	}
+	more := m.hasWork(ctx, s)
+	if more {
+		m.wake(id, time.Now())
+	}
+	return more, nil
+}
+
+// hasWork reports whether a session has events it could take now.
+func (m *Manager) hasWork(ctx context.Context, s *Session) bool {
+	pending, err := m.store.Events(ctx, EventFilter{Session: s.id, Status: EventPending, Limit: MaxBatch})
+	if err != nil {
+		return false
+	}
+	now := time.Now()
+	s.mu.Lock()
+	awaiting := s.deferred != nil
+	s.mu.Unlock()
+	for _, e := range pending {
+		if !e.NotBefore.After(now) && (!awaiting || e.Kind == KindApproval || e.Kind == KindResult) {
+			return true
+		}
+	}
+	return false
+}
+
+// Tick does once what the loops do continuously: fires the timers that are
+// due, wakes every session with work it could take now — those whose
+// daemon died included — delivers the outbox, when Deliver is set, and
+// prunes the ledger. It returns the sessions it found work for. A host that
+// runs no loop calls it now and then — a cron — so that nothing a lost
+// wake-up left waits for longer.
+func (m *Manager) Tick(ctx context.Context) ([]string, error) {
+	if m.isClosed() {
+		return nil, ErrClosed
+	}
+	now := time.Now()
+	fired, err := m.store.Fire(ctx, now)
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range fired {
+		m.wake(e.Session, now)
+	}
+	m.mu.Lock()
+	busy := slices.Collect(maps.Keys(m.busy))
+	m.mu.Unlock()
+	ready, err := m.store.Ready(ctx, now, m.cfg.Name, busy, 100)
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range ready {
+		m.wake(id, now)
+	}
+	if m.cfg.Deliver != nil {
+		m.deliverPending()
+	}
+	if m.cfg.LedgerRetention > 0 {
+		m.pruneAt(now)
+	}
+	return ready, nil
 }

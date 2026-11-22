@@ -90,6 +90,18 @@ type TurnEnded struct {
 	Undelivered []string `json:"undelivered,omitempty"`
 }
 
+// TurnSuspended marks the end of a slice of a turn: the turn stopped at a
+// step boundary because its slice was up ([ManagerConfig.Slice]), and
+// carries on in the next — in this process or another. No TurnEnded comes
+// between: the turn is still the one turn_started began, and the session is
+// running.
+type TurnSuspended struct {
+	Turn int `json:"turn"`
+
+	// Spend is what the slice cost.
+	Spend Spend `json:"spend"`
+}
+
 // SteerSent echoes a message sent to the turn in progress, the way
 // TurnStarted echoes a prompt. The run reports when it delivers it, with a
 // core.Steered event.
@@ -106,6 +118,15 @@ func (TurnEnded) Kind() string { return "turn_ended" }
 
 // Kind implements [core.Event].
 func (SteerSent) Kind() string { return "steer_sent" }
+
+// Kind implements [core.Event].
+func (TurnSuspended) Kind() string { return "turn_suspended" }
+
+// MarshalJSON implements [json.Marshaler].
+func (e TurnSuspended) MarshalJSON() ([]byte, error) {
+	type r TurnSuspended
+	return eventJSON(e.Kind(), r(e))
+}
 
 // MarshalJSON implements [json.Marshaler].
 func (e SteerSent) MarshalJSON() ([]byte, error) {
@@ -132,7 +153,7 @@ func (e TurnEnded) MarshalJSON() ([]byte, error) {
 // a renderer needs one list to walk: this one, alongside the others, or these
 // frames reach it as kinds it has never heard of.
 func EventTypes() []core.Event {
-	return []core.Event{TurnStarted{}, TurnEnded{}, SteerSent{}}
+	return []core.Event{TurnStarted{}, TurnEnded{}, SteerSent{}, TurnSuspended{}}
 }
 
 // eventJSON marshals v as an object with "type" spliced in as the first key.
@@ -175,3 +196,49 @@ func marshalNoEscape(v any) ([]byte, error) {
 	}
 	return bytes.TrimRight(buf.Bytes(), "\n"), nil
 }
+
+// decodeKept is an event read back from a session's kept log: one of this
+// package's own as what it was, so that a reader can tell how a turn ended;
+// any other as its kind and the JSON a client is sent.
+func decodeKept(kind string, data json.RawMessage) core.Event {
+	var ev core.Event
+	switch kind {
+	case TurnStarted{}.Kind():
+		var e TurnStarted
+		if json.Unmarshal(data, &e) == nil {
+			ev = e
+		}
+	case TurnEnded{}.Kind():
+		var e TurnEnded
+		if json.Unmarshal(data, &e) == nil {
+			ev = e
+		}
+	case TurnSuspended{}.Kind():
+		var e TurnSuspended
+		if json.Unmarshal(data, &e) == nil {
+			ev = e
+		}
+	case SteerSent{}.Kind():
+		var e SteerSent
+		if json.Unmarshal(data, &e) == nil {
+			ev = e
+		}
+	}
+	if ev == nil {
+		ev = keptEvent{kind: kind, data: data}
+	}
+	return ev
+}
+
+// keptEvent is an event read back from a session's kept log: its kind, and
+// the JSON a client is sent, as it was.
+type keptEvent struct {
+	kind string
+	data json.RawMessage
+}
+
+// Kind implements [core.Event].
+func (e keptEvent) Kind() string { return e.kind }
+
+// MarshalJSON implements [json.Marshaler].
+func (e keptEvent) MarshalJSON() ([]byte, error) { return e.data, nil }

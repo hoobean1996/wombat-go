@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -167,9 +168,33 @@ type ManagerConfig struct {
 
 	// LedgerRetention is how long the ledger keeps a tool call once it has
 	// ended — see [Store.PruneCalls] — for the sessions with no turn in
-	// flight and nothing waiting. Default DefaultLedgerRetention; negative
-	// keeps every call.
+	// flight and nothing waiting, and the session logs their frames.
+	// Default DefaultLedgerRetention; negative keeps everything.
 	LedgerRetention time.Duration
+
+	// Slice, when set, is the longest a turn runs in one go: it stops at
+	// the first step boundary after, written down where it got to, and
+	// carries on as soon as it is taken up again — here, or by any daemon
+	// sharing the store. See core.Input.Until.
+	Slice time.Duration
+
+	// Stateless runs the daemon as a serverless function would: nothing is
+	// kept in memory between calls, and nothing runs but what a call asks
+	// for. No loop runs; [Manager.Advance] runs a session's next slice,
+	// [Manager.Tick] does once what the loops would — fire the timers,
+	// deliver the outbox, find what is ready — and a request about a session
+	// reads it from the store, taking no lease (see [Manager.Get]). Set
+	// Slice to fit what one call may take, and Wake to have the slices
+	// that follow run.
+	Stateless bool
+
+	// Wake is told when a session has work, now or at a time to come: an
+	// event in its inbox, a turn that stopped at the end of its slice, a
+	// timer set, a retry due. A host that runs no loop — a Stateless one —
+	// has it run the session's next slice then: post to a queue that calls
+	// Advance. Best effort: Tick finds what a lost wake-up left. nil wakes
+	// this daemon's own loop.
+	Wake func(ctx context.Context, session string, at time.Time) error
 }
 
 // Manager runs sessions: it takes their events from the inbox, runs their
@@ -247,17 +272,26 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 	if cfg.LedgerRetention == 0 {
 		cfg.LedgerRetention = DefaultLedgerRetention
 	}
+	if cfg.Stateless {
+		// Nobody renews a lease between calls: one call's must outlast its
+		// slice, the unit of work that may overrun it, and then some.
+		cfg.Lease = max(cfg.Lease, 2*cfg.Slice+time.Minute)
+	}
 
 	// The turns this daemon was running when it last stopped, under this
-	// name, died with it; nobody else's are touched.
-	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
-	n, err := cfg.Store.Recover(ctx, cfg.Name, cfg.Attempts)
-	cancel()
-	if err != nil {
-		return nil, fmt.Errorf("daemon: recovering the inbox: %w", err)
-	}
-	if n > 0 {
-		cfg.Logger.Info("events this daemon left running when it stopped are back in the inbox", "events", n)
+	// name, died with it; nobody else's are touched. A stateless daemon has
+	// no name to start again under: what its calls leave running is taken
+	// over once their leases run out.
+	if !cfg.Stateless {
+		ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
+		n, err := cfg.Store.Recover(ctx, cfg.Name, cfg.Attempts)
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("daemon: recovering the inbox: %w", err)
+		}
+		if n > 0 {
+			cfg.Logger.Info("events this daemon left running when it stopped are back in the inbox", "events", n)
+		}
 	}
 
 	m := &Manager{
@@ -272,6 +306,9 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 		posted:   make(chan struct{}),
 	}
 	m.ctx, m.cancel = context.WithCancel(context.Background())
+	if cfg.Stateless {
+		return m, nil
+	}
 	m.loops.Add(4)
 	go m.work()
 	go m.schedule()
@@ -312,10 +349,19 @@ func (m *Manager) create(ctx context.Context, opts SessionOptions, thread string
 	s.updated = s.created
 	rec := s.record()
 	rec.Lease = m.leaseAt(now) // made here, so held here
+	if m.cfg.Stateless {
+		// Held by nobody: whichever call runs its first slice takes it.
+		rec.Lease = Lease{}
+	}
 	if err := m.store.CreateSession(ctx, rec); err != nil {
 		return nil, err
 	}
 	s.epoch = 1 // a new session's first tenure; see Store.CreateSession
+	if m.cfg.Stateless {
+		s.agent, s.view = nil, true
+		m.cfg.Logger.Info("session created", "session", s.id, "title", opts.Title, "thread", thread)
+		return s, nil
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
@@ -333,7 +379,14 @@ var errBuild = errors.New("daemon: cannot rebuild the session's agent")
 // Get returns a session, loading it from the store if it is not in memory —
 // and taking it, so that this daemon runs it from now on. A session another
 // daemon runs is an *[OwnedError], which names that daemon.
+//
+// A Stateless daemon takes nothing: it reads the session from the store for
+// the request — a view, which runs nothing and follows its log from the
+// store — and leaves running it to [Manager.Advance].
 func (m *Manager) Get(ctx context.Context, id string) (*Session, error) {
+	if m.cfg.Stateless {
+		return m.view(ctx, id)
+	}
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
@@ -370,23 +423,10 @@ func (m *Manager) Get(ctx context.Context, id string) (*Session, error) {
 
 // load builds a session this daemon now holds from its record.
 func (m *Manager) load(ctx context.Context, id string) (*Session, error) {
-	rec, err := m.store.LoadSession(ctx, id)
+	s, err := m.restore(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	if rec.State == Running {
-		// A turn was running when the daemon that ran it died; its events
-		// are back in the inbox, and will run again. Fixed here and not in
-		// the store: the next turn saves it, and a save from here could land
-		// on top of one from a turn this process has started since.
-		rec = interrupted(rec)
-		rec.Events += crashGap
-	}
-	agent, err := m.cfg.Build(rec.Options)
-	if err != nil {
-		return nil, fmt.Errorf("%w %s: %w", errBuild, id, err)
-	}
-	s := m.newSession(rec, agent)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -401,6 +441,102 @@ func (m *Manager) load(ctx context.Context, id string) (*Session, error) {
 	}
 	m.sessions[id] = s
 	return s, nil
+}
+
+// restore builds a session this daemon holds from its record, without
+// keeping it in memory.
+func (m *Manager) restore(ctx context.Context, id string) (*Session, error) {
+	rec, err := m.record(ctx, id, true)
+	if err != nil {
+		return nil, err
+	}
+	agent, err := m.cfg.Build(rec.Options)
+	if err != nil {
+		return nil, fmt.Errorf("%w %s: %w", errBuild, id, err)
+	}
+	return m.newSession(rec, agent), nil
+}
+
+// record reads a session's record as it stands for this daemon: a turn
+// saved as running is, unless it stopped at the end of a slice to carry on,
+// one whose daemon died — when this daemon holds it now, held, or nobody
+// does. Its log numbers on from the frames it has kept, and from anything a
+// dead daemon may have handed out without keeping.
+func (m *Manager) record(ctx context.Context, id string, held bool) (SessionRecord, error) {
+	rec, err := m.store.LoadSession(ctx, id)
+	if err != nil {
+		return rec, err
+	}
+	planned := rec.Inflight != nil && rec.Inflight.Suspended
+	if rec.State == Running && !planned && (held || !m.heldElsewhere(rec.Lease)) {
+		// A turn was running when the daemon that ran it died; its events
+		// are back in the inbox, and will run again. Fixed here and not in
+		// the store: the next turn saves it, and a save from here could land
+		// on top of one from a turn this process has started since.
+		rec = interrupted(rec)
+		if held {
+			rec.Events += crashGap
+		}
+	}
+	if last, err := m.store.LastFrame(ctx, id); err == nil && last+1 > rec.Events {
+		rec.Events = last + 1
+	}
+	return rec, nil
+}
+
+// view reads a session for one request, in a Stateless daemon: nothing is
+// held, and nothing runs on it.
+func (m *Manager) view(ctx context.Context, id string) (*Session, error) {
+	if m.isClosed() {
+		return nil, ErrClosed
+	}
+	rec, err := m.record(ctx, id, false)
+	if err != nil {
+		return nil, err
+	}
+	s := m.newSession(rec, nil)
+	s.view = true
+	return s, nil
+}
+
+// take holds a session for its next slice: what Get does, for a daemon that
+// keeps sessions; for a Stateless one, its lease and a fresh read.
+func (m *Manager) take(ctx context.Context, id string) (*Session, error) {
+	if !m.cfg.Stateless {
+		return m.Get(ctx, id)
+	}
+	now := time.Now()
+	n, err := m.store.Acquire(ctx, id, m.leaseAt(now), now, m.cfg.Attempts)
+	if err != nil {
+		return nil, err
+	}
+	if n > 0 {
+		m.cfg.Logger.Info("took over a session whose slice stopped; its events are back in the inbox", "session", id, "events", n)
+	}
+	s, err := m.restore(ctx, id)
+	if err != nil {
+		m.release(id)
+		return nil, err
+	}
+	return s, nil
+}
+
+// setPermission changes a session's permission for a Stateless daemon: held
+// for the change, and only between turns — one running somewhere would write
+// over it when it ends.
+func (m *Manager) setPermission(ctx context.Context, id, mode string) error {
+	s, err := m.take(ctx, id)
+	if errors.Is(err, ErrOwned) {
+		return fmt.Errorf("%w: %s", ErrBusy, id)
+	}
+	if err != nil {
+		return err
+	}
+	defer m.release(id)
+	if s.Info().State == Running {
+		return fmt.Errorf("%w: %s", ErrBusy, id)
+	}
+	return s.SetPermission(ctx, mode)
 }
 
 // interrupted is a record saved as running, as it stands now that the turn is
@@ -436,7 +572,7 @@ func (m *Manager) List(ctx context.Context) ([]SessionInfo, error) {
 			out = append(out, s.Info())
 			continue
 		}
-		if rec.State == Running && !m.heldElsewhere(rec.Lease) {
+		if rec.State == Running && !m.heldElsewhere(rec.Lease) && (rec.Inflight == nil || !rec.Inflight.Suspended) {
 			rec = interrupted(rec)
 		}
 		out = append(out, infoOf(rec))
@@ -643,7 +779,7 @@ func (m *Manager) enqueue(ctx context.Context, e Event) (Event, bool, error) {
 	e.Created = time.Now()
 	got, created, err := m.store.Enqueue(ctx, e)
 	if err == nil && created {
-		m.poke(m.kick)
+		m.wake(e.Session, cmp.Or(got.NotBefore, e.Created))
 	}
 	return got, created, err
 }
@@ -687,7 +823,11 @@ func (m *Manager) AddTimer(ctx context.Context, t Timer) (Timer, error) {
 		t.CreatedBy = SourceAPI
 	}
 	t.Created = time.Now()
-	return m.store.AddTimer(ctx, t)
+	got, err := m.store.AddTimer(ctx, t)
+	if err == nil {
+		m.wake(t.Session, got.Due)
+	}
+	return got, err
 }
 
 // CancelTimer cancels an active timer — of that session, when session is

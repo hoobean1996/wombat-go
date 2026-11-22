@@ -156,6 +156,32 @@ var migrations = []string{
 
 	ALTER TABLE timers ADD COLUMN dedup_key text UNIQUE;
 	`,
+
+	// 5: what a run in slices needs, wherever its slices run: each
+	// session's event log, kept (daemon.Store.AppendFrames), where a
+	// sub-agent's run had got to besides its transcript (tool_runs.state),
+	// and leaders as rows with an expiry rather than session locks, which a
+	// connection pooler in transaction mode does not keep.
+	`
+	CREATE TABLE frames (
+		session_id text NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
+		seq        integer NOT NULL,
+		turn       integer NOT NULL,
+		kind       text NOT NULL,
+		data       json NOT NULL,
+		at         timestamptz NOT NULL,
+		PRIMARY KEY (session_id, seq)
+	);
+	CREATE INDEX frames_at ON frames (at);
+
+	ALTER TABLE tool_runs ADD COLUMN state json;
+
+	CREATE TABLE leaders (
+		role  text PRIMARY KEY,
+		owner text NOT NULL,
+		until timestamptz NOT NULL
+	);
+	`,
 }
 
 // migrate brings the schema up to date. A transaction-scoped advisory lock

@@ -562,7 +562,31 @@ func TestEvictionClampsFrom(t *testing.T) {
 		t.Fatalf("only %d frames; the ring of %d never overflowed", total, ring)
 	}
 
+	s.mu.Lock()
+	inMemory := len(s.frames)
+	s.mu.Unlock()
+	if inMemory != ring {
+		t.Fatalf("memory holds %d frames, want the ring's %d", inMemory, ring)
+	}
+
+	// What the ring let go of was kept: a follower from 0 reads it all, in
+	// order, with no gap.
 	got := collect(t, s, 0, endOfTurn(1))
+	if len(got) != total {
+		t.Fatalf("resumed with %d frames, want all %d", len(got), total)
+	}
+	for i, f := range got {
+		if f.Seq != i {
+			t.Fatalf("frame %d has seq %d: a gap, or out of order", i, f.Seq)
+		}
+	}
+
+	// Once the store has let go of them too, a follower starts at the oldest
+	// frame retained: the only way eviction is observable.
+	if _, err := m.store.PruneFrames(testCtx(t), time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	got = collect(t, s, 0, endOfTurn(1))
 	if len(got) != ring {
 		t.Fatalf("retained %d frames, want %d", len(got), ring)
 	}

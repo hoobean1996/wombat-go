@@ -167,17 +167,26 @@ func TestLeadIsOneAtATime(t *testing.T) {
 	ctx := context.Background()
 	where := schema(t)
 	first, second := open(t, where), open(t, where)
-	if ok, err := first.Lead(ctx, "deliver", "d1", time.Time{}); err != nil || !ok {
+	hour := time.Now().Add(time.Hour)
+	if ok, err := first.Lead(ctx, "deliver", "d1", hour); err != nil || !ok {
 		t.Fatalf("the first Lead = %v, %v", ok, err)
 	}
-	if ok, err := second.Lead(ctx, "deliver", "d2", time.Time{}); err != nil || ok {
+	if ok, err := second.Lead(ctx, "deliver", "d2", hour); err != nil || ok {
 		t.Fatalf("a second store's Lead = %v, %v; want false", ok, err)
 	}
-	if ok, err := second.Lead(ctx, "other", "d2", time.Time{}); err != nil || !ok {
+	if ok, err := second.Lead(ctx, "other", "d2", hour); err != nil || !ok {
 		t.Fatalf("another role = %v, %v; want it led", ok, err)
 	}
 	first.Close()
-	if ok, err := second.Lead(ctx, "deliver", "d2", time.Time{}); err != nil || !ok {
+	if ok, err := second.Lead(ctx, "deliver", "d2", hour); err != nil || !ok {
 		t.Fatalf("once the leader is closed = %v, %v; want the second to lead", ok, err)
+	}
+	// A leader that stops asking leads until its hold runs out.
+	if ok, _ := second.Lead(ctx, "brief", "d2", time.Now().Add(-time.Second)); !ok {
+		t.Fatal("an unled role was not led")
+	}
+	third := open(t, where)
+	if ok, err := third.Lead(ctx, "brief", "d3", hour); err != nil || !ok {
+		t.Fatalf("a role whose hold ran out = %v, %v; want it taken", ok, err)
 	}
 }
