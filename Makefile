@@ -102,6 +102,7 @@ pg-down: ## stop and remove the podman Postgres, and its data
 .PHONY: test-pg
 test-pg: ## the Postgres store's tests, against $(PG_DSN)
 	$(GO) test -race -count=1 ./pkg/store/postgres/ -args -dsn '$(PG_DSN)'
+	WOMBAT_TEST_DSN='$(PG_DSN)' $(GO) test -race -count=1 -run Serverless ./internal/wombatd/
 
 # ── live runs against a real endpoint ──────────────────────────────────
 #

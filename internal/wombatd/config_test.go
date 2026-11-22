@@ -1,4 +1,4 @@
-package main
+package wombatd
 
 import (
 	"bytes"
@@ -68,6 +68,9 @@ func TestAConfigThatCannotMeanWhatItSaysIsRefused(t *testing.T) {
 		{"an empty tool to disable", "tools:\n  disable: [write_file, \"\"]\n", "tools.disable: holds an empty name"},
 		{"an unknown recovery", "tools:\n  recovery: retry\n", `tools.recovery: "retry" is not one of ask, report`},
 		{"a negative retention", "store:\n  ledger_retention: -1h\n", "store.ledger_retention: is negative"},
+		{"a negative slice", "daemon:\n  slice: -1s\n", "daemon.slice: is negative"},
+		{"a wake-up that is not a URL", "serverless:\n  wake:\n    url: queue\n", `serverless.wake.url: "queue" is not an http or https URL`},
+		{"wake-up headers without a URL", "serverless:\n  wake:\n    delay_header: Upstash-Not-Before\n", "serverless.wake: headers are sent to serverless.wake.url"},
 		{"an unknown mode", "mode: plan-only\n", `mode: "plan-only" is not one of build, plan, review`},
 		{"compaction without a window", "turn:\n  compact_at: 0.8\n", "turn.context_window, which is not set"},
 		{"compaction past the window", "turn:\n  context_window: 100000\n  compact_at: 1.5\n", "not a fraction"},
@@ -129,6 +132,9 @@ func TestTheExampleConfigShowsEveryKeyAndItsDefault(t *testing.T) {
 	}
 	if len(cfg.Tools.Disable) == 0 {
 		cfg.Tools.Disable = nil // [] in the file, nil by default
+	}
+	if len(cfg.Serverless.Wake.Headers) == 0 {
+		cfg.Serverless.Wake.Headers = nil // {} in the file, nil by default
 	}
 	if !reflect.DeepEqual(cfg, want) {
 		t.Errorf("the example's values are not the defaults:\nexample  %+v\ndefaults %+v", cfg, want)

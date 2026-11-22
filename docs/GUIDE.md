@@ -374,6 +374,78 @@ idle and lets it go, or dies. So a deployment of several needs
 `tools.working_dir` on storage they all see, or an agent finds the files it
 wrote somewhere else.
 
+**Turns in slices.** `daemon.slice` caps how long a turn runs in one go. Once
+the next step might not fit — a model call slower than the slowest one the
+turn has timed, a batch whose longest timeout is too long — the turn stops
+between two steps, written down where it got to, and carries on at once:
+here, or on any wombatd sharing the store. Its event stream says
+`turn_suspended` where a slice ended, and goes on. The turn is the same turn:
+its number, its budget, what a person allowed for it, what it has spent. A
+`steer` or a cancel sent between two slices waits in the inbox for the next.
+
+<a id="en-serverless"></a>
+
+### On a serverless host (Vercel)
+
+wombatd also runs as a serverless function: `api/index.go` serves every
+request to `/api`, `/files` and `/metrics` with the same server, one request
+at a time, keeping nothing between requests that Postgres does not keep. No
+loop runs; instead:
+
+- **A slice per request.** `POST /api/advance {"session_id"}` runs a
+  session's next slice (`daemon.slice`, 4 minutes unless set; keep it well
+  under the function's `maxDuration`, 300 seconds in `vercel.json`).
+- **A queue for what comes next.** Whenever a session has work — a message,
+  a decision, a slice that stopped with more to do, a timer set, a retry due
+  — wombatd POSTs `{"session_id", "not_before"}` to `serverless.wake.url`.
+  Point it at a queue that calls `POST /api/advance` with the body: for
+  [Upstash QStash](https://upstash.com/docs/qstash),
+  `https://qstash.upstash.io/v2/publish/https://<your app>/api/advance`,
+  with `Authorization: Bearer <QStash token>`,
+  `Upstash-Forward-Authorization: Bearer <server.token>`, and
+  `delay_header: Upstash-Not-Before`, so a timer's wake-up is held until it
+  is due.
+- **A cron as the backstop.** `vercel.json` calls
+  `GET /api/tick?advance=true` every minute: it fires due timers, finds what a
+  lost wake-up left — a session whose slice died, once its lease has run out
+  — and runs it. Without a queue, the cron alone runs everything, a slice per
+  session per minute. Vercel sends `Authorization: Bearer $CRON_SECRET`: set
+  `CRON_SECRET` to `server.token`. (A per-minute cron needs a paid plan.)
+- **Streams that end.** An event stream ends before the host would cut it
+  (`serverless.stream_limit`, 4 minutes unless set) with an `end` event, and
+  the browser reconnects with the last id it saw. Any instance serves it,
+  reading the session's log from the store.
+- **Configuration from the environment.** `WOMBATD_CONFIG_YAML` holds what
+  `wombatd.yaml` would, with `${VARS}` expanded from the environment, so the
+  provider key and the database URL can live in variables of their own. The
+  store must be `postgres` (Neon or Supabase; through a pooler in
+  transaction mode, add `default_query_exec_mode=simple_protocol` to the
+  DSN). `server.addr`, `daemon.name` and the host check do not apply: each
+  instance is a daemon of its own.
+
+```yaml
+# WOMBATD_CONFIG_YAML
+server:
+  token: ${WOMBATD_TOKEN}
+store:
+  driver: postgres
+  dsn: ${DATABASE_URL}
+model:
+  provider: anthropic
+  name: claude-sonnet-5-5
+  api_key: ${ANTHROPIC_API_KEY}
+serverless:
+  wake:
+    url: https://qstash.upstash.io/v2/publish/https://my-agent.vercel.app/api/advance
+    headers:
+      Authorization: Bearer ${QSTASH_TOKEN}
+      Upstash-Forward-Authorization: Bearer ${WOMBATD_TOKEN}
+    delay_header: Upstash-Not-Before
+```
+
+A permission changed while a turn runs is refused (`409 busy`) until it ends:
+the turn would write over it.
+
 <a id="en-http"></a>
 
 ## HTTP API
@@ -395,6 +467,8 @@ wrote somewhere else.
 | `GET /api/sessions/{id}/approvals` | Calls waiting for a decision (`approvals`), and for a result from outside (`awaiting`) |
 | `POST /api/sessions/{id}/approvals/{use_id}` | Decide one: `{"allow": true, "from": "..."}` |
 | `POST /api/sessions/{id}/results/{use_id}` | The result a call waits for — a build, a job the agent started and waits on with `wait_for_result`: `{"output": "...", "is_error": false, "from": "..."}`. The call returns it, and once nothing else waits the turn carries on |
+| `POST /api/advance` | Run a session's next slice: `{"session_id": "..."}`. The call a queue makes on a serverless host; answers `{"more": true}` while the session has work, which it has asked to be woken for already |
+| `POST /api/tick` (or `GET`) | Fire due timers, wake every session with work, deliver the outbox, prune; `?advance=true` also runs the slices it found. A serverless host's cron |
 | `GET /api/tool-calls` | The ledger, newest first: every tool call, its state (`pending`, `running`, `succeeded`, `failed`, `denied`, `deferred`, `waiting`, `interrupted`, `cancelled`), how many times it ran and what came of it. `?session=`, `?state=` (repeated or comma-separated), `?turn=`, `?step=`, `?parent=` (`-` for a session's own calls), `?limit=` |
 | `POST /api/events` | An event from outside: `{"session_id" or "thread", "kind", "source", "from", "dedup_key", "payload"}` |
 | `GET /api/inbox` | Events, newest first: `?session=`, `?status=`, `?limit=` |
@@ -672,9 +746,11 @@ pkg/core/accept/      deterministic "is it really done?" gates (build, vet, test
 pkg/core/review/      adversarial code review that reports defects as failing tests
 pkg/daemon/           always on: sessions, the inbox, timers, deferred decisions, the outbox
 pkg/daemon/storetest/ what a store has to do, as tests both stores pass
-pkg/store/postgres/   the sessions and the three tables in Postgres
+pkg/store/postgres/   the sessions, the three tables, the ledger and the logs in Postgres
 pkg/httpapi/          the daemon over HTTP: events in, SSE and the outbox out; serves the web UI
-cmd/wombatd/          the service; everything configured by wombatd.yaml
+internal/wombatd/     the service; everything configured by wombatd.yaml
+cmd/wombatd/          the service as a process
+api/                  the service as a Vercel function (with vercel.json)
 ui/                   the web UI (React + Vite), embedded into wombatd by ui/embed.go
 eval/                 evaluation of the harness itself
 eval/rl/              episodes, verifiers, pass@k

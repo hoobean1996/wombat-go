@@ -82,6 +82,7 @@ type config struct {
 	parallel            int
 	toolFallbackTimeout time.Duration
 	toolFallbackSet     bool
+	callEstimate        time.Duration
 	untruncated         []string
 
 	systemPrompt string

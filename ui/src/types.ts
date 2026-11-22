@@ -101,18 +101,20 @@ export interface PermissionRequested { type: 'permission_requested'; use_id: str
 export interface PermissionDecided { type: 'permission_decided'; use_id: string; tool: string; allowed: boolean; reason?: string; source?: string }
 export interface SubagentEvent { type: 'subagent_event'; name: string; depth: number; inner: StreamEvent }
 export interface SteerSent { type: 'steer_sent'; turn: number; prompt: string }
+/** A turn stopped between steps at the end of its slice (daemon.slice), and carries on in the next: still running. */
+export interface TurnSuspended { type: 'turn_suspended'; turn: number; spend: Spend }
 export interface CompletionChecked { type: 'completion_checked'; attempt: number; accepted: boolean; feedback?: string; gave_up?: boolean; error?: string; ms: number }
 
 /** Every event wombatd may send; the ones the UI draws are typed above. */
 export type StreamEvent =
   | TurnStarted | TurnEnded | TextDelta | ReasoningDelta | IterStart | ToolStart | ToolDone
-  | PermissionRequested | PermissionDecided | SubagentEvent | SteerSent | CompletionChecked
+  | PermissionRequested | PermissionDecided | SubagentEvent | SteerSent | CompletionChecked | TurnSuspended
   | { type: 'subagent_start' | 'subagent_end' | 'llm_start' | 'llm_done' | 'llm_retry' | 'spend' | 'steered' | 'tool_args_delta' | 'tool_result'
       | 'empty_turn' | 'turn_truncated' | 'context_trimmed' | 'context_overflow' | 'transcript_compacted' | 'reviewed' | 'tool_recovered'; [k: string]: unknown }
 
 /** The `event:` names to listen for on the stream: EventSource only hands named events to their own listeners. */
 export const STREAM_EVENT_TYPES = [
-  'turn_started', 'turn_ended', 'steer_sent', 'iter_start', 'turn_truncated', 'llm_start', 'llm_done', 'llm_retry',
+  'turn_started', 'turn_ended', 'turn_suspended', 'steer_sent', 'iter_start', 'turn_truncated', 'llm_start', 'llm_done', 'llm_retry',
   'text_delta', 'reasoning_delta', 'tool_args_delta', 'tool_start', 'tool_done', 'tool_result', 'spend', 'steered',
   'empty_turn', 'context_trimmed', 'context_overflow', 'transcript_compacted', 'completion_checked',
   'permission_requested', 'permission_decided', 'reviewed', 'subagent_start', 'subagent_event', 'subagent_end',

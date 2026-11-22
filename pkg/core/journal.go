@@ -2,10 +2,12 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
 
+	"wombat/pkg/core/governor"
 	"wombat/pkg/core/llm"
 	"wombat/pkg/core/tool"
 )
@@ -91,6 +93,11 @@ type Step struct {
 	// added to a transcript it already has must keep the whole of it once a
 	// compaction rewrote what it had.
 	Folds []int
+
+	// State is what the run keeps besides its transcript, as a checkpoint
+	// holds it (see [Checkpoint.State]): opaque, for a journal to keep and
+	// give back.
+	State json.RawMessage
 }
 
 // Call is one tool call of a step, as a journal records it.
@@ -136,6 +143,15 @@ type Checkpoint struct {
 
 	// Iterations is how many iterations the run had made.
 	Iterations int
+
+	// State is everything else the run keeps while it goes — its loop's
+	// counters, what is registered with [Carry] — opaque, to be given back
+	// as it was. A checkpoint without one starts those afresh.
+	State json.RawMessage
+
+	// Used is what the run's budget had used, for a host that carries the
+	// budget on itself (governor.WithBudgetFrom). Set by [Suspended].
+	Used governor.Used
 }
 
 type journalKey struct{}
@@ -317,6 +333,11 @@ func journalCalls(next tool.Handler) tool.Handler {
 			return "", fmt.Errorf("%w; it did not run", err)
 		}
 		out, err := next(ctx, d, use)
+		if errors.Is(err, tool.ErrSuspended) {
+			// Not over: still running, as the step's Close writes it, and run
+			// again when the run carries on.
+			return out, err
+		}
 		c := outcome(ctx, i, use, d.Name, out, err, tool.Tagged(ctx), tool.Attached(ctx), true)
 		c.Ran = true
 		if werr := rj.j.Track(ctx, c); werr != nil {
@@ -336,6 +357,10 @@ func outcome(ctx context.Context, i int, use llm.ToolUse, name, out string, err 
 		res.Media = media
 	}
 	blk, _ := res.Block().(llm.ToolResult)
+	if errors.Is(err, tool.ErrSuspended) {
+		c.State, c.Reason = tool.StateRunning, suspendedReason
+		return c
+	}
 	if handle, note, ok := tool.Awaiting(err); ok {
 		c.State, c.Handle, c.Reason = tool.StateWaiting, handle, note
 		return c
@@ -404,11 +429,8 @@ func (r *Run) dispatched(ctx context.Context, i int, res tool.Result) settled {
 
 // closeStep writes down how the step's calls ended: each one's result, or,
 // for a run that stopped at one of them, what it stopped for and what never
-// ran.
-func (r *Run) closeStep(ctx context.Context, uses []llm.ToolUse, results []tool.Result, stop Outcome) error {
-	if r.journal == nil {
-		return nil
-	}
+// ran. It returns the calls as it wrote them.
+func (r *Run) closeStep(ctx context.Context, uses []llm.ToolUse, results []tool.Result, stop Outcome) ([]Call, error) {
 	st := make([]settled, len(uses))
 	for i, u := range uses {
 		if i < len(results) && results[i].UseID != "" {
@@ -419,7 +441,17 @@ func (r *Run) closeStep(ctx context.Context, uses []llm.ToolUse, results []tool.
 		}
 		st[i] = settledResult(tool.StateCancelled, notRun(u, notRunText(stop)))
 	}
-	return r.journal.close(ctx, stepCalls(uses, st))
+	calls := stepCalls(uses, st)
+	return calls, r.journal.close(ctx, calls)
+}
+
+// openStep writes a step down, with the run's state as it stands.
+func (r *Run) openStep(ctx context.Context, s Step) error {
+	if r.journal == nil {
+		return nil
+	}
+	s.State = r.state()
+	return r.journal.open(ctx, s)
 }
 
 // notRunText is what a call the run never dispatched is answered with — the

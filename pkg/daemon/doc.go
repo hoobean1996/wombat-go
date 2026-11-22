@@ -42,6 +42,26 @@
 // Until then the session takes nothing but decisions. An approved call runs
 // once: the ledger says whether it ran before a resumed turn was cut short.
 //
+// # Slices, and a daemon that keeps nothing
+//
+// A turn need not run in one go. With [ManagerConfig.Slice] it stops between
+// two steps once the next might not fit, written down where it got to — its
+// transcript, and everything its run keeps (core.Checkpoint.State) — and its
+// events go back to the inbox at once, for the next slice: here, or on any
+// daemon sharing the store. The turn carries on under the same number, with
+// its budget, spend and grants; its log says turn_suspended where each slice
+// ended. A message steering it, or a cancellation, sent while it runs
+// elsewhere or between two slices, goes through the inbox ([KindSteer],
+// [KindCancel]).
+//
+// With [ManagerConfig.Stateless] nothing is kept between calls and no loop
+// runs, as on a serverless host: [Manager.Advance] runs a session's next
+// slice, [Manager.Tick] does once what the loops do, and
+// [ManagerConfig.Wake] — a queue, with [WakeWebhook] — is told whenever a
+// session has work, now or later. A request reads a session as a view,
+// without its lease, and follows its log from the store, where every frame
+// is kept.
+//
 // # Waiting for a result
 //
 // A call that starts something finishing outside the session — a build, a

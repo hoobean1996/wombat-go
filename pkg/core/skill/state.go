@@ -2,6 +2,7 @@ package skill
 
 import (
 	"context"
+	"encoding/json"
 	"slices"
 	"sync"
 
@@ -121,4 +122,27 @@ func (s *State) BodyOf(name string) (llm.ToolUseID, bool) {
 	defer s.mu.RUnlock()
 	id, ok := s.active[name]
 	return id, ok
+}
+
+// MarshalState is the activation set as a run suspended at the end of its
+// slice carries it to the next; see core.Carried.
+func (s *State) MarshalState() (json.RawMessage, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return json.Marshal(s.active)
+}
+
+// UnmarshalState puts back what MarshalState wrote.
+func (s *State) UnmarshalState(b json.RawMessage) error {
+	var active map[string]llm.ToolUseID
+	if err := json.Unmarshal(b, &active); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.active = active
+	if s.active == nil {
+		s.active = make(map[string]llm.ToolUseID, 4)
+	}
+	return nil
 }

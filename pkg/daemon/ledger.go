@@ -193,6 +193,12 @@ type Inflight struct {
 	// stopped and was counted, rather than died.
 	Used    governor.Used `json:"used"`
 	Counted Spend         `json:"counted"`
+
+	// State is what the run keeps besides its transcript (core.Checkpoint.
+	// State), and Suspended says the run stopped on purpose at the end of a
+	// slice, to carry on in the next, rather than died.
+	State     json.RawMessage `json:"state,omitempty"`
+	Suspended bool            `json:"suspended,omitempty"`
 }
 
 // Transcript is the turn's transcript, given the session's: what it carries
@@ -217,6 +223,26 @@ type SubRun struct {
 	Messages   []llm.Message `json:"messages"`
 	Iterations int           `json:"iterations"`
 	Updated    time.Time     `json:"updated"`
+
+	// State is what the sub-agent's run keeps besides its transcript.
+	State json.RawMessage `json:"state,omitempty"`
+}
+
+// Progress is where a run had got to when it stopped at the end of its
+// slice; see [Store.SaveProgress].
+type Progress struct {
+	Session string
+	Owner   string
+	Epoch   int64
+
+	// Inflight is the session's own turn; or Sub, with Parent and Run, a
+	// sub-agent's.
+	Inflight *Inflight
+	Parent   string
+	Run      int
+	Sub      *SubRun
+
+	At time.Time
 }
 
 // EncodeInflight and DecodeInflight are an [Inflight] as a store keeps it:

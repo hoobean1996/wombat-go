@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +36,15 @@ type Input struct {
 
 	// completed are results posted for calls that waited for one, by id.
 	completed map[llm.ToolUseID]llm.ToolResult
+
+	// state is what the run is carried on with besides its transcript; see
+	// Checkpoint.State.
+	state []byte
+
+	// until, steer and steerFrom are set by Until, Steer and SteerFrom.
+	until     time.Time
+	steer     []string
+	steerFrom func(context.Context) []string
 }
 
 // decisions is a Deferred run's pending turn, and the verdicts on it.
@@ -258,6 +269,22 @@ type Run struct {
 	// rejections counts the times the completion check sent the model back.
 	rejections int
 
+	// until is when the run's slice is up, zero for a run that is not run in
+	// slices; units counts the units of work — model calls, batches of tool
+	// calls — done in this one, and modelMax is the slowest model call the
+	// run has timed. Loop-owned.
+	until    time.Time
+	units    int
+	modelMax time.Duration
+
+	// carry is what is registered with Carry for the run, down to carryBase,
+	// what was registered for its parent, which is its parent's to carry.
+	carry, carryBase *carried
+
+	// steerFrom is where messages from outside the process come from; see
+	// Input.SteerFrom.
+	steerFrom func(context.Context) []string
+
 	steerMu     sync.Mutex
 	steering    []string
 	ended       bool
@@ -283,6 +310,16 @@ func (a *Agent) Start(ctx context.Context, in Input) *Run {
 		iterations: max(in.iterations, 0),
 		results:    make(map[llm.ToolUseID]ResultInfo),
 		tokens:     newTokenEstimator(),
+		until:      in.until,
+		steering:   slices.Clone(in.steer),
+		steerFrom:  in.steerFrom,
+	}
+
+	// A run started from inside another — a sub-agent's — carries only what
+	// is registered for it alone; see Carry.
+	inside := ctx.Value(runJournalKey{}) != nil
+	if inside {
+		r.carryBase = carriedFrom(ctx)
 	}
 
 	// The journal is this run's, and only this run's: taken off the context,
@@ -290,7 +327,8 @@ func (a *Agent) Start(ctx context.Context, in Input) *Run {
 	// check's reviewer — does not write its steps into this one's, and its
 	// state put back on, nil when there is none, so a sub-agent never finds
 	// its parent's there and mistakes it for its own.
-	if j := journalFrom(ctx); j != nil {
+	j := journalFrom(ctx)
+	if j != nil {
 		r.journal = &runJournal{j: j}
 		ctx = context.WithValue(ctx, journalKey{}, nil)
 		if _, ok := j.(Keyer); ok {
@@ -298,6 +336,20 @@ func (a *Agent) Start(ctx context.Context, in Input) *Run {
 		}
 	}
 	ctx = withRunJournal(ctx, r.journal)
+
+	// A sub-agent stops with the run it was started in when its journal can
+	// write down where it got to, and never otherwise: nothing would carry it
+	// on. The time is passed down either way — as zero when it cannot stop —
+	// so that a run that cannot stop has no sub-agent that does.
+	if inside {
+		parent := sliceFrom(ctx)
+		if _, ok := j.(Suspender); !ok {
+			r.until = time.Time{}
+		} else if r.until.IsZero() || (!parent.IsZero() && parent.Before(r.until)) {
+			r.until = parent
+		}
+	}
+	ctx = withSlice(ctx, r.until)
 
 	// Every run has a budget, even one given no limits, so that what it spends
 	// is tallied as ITS spend: Progress, the Spend events and the sub-agent
@@ -338,6 +390,16 @@ func (a *Agent) Start(ctx context.Context, in Input) *Run {
 	// of the same agent never share it.
 	for _, dec := range a.cfg.runCtx {
 		ctx = dec(ctx)
+	}
+
+	// What the run carries from slice to slice: the counters installed above,
+	// or the ones a decorator put in their place, and what the decorators
+	// registered; put back as the checkpoint it resumes from had them.
+	ctx = Carry(ctx, "tool.callstats", tool.CallStatsFrom(ctx))
+	ctx = Carry(ctx, "core.overflow", overflowFrom(ctx))
+	r.carry = carriedFrom(ctx)
+	if err := r.restore(in.state); err != nil {
+		a.log.Warn("wombat: the resumed run's state did not all come back", slog.String("agent", a.cfg.name), slog.Any("err", err))
 	}
 
 	// After the decorators, so a tracer installed by WithRunContext is the one
@@ -481,12 +543,20 @@ func (r *Run) Undelivered() []string {
 	return append([]string(nil), r.undelivered...)
 }
 
-// takeSteering removes and returns everything queued.
+// takeSteering removes and returns everything queued, and whatever has
+// arrived from outside the process (Input.SteerFrom). Loop-owned.
 func (r *Run) takeSteering() []string {
 	r.steerMu.Lock()
-	defer r.steerMu.Unlock()
 	out := r.steering
 	r.steering = nil
+	r.steerMu.Unlock()
+	if r.steerFrom != nil {
+		for _, m := range r.steerFrom(r.ctx) {
+			if m = strings.TrimSpace(m); m != "" {
+				out = append(out, m)
+			}
+		}
+	}
 	return out
 }
 
@@ -573,7 +643,11 @@ func (r *Run) loop() {
 			return
 		}
 	}
-	if err := convo.Validate(); err != nil {
+	// A resumed run's transcript is the run's own, as its journal wrote it
+	// down: checked when the run began, it may fail the check since for
+	// reasons that are the model's — a gateway that reuses tool_use ids
+	// across turns — which the run in one go never looks at again either.
+	if err := convo.Validate(); err != nil && !r.resume {
 		r.finish(nil, fmt.Errorf("wombat: invalid input transcript: %w", err))
 		return
 	}
@@ -587,6 +661,12 @@ func (r *Run) loop() {
 		}
 		if iter > a.cfg.maxIters {
 			r.finish(nil, fmt.Errorf("%w (%d)", ErrMaxIterations, a.cfg.maxIters))
+			return
+		}
+		// The slice is up, and a model call might not fit in what is left:
+		// stop here, between steps, and carry on in the next.
+		if r.mayStop(r.modelNeed()) {
+			r.suspend(ctx, convo, nil, iter-1)
 			return
 		}
 
@@ -757,6 +837,10 @@ func (r *Run) iterate(parent context.Context, iter int, convo Convo) (Convo, boo
 	started := time.Now()
 	sent := &sentRecorder{}
 	resp, err := a.cfg.client.Complete(withSent(ctx, sent), req)
+	r.units++
+	if took := time.Since(started); err == nil && took > r.modelMax {
+		r.modelMax = took
+	}
 	if err == nil {
 		// Calibrate on what was actually sent, which is not msgs when the
 		// overflow ladder shrank the request on its way out.
@@ -873,7 +957,7 @@ func (r *Run) iterate(parent context.Context, iter int, convo Convo) (Convo, boo
 		// Written down before it is checked, which can take as long as a
 		// test suite: a run resumed after this checks the answer again
 		// rather than asking the model for another.
-		if err := r.journal.open(ctx, Step{Messages: convo, Iteration: iter, Folds: r.folds}); err != nil {
+		if err := r.openStep(ctx, Step{Messages: convo, Iteration: iter, Folds: r.folds}); err != nil {
 			return fail(err)
 		}
 		next, o := r.answered(ctx, convo, resp.Content)
@@ -900,14 +984,29 @@ func (r *Run) iterate(parent context.Context, iter int, convo Convo) (Convo, boo
 		for i, u := range uses {
 			pendingCalls[i] = Call{Index: i, Use: u, State: tool.StatePending}
 		}
-		if err := r.journal.open(ctx, Step{Messages: convo, Calls: pendingCalls, Iteration: iter, Folds: r.folds}); err != nil {
+		if err := r.openStep(ctx, Step{Messages: convo, Calls: pendingCalls, Iteration: iter, Folds: r.folds}); err != nil {
 			return fail(err)
 		}
+		// The slice is up, and the batch might not finish in what is left:
+		// the calls are written down, pending, and run in the next.
+		if r.mayStop(r.batchNeed(uses)) {
+			return r.suspend(ctx, convo, pendingCalls, iter)
+		}
 		results, stop := r.dispatch(ctx, convo, uses)
-		jerr := r.closeStep(ctx, uses, results, stop)
+		r.units++
+		calls, jerr := r.closeStep(ctx, uses, results, stop)
 		if jerr != nil && ctx.Err() != nil {
 			// The run is stopping anyway, and that is what it reports.
 			jerr = nil
+		}
+		if suspendedIn(results) {
+			// A sub-agent stopped at the end of the slice: the run stops too,
+			// with what the others returned, and its call carries on in the
+			// next.
+			if jerr != nil {
+				return fail(jerr)
+			}
+			return r.suspend(ctx, convo, calls, iter)
 		}
 		if stop != nil {
 			if jerr != nil {
@@ -1049,7 +1148,7 @@ func deferrals(uses []llm.ToolUse, results []tool.Result) Outcome {
 		return nil
 	}
 	for _, res := range results {
-		if !waits(res.Err) {
+		if !waits(res.Err) && !errors.Is(res.Err, tool.ErrSuspended) {
 			if blk, ok := res.Block().(llm.ToolResult); ok {
 				d.Done = append(d.Done, blk)
 			}
@@ -1181,6 +1280,8 @@ func outcomeLabel(o Outcome, err error) string {
 	switch o.(type) {
 	case Answer:
 		return "answered"
+	case Suspended:
+		return "suspended"
 	case Paused:
 		return "paused"
 	case Submitted:

@@ -1,4 +1,4 @@
-package main
+package wombatd
 
 import (
 	"errors"
@@ -41,6 +41,8 @@ type config struct {
 	Done   doneConfig   `yaml:"done"`   // when a build is done
 	Review reviewConfig `yaml:"review"` // the adversarial review after an answer
 	Record recordConfig `yaml:"record"` // what is written down, to replay or to read
+
+	Serverless serverlessConfig `yaml:"serverless"` // run one request at a time, as a serverless function
 }
 
 type serverConfig struct {
@@ -64,6 +66,20 @@ type daemonConfig struct {
 	MaxRuns  int           `yaml:"max_runs"`
 	Attempts int           `yaml:"attempts"`
 	Idle     time.Duration `yaml:"idle"`
+	Slice    time.Duration `yaml:"slice"`
+}
+
+// serverlessConfig is for wombatd run by a serverless host (Handler): how it
+// has the next slice of a session run, and how long a stream stays open.
+type serverlessConfig struct {
+	Wake        wakeConfig    `yaml:"wake"`
+	StreamLimit time.Duration `yaml:"stream_limit"`
+}
+
+type wakeConfig struct {
+	URL         string            `yaml:"url"`
+	Headers     map[string]string `yaml:"headers"`
+	DelayHeader string            `yaml:"delay_header"`
 }
 
 type outboxConfig struct {
@@ -204,13 +220,19 @@ func loadConfig(path string) (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	return parseConfig(data, path)
+}
+
+// parseConfig reads a configuration over the defaults, from where says, and
+// refuses one that cannot mean what it says.
+func parseConfig(data []byte, where string) (config, error) {
 	cfg := defaults()
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return config{}, fmt.Errorf("%s: %w", path, err)
+		return config{}, fmt.Errorf("%s: %w", where, err)
 	}
 	if errs := cfg.validate(); len(errs) > 0 {
 		for i, err := range errs {
-			errs[i] = fmt.Errorf("%s: %w", path, err)
+			errs[i] = fmt.Errorf("%s: %w", where, err)
 		}
 		return config{}, errors.Join(errs...)
 	}
@@ -279,6 +301,20 @@ func (c config) validate() []error {
 	}
 	positive("daemon.poll", c.Daemon.Poll)
 	positive("daemon.idle", c.Daemon.Idle)
+	if c.Daemon.Slice < 0 {
+		bad("daemon.slice", "is negative; 0 runs a turn in one go")
+	}
+	if c.Serverless.StreamLimit < 0 {
+		bad("serverless.stream_limit", "is negative; 0 keeps a stream open")
+	}
+	switch w := c.Serverless.Wake; {
+	case w.URL != "":
+		if u, err := url.Parse(w.URL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			bad("serverless.wake.url", "%q is not an http or https URL", w.URL)
+		}
+	case len(w.Headers) > 0 || w.DelayHeader != "":
+		bad("serverless.wake", "headers are sent to serverless.wake.url, which is not set")
+	}
 	atLeast("daemon.max_runs", c.Daemon.MaxRuns, 1)
 	atLeast("daemon.attempts", c.Daemon.Attempts, 1)
 	if c.Outbox.Webhook != "" {

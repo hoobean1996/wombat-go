@@ -49,15 +49,9 @@ type Store struct {
 	pool *pgxpool.Pool
 	cfg  *pgxpool.Config
 
-	mu    sync.Mutex
-	lock  *pgx.Conn            // holds the advisory lock Lock took
-	roles map[string]*leadConn // by role: the connections Lead asks on
-}
-
-// leadConn is a connection of Lead's, and whether it holds its role's lock.
-type leadConn struct {
-	conn *pgx.Conn
-	held bool
+	mu   sync.Mutex
+	lock *pgx.Conn         // holds the advisory lock Lock took
+	led  map[string]string // the roles Lead has led, and as whom, to give up on Close
 }
 
 // Open connects to the database dsn names and brings its schema up to date.
@@ -70,7 +64,7 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("postgres: %w", err)
 	}
-	st := &Store{pool: pool, cfg: cfg, roles: map[string]*leadConn{}}
+	st := &Store{pool: pool, cfg: cfg, led: map[string]string{}}
 	if err := st.migrate(ctx); err != nil {
 		pool.Close()
 		return nil, err
@@ -109,18 +103,24 @@ func (s *Store) Lock(ctx context.Context, name string) error {
 	return nil
 }
 
-// Close releases the locks this store holds, and the connections.
+// Close releases the locks this store holds, gives up the roles it leads,
+// and closes the connections.
 func (s *Store) Close() error {
 	s.mu.Lock()
 	if s.lock != nil {
 		s.lock.Close(context.Background())
 		s.lock = nil
 	}
-	for role, lc := range s.roles {
-		lc.conn.Close(context.Background())
-		delete(s.roles, role)
-	}
+	led := s.led
+	s.led = map[string]string{}
 	s.mu.Unlock()
+	if len(led) > 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		for role, owner := range led {
+			_, _ = s.pool.Exec(ctx, `DELETE FROM leaders WHERE role = $1 AND owner = $2`, role, owner)
+		}
+		cancel()
+	}
 	s.pool.Close()
 	return nil
 }
@@ -361,14 +361,28 @@ func (s *Store) Ready(ctx context.Context, now time.Time, owner string, busy []s
 }
 
 func (s *Store) Claim(ctx context.Context, session, owner string, now time.Time, limit int) ([]daemon.Event, error) {
+	return s.claim(ctx, session, owner, now, limit, nil)
+}
+
+func (s *Store) ClaimKinds(ctx context.Context, session, owner string, kinds []string, now time.Time) ([]daemon.Event, error) {
+	if len(kinds) == 0 {
+		return nil, nil
+	}
+	return s.claim(ctx, session, owner, now, daemon.MaxBatch, kinds)
+}
+
+// claim takes up to limit of a session's claimable events — of kinds, when
+// it names any — for owner.
+func (s *Store) claim(ctx context.Context, session, owner string, now time.Time, limit int, kinds []string) ([]daemon.Event, error) {
 	rows, err := s.pool.Query(ctx, `
 		UPDATE inbox SET status = 'running', attempts = attempts + 1, claimed_at = $1
 		WHERE id IN (
 			SELECT e.id FROM inbox e JOIN sessions s ON s.id = e.session_id
 			WHERE e.session_id = $2 AND s.owner = $4 AND `+claimable+`
+				AND ($5::text[] IS NULL OR e.kind = ANY($5))
 			ORDER BY e.id LIMIT $3
 			FOR UPDATE OF e SKIP LOCKED)
-		RETURNING `+eventCols, now, session, limit, owner)
+		RETURNING `+eventCols, now, session, limit, owner, kinds)
 	if err != nil {
 		return nil, wrap(err)
 	}
@@ -398,6 +412,7 @@ func (s *Store) Settle(ctx context.Context, set daemon.Settlement) error {
 			{set.Retry, `UPDATE inbox SET status = 'pending', error = $2, not_before = coalesce($3, not_before) WHERE id = ANY($1)`,
 				[]any{set.Error, nullTime(set.RetryAt)}},
 			{set.Failed, `UPDATE inbox SET status = 'failed', error = $2 WHERE id = ANY($1)`, []any{set.Error}},
+			{set.Continue, `UPDATE inbox SET status = 'pending', error = '', attempts = greatest(attempts - 1, 0) WHERE id = ANY($1)`, nil},
 		} {
 			if len(st.ids) == 0 {
 				continue
@@ -509,37 +524,29 @@ func (s *Store) Release(ctx context.Context, owner string, sessions []string) er
 	return wrap(err)
 }
 
-// Lead holds role's lock on a connection of its own: owner and until are for
-// stores without one, and are not needed here. The lock goes with the
-// connection, so a leader that dies, or whose connection drops, hands it to
-// the next to ask; a connection that has dropped is replaced on the next ask.
-func (s *Store) Lead(ctx context.Context, role, _ string, _ time.Time) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	lc := s.roles[role]
-	if lc != nil && lc.conn.Ping(ctx) != nil {
-		lc.conn.Close(context.Background())
-		delete(s.roles, role)
-		lc = nil
+// Lead makes owner the leader of role while nobody else leads it, and keeps
+// it leading — each ask moves its hold on to until. The hold is a row with an
+// expiry, not a lock on a connection: a connection pooler in transaction mode
+// and a serverless function both drop connections between requests. A leader
+// that stops asking leads until its hold runs out; one whose store is closed
+// gives it up at once.
+func (s *Store) Lead(ctx context.Context, role, owner string, until time.Time) (bool, error) {
+	var got string
+	err := s.pool.QueryRow(ctx, `
+		INSERT INTO leaders (role, owner, until) VALUES ($1, $2, $3)
+		ON CONFLICT (role) DO UPDATE SET owner = excluded.owner, until = excluded.until
+		WHERE leaders.owner = excluded.owner OR leaders.until <= $4
+		RETURNING owner`, role, owner, until, time.Now()).Scan(&got)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
 	}
-	if lc == nil {
-		conn, err := pgx.ConnectConfig(ctx, s.cfg.ConnConfig.Copy())
-		if err != nil {
-			return false, fmt.Errorf("postgres: %w", err)
-		}
-		lc = &leadConn{conn: conn}
-		s.roles[role] = lc
-	}
-	if lc.held {
-		return true, nil
-	}
-	err := lc.conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtext('wombat-lead:' || current_schema() || ':' || $1))`, role).Scan(&lc.held)
 	if err != nil {
-		lc.conn.Close(context.Background())
-		delete(s.roles, role)
-		return false, fmt.Errorf("postgres: %w", err)
+		return false, wrap(err)
 	}
-	return lc.held, nil
+	s.mu.Lock()
+	s.led[role] = owner
+	s.mu.Unlock()
+	return got == owner, nil
 }
 
 func (s *Store) Events(ctx context.Context, f daemon.EventFilter) ([]daemon.Event, error) {

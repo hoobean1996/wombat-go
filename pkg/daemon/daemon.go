@@ -51,6 +51,11 @@ var (
 
 	// ErrClosed reports use of a [Manager] after [Manager.Close].
 	ErrClosed = errors.New("daemon: manager is closed")
+
+	// ErrBusy reports a change a session cannot take while a turn of it
+	// runs somewhere — a permission changed in a Stateless daemon, which the
+	// turn would write over when it ends. Try again once it has.
+	ErrBusy = errors.New("daemon: a turn of the session is running")
 )
 
 // PermissionFull is full access: the whole tool surface, and nobody asked

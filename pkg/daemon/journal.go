@@ -64,12 +64,49 @@ type journal struct {
 	// decided are decisions on calls of the open step, written with the
 	// step's Close.
 	decided map[llm.ToolUseID]*Decision
+	// folds are the compactions the run had made as of the open step.
+	folds []int
+	// taken are the events the turn took from the inbox as it went: what
+	// steered it, a cancellation; offers what it is offered to take next.
+	taken, offers []Event
+}
+
+// take records events the turn took from the inbox as it went: they are the
+// turn's from now on, and settled with it.
+func (j *journal) take(evs []Event) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.taken = append(j.taken, evs...)
+	j.frame.Events = slices.Concat(j.frame.Events, eventIDs(evs))
+}
+
+// offer gives the turn events to take at its next model call.
+func (j *journal) offer(evs []Event) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.offers = append(j.offers, evs...)
+}
+
+// offered removes and returns what was offered and not taken.
+func (j *journal) offered() []Event {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	out := j.offers
+	j.offers = nil
+	return out
+}
+
+func (j *journal) takenEvents() []Event {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return slices.Clone(j.taken)
 }
 
 var (
-	_ core.Journal = (*journal)(nil)
-	_ core.Keyer   = (*journal)(nil)
-	_ core.Nester  = (*journal)(nil)
+	_ core.Journal   = (*journal)(nil)
+	_ core.Keyer     = (*journal)(nil)
+	_ core.Nester    = (*journal)(nil)
+	_ core.Suspender = (*journal)(nil)
 )
 
 // reopen makes the step the transcript msgs ends on the open one, without
@@ -113,7 +150,7 @@ func (j *journal) Open(ctx context.Context, st core.Step) error {
 		f = j.inflightAt(ctx, st)
 		o.Inflight = &f
 	} else {
-		o.Sub = &SubRun{Messages: st.Messages, Iterations: st.Iteration}
+		o.Sub = &SubRun{Messages: st.Messages, Iterations: st.Iteration, State: st.State}
 	}
 	wctx, cancel := j.write(ctx)
 	defer cancel()
@@ -123,6 +160,7 @@ func (j *journal) Open(ctx context.Context, st core.Step) error {
 	}
 	j.mu.Lock()
 	j.step, j.index, j.tracked, j.decided = step, make(map[llm.ToolUseID]int, len(st.Calls)), map[int]bool{}, nil
+	j.folds = st.Folds
 	for _, c := range st.Calls {
 		if _, dup := j.index[c.Use.ID]; !dup {
 			j.index[c.Use.ID] = c.Index
@@ -140,16 +178,48 @@ func (j *journal) Open(ctx context.Context, st core.Step) error {
 // transcript carries on with — all of it, once the turn has compacted what
 // came before — and what the turn has used of its budget.
 func (j *journal) inflightAt(ctx context.Context, st core.Step) Inflight {
+	j.mu.Lock()
 	f := j.frame
-	f.Iterations = st.Iteration
+	f.Events = slices.Clone(f.Events)
+	j.mu.Unlock()
+	f.Iterations, f.State, f.Suspended = st.Iteration, st.State, false
 	f.Folds = slices.Concat(j.frame.Folds, st.Folds)
 	if len(f.Folds) > 0 || f.Base < 0 || f.Base > len(st.Messages) {
 		f.Base, f.Messages = -1, st.Messages
 	} else {
 		f.Messages = st.Messages[f.Base:]
 	}
-	f.Used = governor.FromContext(ctx).Progress().Used()
+	f.Used = governor.FromContext(ctx).Used()
 	return f
+}
+
+// Suspend writes down where the run stopped at the end of its slice: the
+// whole transcript — a compaction since the last step would make a tail of
+// it wrong — on the step it stopped in, which stays open.
+func (j *journal) Suspend(ctx context.Context, cp core.Checkpoint) error {
+	j.mu.Lock()
+	step, folds, f := j.step, j.folds, j.frame
+	f.Events = slices.Clone(f.Events)
+	j.mu.Unlock()
+	p := Progress{Session: j.session, Owner: j.owner, Epoch: j.epoch, At: time.Now()}
+	if j.parent == "" {
+		f.Step, f.Base, f.Messages, f.Iterations = step, -1, cp.Messages, cp.Iterations
+		f.State, f.Suspended, f.Used = cp.State, true, cp.Used
+		f.Folds = slices.Concat(j.frame.Folds, folds)
+		p.Inflight = &f
+	} else {
+		p.Parent, p.Run = j.parent, j.run
+		p.Sub = &SubRun{Step: step, Messages: cp.Messages, Iterations: cp.Iterations, State: cp.State}
+	}
+	wctx, cancel := j.write(ctx)
+	defer cancel()
+	if err := j.m.store.SaveProgress(wctx, p); err != nil {
+		return err
+	}
+	if j.parent == "" && j.opened != nil {
+		j.opened(f)
+	}
+	return nil
 }
 
 func (j *journal) Track(ctx context.Context, c core.Call) error {
@@ -215,5 +285,5 @@ func (j *journal) Nest(ctx context.Context, key string, n int) (core.Journal, *c
 		return nil, nil, err
 	}
 	sub.reopen(sr.Step, sr.Messages)
-	return sub, &core.Checkpoint{Messages: sr.Messages, Calls: callsOf(rows), Iterations: sr.Iterations}, nil
+	return sub, &core.Checkpoint{Messages: sr.Messages, Calls: callsOf(rows), Iterations: sr.Iterations, State: sr.State}, nil
 }

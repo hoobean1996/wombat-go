@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"sync"
@@ -197,6 +198,32 @@ type overflowState struct {
 	// too long: an upper bound on the window, whatever it really is. 0 until
 	// the first refusal.
 	refused int
+}
+
+// MarshalState is the ladder as a run suspended at the end of its slice
+// carries it to the next; see Carried.
+func (s *overflowState) MarshalState() (json.RawMessage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return json.Marshal(struct {
+		N       int `json:"n,omitempty"`
+		Refused int `json:"refused,omitempty"`
+	}{s.n, s.refused})
+}
+
+// UnmarshalState puts back what MarshalState wrote.
+func (s *overflowState) UnmarshalState(b json.RawMessage) error {
+	var st struct {
+		N       int `json:"n"`
+		Refused int `json:"refused"`
+	}
+	if err := json.Unmarshal(b, &st); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.n, s.refused = st.N, st.Refused
+	return nil
 }
 
 // refuse records a refused request's estimated size.

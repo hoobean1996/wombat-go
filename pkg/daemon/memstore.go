@@ -47,6 +47,9 @@ type memSession struct {
 	steps int
 	calls map[[2]int]ToolCall // by step and index
 	subs  map[subKey]SubRun
+
+	// frames is its kept log, by sequence number.
+	frames map[int]StoredFrame
 }
 
 type subKey struct {
@@ -319,6 +322,19 @@ func (m *memStore) Ready(_ context.Context, now time.Time, owner string, busy []
 }
 
 func (m *memStore) Claim(_ context.Context, session, owner string, now time.Time, limit int) ([]Event, error) {
+	return m.claim(session, owner, now, limit, nil)
+}
+
+func (m *memStore) ClaimKinds(_ context.Context, session, owner string, kinds []string, now time.Time) ([]Event, error) {
+	if len(kinds) == 0 {
+		return nil, nil
+	}
+	return m.claim(session, owner, now, MaxBatch, kinds)
+}
+
+// claim takes up to limit of a session's claimable events — of kinds, when
+// it names any — for owner.
+func (m *memStore) claim(session, owner string, now time.Time, limit int, kinds []string) ([]Event, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now = micro(now)
@@ -331,7 +347,7 @@ func (m *memStore) Claim(_ context.Context, session, owner string, now time.Time
 			break
 		}
 		e := &m.events[i]
-		if e.Session != session || !m.claimable(*e, now) {
+		if e.Session != session || !m.claimable(*e, now) || (kinds != nil && !slices.Contains(kinds, e.Kind)) {
 			continue
 		}
 		e.Status = EventRunning
@@ -372,6 +388,12 @@ func (m *memStore) Settle(_ context.Context, s Settlement) error {
 	m.setStatus(s.Done, EventDone, "", time.Time{})
 	m.setStatus(s.Retry, EventPending, s.Error, micro(s.RetryAt))
 	m.setStatus(s.Failed, EventFailed, s.Error, time.Time{})
+	m.setStatus(s.Continue, EventPending, "", time.Time{})
+	for i := range m.events {
+		if e := &m.events[i]; slices.Contains(s.Continue, e.ID) && e.Attempts > 0 {
+			e.Attempts--
+		}
+	}
 	for _, msg := range s.Outbox {
 		_, _, _ = m.postLocked(msg)
 	}
@@ -765,10 +787,37 @@ func (m *memStore) OpenStep(_ context.Context, o StepOpen) (int, error) {
 	if o.Sub != nil {
 		sub := *o.Sub
 		sub.Session, sub.Parent, sub.Run, sub.Step, sub.Updated = o.Session, o.Parent, o.Run, step, at
-		sub.Messages = slices.Clone(sub.Messages)
+		sub.Messages, sub.State = slices.Clone(sub.Messages), clone(sub.State)
 		s.subs[subKey{o.Parent, o.Run}] = sub
 	}
 	return step, nil
+}
+
+func (m *memStore) SaveProgress(_ context.Context, p Progress) error {
+	var inflight []byte
+	if p.Inflight != nil {
+		b, err := EncodeInflight(p.Inflight)
+		if err != nil {
+			return err
+		}
+		inflight = b
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.writableLocked(p.Session, p.Owner, p.Epoch); err != nil {
+		return err
+	}
+	s := m.sessions[p.Session]
+	if p.Inflight != nil {
+		s.inflight = inflight
+	}
+	if p.Sub != nil {
+		sub := *p.Sub
+		sub.Session, sub.Parent, sub.Run, sub.Updated = p.Session, p.Parent, p.Run, micro(cmp.Or(p.At, time.Now()))
+		sub.Messages, sub.State = slices.Clone(sub.Messages), clone(sub.State)
+		s.subs[subKey{p.Parent, p.Run}] = sub
+	}
+	return nil
 }
 
 func (m *memStore) MoveCalls(_ context.Context, mv CallMoves) error {
@@ -850,6 +899,7 @@ func (m *memStore) SubRun(_ context.Context, session, parent string, n int) (Sub
 	if err := json.Unmarshal(b, &sub.Messages); err != nil {
 		return SubRun{}, false, err
 	}
+	sub.State = clone(sub.State)
 	return sub, true, nil
 }
 
@@ -886,4 +936,77 @@ func (m *memStore) liveParentLocked(s *memSession, key string) bool {
 		}
 	}
 	return false
+}
+
+// ===== The event log =====
+
+func (m *memStore) AppendFrames(_ context.Context, session, owner string, epoch int64, frames []StoredFrame) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.writableLocked(session, owner, epoch); err != nil {
+		return err
+	}
+	s := m.sessions[session]
+	if s.frames == nil {
+		s.frames = map[int]StoredFrame{}
+	}
+	for _, f := range frames {
+		if _, kept := s.frames[f.Seq]; kept {
+			continue
+		}
+		f.Data, f.At = clone(f.Data), micro(cmp.Or(f.At, time.Now()))
+		s.frames[f.Seq] = f
+	}
+	return nil
+}
+
+func (m *memStore) Frames(_ context.Context, f FrameFilter) ([]StoredFrame, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[f.Session]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrNoSuchSession, f.Session)
+	}
+	var out []StoredFrame
+	for seq, fr := range s.frames {
+		if seq > f.After {
+			fr.Data = clone(fr.Data)
+			out = append(out, fr)
+		}
+	}
+	slices.SortFunc(out, func(a, b StoredFrame) int { return a.Seq - b.Seq })
+	if f.Limit > 0 && len(out) > f.Limit {
+		out = out[:f.Limit]
+	}
+	return out, nil
+}
+
+func (m *memStore) LastFrame(_ context.Context, session string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sessions[session]
+	if !ok {
+		return -1, fmt.Errorf("%w: %s", ErrNoSuchSession, session)
+	}
+	last := -1
+	for seq := range s.frames {
+		last = max(last, seq)
+	}
+	return last, nil
+}
+
+func (m *memStore) PruneFrames(_ context.Context, before time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	before = micro(before)
+	n := 0
+	for _, s := range m.sessions {
+		for seq, f := range s.frames {
+			if f.At.Before(before) {
+				delete(s.frames, seq)
+				n++
+			}
+		}
+	}
+	return n, nil
 }

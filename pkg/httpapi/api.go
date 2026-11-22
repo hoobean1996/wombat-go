@@ -79,6 +79,7 @@ const (
 	kindUnauthorized    = "unauthorized"
 	kindWrongHost       = "misdirected"
 	kindElsewhere       = "elsewhere"
+	kindBusy            = "busy"
 )
 
 const (
@@ -125,6 +126,18 @@ type apiConfig struct {
 	hosts   []string
 	ui      fs.FS
 	files   func(daemon.SessionOptions) (string, error)
+	// streamLimit ends an event stream after that long; see WithStreamLimit.
+	streamLimit time.Duration
+}
+
+// WithStreamLimit ends a session's event stream once it has been open for d,
+// with an "end" event saying the stream — not the conversation — is over:
+// the client reconnects with Last-Event-ID and carries on where it left off.
+// For a host that cuts a request off after a while, a serverless function
+// above all, so that the stream ends on a frame boundary rather than mid-
+// frame. 0, the default, keeps it open as long as the client does.
+func WithStreamLimit(d time.Duration) Option {
+	return func(c *apiConfig) { c.streamLimit = d }
 }
 
 // WithBearerToken requires token on every request to the API and to
@@ -393,6 +406,11 @@ func New(m *daemon.Manager, opts ...Option) http.Handler {
 	mux.HandleFunc("POST /api/sessions/{id}/results/{use_id}", a.placed("id", a.postResult))
 	// Not placed: the ledger is the store's, whichever daemon reads it.
 	mux.HandleFunc("GET /api/tool-calls", a.listToolCalls)
+	// For a host that runs no loop (daemon.ManagerConfig.Stateless): the
+	// queue that runs a session's next slice, and the cron that ticks.
+	mux.HandleFunc("POST /api/advance", a.advance)
+	mux.HandleFunc("POST /api/tick", a.tick)
+	mux.HandleFunc("GET /api/tick", a.tick)
 	mux.HandleFunc("POST /api/events", a.postEvent)
 	mux.HandleFunc("GET /api/inbox", a.listInbox)
 	mux.HandleFunc("GET /api/outbox", a.listOutbox)
@@ -1084,9 +1102,21 @@ func (a *api) events(w http.ResponseWriter, r *http.Request) {
 
 	ticker := time.NewTicker(heartbeat)
 	defer ticker.Stop()
+	var limit <-chan time.Time
+	if a.cfg.streamLimit > 0 {
+		t := time.NewTimer(a.cfg.streamLimit)
+		defer t.Stop()
+		limit = t.C
+	}
 
 	for {
 		select {
+		case <-limit:
+			// The stream is over, not the conversation: the client comes back
+			// with the last id it rendered.
+			_, _ = fmt.Fprint(w, "event: end\ndata: {\"reason\":\"stream limit\",\"reconnect\":true}\n\n")
+			_ = rc.Flush()
+			return
 		case f, ok := <-frames:
 			if !ok {
 				// Follow returned on its own, so the conversation is over.
@@ -1262,6 +1292,10 @@ func classify(err error) (status int, kind string) {
 		return http.StatusServiceUnavailable, kindElsewhere
 	case errors.Is(err, daemon.ErrNotRunning):
 		return http.StatusConflict, kindNotRunning
+	case errors.Is(err, daemon.ErrBusy):
+		// A turn runs somewhere, and the change would be written over when
+		// it ends: passing, once it has.
+		return http.StatusConflict, kindBusy
 	case errors.Is(err, daemon.ErrDone):
 		// A conflict with the resource's state: the session exists and the
 		// request is well formed, but a conversation the model ended with a
@@ -1372,4 +1406,59 @@ func marshal(v any) ([]byte, error) {
 		return nil, err
 	}
 	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
+// ===== Driven from outside =====
+
+// advance runs a session's next slice: the call a queue makes when the
+// daemon asked to be woken (daemon.ManagerConfig.Wake). 200 with whether the
+// session has more work, which has been asked for already.
+func (a *api) advance(w http.ResponseWriter, r *http.Request) {
+	var req AdvanceRequest
+	if err := decodeBody(w, r, &req); err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	if req.SessionID == "" {
+		a.fail(w, r, fmt.Errorf("%w: session_id is required", daemon.ErrBadRequest))
+		return
+	}
+	// Not cut short when the caller gives up on the answer: a queue's
+	// timeout is no reason to stop a slice half way, which is bounded on its
+	// own.
+	more, err := a.m.Advance(context.WithoutCancel(r.Context()), req.SessionID)
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, Advanced{SessionID: req.SessionID, More: more})
+}
+
+// tick does once what a daemon's loops do — fire timers, wake what is ready,
+// deliver, prune — for the cron of a host that runs none. With ?advance=true
+// it runs the slices it found work for itself, one after another, while the
+// request has time: for a host with a cron and no queue.
+func (a *api) tick(w http.ResponseWriter, r *http.Request) {
+	ready, err := a.m.Tick(r.Context())
+	if err != nil {
+		a.fail(w, r, err)
+		return
+	}
+	body := Ticked{Ready: ready}
+	if body.Ready == nil {
+		body.Ready = []string{}
+	}
+	if r.URL.Query().Get("advance") == "true" {
+		for _, id := range ready {
+			if r.Context().Err() != nil {
+				break
+			}
+			if _, err := a.m.Advance(r.Context(), id); err != nil {
+				slog.Default().WarnContext(r.Context(), "httpapi: advancing a session from a tick failed", "session", id, "err", err)
+				continue
+			}
+			body.Advanced = append(body.Advanced, id)
+		}
+	}
+	writeJSON(w, http.StatusOK, body)
 }

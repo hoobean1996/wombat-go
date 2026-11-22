@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"slices"
 	"sync"
 
 	"wombat/pkg/core/llm"
@@ -113,4 +114,33 @@ func grantKey(d tool.Def, use llm.ToolUse) string {
 	}
 	buf.Write(compact.Bytes())
 	return buf.String()
+}
+
+// MarshalState is what has been granted, as a run suspended at the end of its
+// slice carries it to the next (see core.Carried): what a person allowed for
+// the turn stays allowed when the turn carries on.
+func (g *Grants) MarshalState() (json.RawMessage, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	keys := make([]string, 0, len(g.seen))
+	for k := range g.seen {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	return json.Marshal(keys)
+}
+
+// UnmarshalState puts back what MarshalState wrote.
+func (g *Grants) UnmarshalState(b json.RawMessage) error {
+	var keys []string
+	if err := json.Unmarshal(b, &keys); err != nil {
+		return err
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.seen = make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		g.seen[k] = struct{}{}
+	}
+	return nil
 }

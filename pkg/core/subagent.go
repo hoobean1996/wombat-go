@@ -431,6 +431,15 @@ func ParallelDelegateTool(child *Agent, opts ...DelegateOption) tool.Def {
 		}
 		wg.Wait()
 
+		// A branch that stopped with the slice carries on in the next, and the
+		// call with it: run again, the branches that finished answer from
+		// where their journals wrote them down, and the others carry on.
+		for _, r := range results {
+			if errors.Is(r.err, tool.ErrSuspended) {
+				return "", r.err
+			}
+		}
+
 		// Returned as a normal result even when branches failed, never as an
 		// error. A tool error replaces the output with the error string, and
 		// that would throw away the branches that did work — the parent model
@@ -542,6 +551,11 @@ func runChildInner(ctx context.Context, child *Agent, label string, depth int, t
 		switch o := run.Outcome().(type) {
 		case Answer:
 			return o.Text, nil
+
+		case Suspended:
+			// Stopped with the slice, where its journal wrote it down: the
+			// call carries on in the next, and so does this child.
+			return "", fmt.Errorf("%w: sub-agent %q stopped with the slice", tool.ErrSuspended, label)
 
 		case Submitted:
 			// A child with a terminal tool answers in structured JSON. Handing

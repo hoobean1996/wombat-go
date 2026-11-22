@@ -51,8 +51,8 @@ func TestEveryEventIsRegistered(t *testing.T) {
 	}
 }
 
-// kindTypes names the types declared in dir, outside its tests, that have a
-// method Kind() string.
+// kindTypes names the exported types declared in dir, outside its tests,
+// that have a method Kind() string.
 func kindTypes(t *testing.T, dir string) []string {
 	t.Helper()
 	entries, err := os.ReadDir(dir)
@@ -82,7 +82,10 @@ func kindTypes(t *testing.T, dir string) []string {
 			if star, ok := recv.(*ast.StarExpr); ok {
 				recv = star.X
 			}
-			if id, ok := recv.(*ast.Ident); ok {
+			// Exported only: the list is for a renderer outside the package,
+			// which cannot name an unexported type — a carrier like the
+			// daemon's events read back from its store, which are of any kind.
+			if id, ok := recv.(*ast.Ident); ok && ast.IsExported(id.Name) {
 				out = append(out, id.Name)
 			}
 		}

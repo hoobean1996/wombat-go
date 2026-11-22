@@ -112,6 +112,16 @@ type Session struct {
 	// epoch is the tenure this daemon holds the session in; every write of
 	// it is made under it. Set when the session is made or loaded.
 	epoch int64
+
+	// view is a session read from the store for one request, by a daemon
+	// that keeps no session between requests (ManagerConfig.Stateless): it
+	// runs nothing, and follows its log from the store.
+	view bool
+
+	// unkept are frames of the log not written to the store yet, and keptAt
+	// when it was last written.
+	unkept []Frame
+	keptAt time.Time
 }
 
 func (m *Manager) newSession(rec SessionRecord, agent *core.Agent) *Session {
@@ -377,6 +387,9 @@ func (s *Session) SetPermission(ctx context.Context, mode string) error {
 	if err := s.open(); err != nil {
 		return err
 	}
+	if s.view {
+		return s.m.setPermission(ctx, s.id, mode)
+	}
 	s.mu.Lock()
 	opts := s.opts
 	s.mu.Unlock()
@@ -452,28 +465,55 @@ func stateOf(d *core.Deferred) State {
 // Steer passes prompt to the turn in progress; see core.Run.Steer. It is
 // echoed into the session's log, like a prompt, so a second client watching
 // the session sees what was said.
+//
+// A turn that runs elsewhere — in another process, or between two of its
+// slices — is sent it through the inbox instead: it takes it at its next
+// model call, and echoes it then.
 func (s *Session) Steer(prompt string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.dropped {
+		s.mu.Unlock()
 		return ErrNoSuchSession
 	}
-	if s.run == nil || !s.run.Steer(prompt) {
+	if s.run != nil && s.run.Steer(prompt) {
+		s.emitLocked(s.turns, SteerSent{Turn: s.turns, Prompt: prompt})
+		s.mu.Unlock()
+		s.keep()
+		return nil
+	}
+	elsewhere := s.run == nil && s.state == Running
+	s.mu.Unlock()
+	if !elsewhere || strings.TrimSpace(prompt) == "" {
 		return ErrNotRunning
 	}
-	s.emitLocked(s.turns, SteerSent{Turn: s.turns, Prompt: prompt})
-	return nil
+	payload, _ := json.Marshal(MessagePayload{Text: prompt})
+	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
+	defer cancel()
+	_, _, err := s.m.enqueue(ctx, Event{Session: s.id, Kind: KindSteer, Source: SourceAPI, Payload: payload})
+	return err
 }
 
 // Cancel stops the turn in flight — the model call, and any subprocess a tool
 // started. A no-op between turns. The turn fails as cancelled, and is not
 // tried again: its events are settled, and the session takes the next.
+//
+// A turn that runs elsewhere — in another process, or between two of its
+// slices — is told through the inbox, and stops at its next step.
 func (s *Session) Cancel() {
 	s.mu.Lock()
 	cancel := s.cancel
+	elsewhere := cancel == nil && s.state == Running
 	s.mu.Unlock()
 	if cancel != nil {
 		cancel()
+		return
+	}
+	if elsewhere {
+		ctx, done := context.WithTimeout(context.Background(), storeTimeout)
+		defer done()
+		if _, _, err := s.m.enqueue(ctx, Event{Session: s.id, Kind: KindCancel, Source: SourceAPI}); err != nil {
+			s.m.logger().Warn("daemon: cancelling a turn that runs elsewhere failed", "session", s.id, "err", err)
+		}
 	}
 }
 
@@ -503,8 +543,10 @@ type turnStart struct {
 	prov    provenance
 	handled []Event
 
-	// resumed is the turn in flight this one carries on, when it is one.
+	// resumed is the turn in flight this one carries on, when it is one, and
+	// steered the messages steering it the batch brought.
 	resumed *Inflight
+	steered []Event
 
 	// step is the step of the ledger a run resumed on decisions starts on,
 	// and decided the decisions on its calls this batch brought.
@@ -546,16 +588,32 @@ func (s *Session) handle(batch []Event) {
 	t := turnStart{prov: provenance{at: -1}, handled: batch}
 	if f := s.inflight; f != nil {
 		mine, rest := partition(batch, f.Events)
+		var steers, cancels, others []Event
+		for _, e := range rest {
+			switch e.Kind {
+			case KindSteer:
+				steers = append(steers, e)
+			case KindCancel:
+				cancels = append(cancels, e)
+			default:
+				others = append(others, e)
+			}
+		}
 		if len(mine) > 0 && f.Base <= len(s.msgs) {
 			// The turn in flight carries on, from where it was written down,
 			// before anything else begins; what came in since waits for the
-			// turn after.
-			if len(rest) > 0 {
-				defer s.m.settle(Settlement{Retry: eventIDs(rest), Error: "held back: the session was carrying on the turn in flight"})
+			// turn after — but a message steering it is taken at its next
+			// model call, and a cancellation ends it.
+			if len(others) > 0 {
+				defer s.m.settle(Settlement{Retry: eventIDs(others), Error: "held back: the session was carrying on the turn in flight"})
+			}
+			if len(cancels) > 0 {
+				s.cancelInFlightLocked(f, inflightRows, mine, slices.Concat(cancels, steers))
+				return
 			}
 			msgs := f.Transcript(s.msgs)
-			t.in = core.Recover(core.Checkpoint{Messages: msgs, Calls: callsOf(inflightRows), Iterations: f.Iterations})
-			t.replyTo, t.handled, t.resumed = slices.Clone(f.ReplyTo), mine, f
+			t.in = core.Recover(core.Checkpoint{Messages: msgs, Calls: callsOf(inflightRows), Iterations: f.Iterations, State: f.State})
+			t.replyTo, t.handled, t.resumed, t.steered = slices.Clone(f.ReplyTo), mine, f, steers
 			t.prov = provenance{at: f.At, origins: slices.Clone(f.Origins), folds: slices.Clone(f.Folds)}
 			s.runLocked(t)
 			return
@@ -563,6 +621,20 @@ func (s *Session) handle(batch []Event) {
 		// Its events were given up on: nothing carries it on.
 		t.abandoned, t.abandonedRows, s.inflight = f, inflightRows, nil
 	}
+
+	// A cancellation with no turn in flight has nothing to cancel.
+	var stray []Event
+	batch = slices.DeleteFunc(slices.Clone(batch), func(e Event) bool {
+		if e.Kind == KindCancel {
+			stray = append(stray, e)
+			return true
+		}
+		return false
+	})
+	if len(stray) > 0 {
+		defer s.m.settle(Settlement{Done: eventIDs(stray)})
+	}
+	t.handled = batch
 
 	var decisions, rest []Event
 	for _, e := range batch {
@@ -619,7 +691,9 @@ func (s *Session) handle(batch []Event) {
 			s.writing.Unlock()
 			return
 		}
-		t.prompt = render(rest, s.pauseID != "")
+		// A message that came to steer a turn and found none in flight is a
+		// message for this one.
+		t.prompt = render(asMessages(rest), s.pauseID != "")
 		switch {
 		case len(s.msgs) == 0:
 			t.in = core.Ask(t.prompt)
@@ -635,7 +709,7 @@ func (s *Session) handle(batch []Event) {
 		// Each of the three puts what came in at the end of the transcript.
 		t.prov = provenance{at: len(t.in.Messages) - 1, origins: originsOf(rest)}
 		for _, e := range rest {
-			if e.Kind == KindMessage {
+			if e.Kind == KindMessage || e.Kind == KindSteer {
 				t.replyTo = append(t.replyTo, e.ID)
 			}
 		}
@@ -647,18 +721,29 @@ func (s *Session) handle(batch []Event) {
 func (s *Session) runLocked(t turnStart) {
 	turn := s.turns + 1
 	var used governor.Used
+	planned := false
 	if f := t.resumed; f != nil {
 		// The same turn, carried on: its number, and its budget as it stood.
-		turn, used = f.Turn, f.Used
+		turn, used, planned = f.Turn, f.Used, f.Suspended
+		// Running again: should this slice die, the next one is carrying on
+		// after a crash, not after a slice that ended as it should.
+		g := *f
+		g.Suspended = false
+		s.inflight = &g
 	}
 	s.turns = max(s.turns, turn)
+	if s.m.cfg.Slice > 0 {
+		t.in = t.in.Until(time.Now().Add(s.m.cfg.Slice))
+	}
 
 	// Background, not a request's context: the turn is no client's. The
 	// budget is per turn, so a long conversation is capped per exchange.
 	ctx, cancel := governor.WithBudgetFrom(context.Background(), s.m.cfg.Limits, used)
 	// One grant set per turn: an approval is about the work in front of the
 	// person now, not a standing licence for every later exchange.
-	ctx = permission.WithGrants(ctx, permission.NewGrants())
+	// Carried from slice to slice, as the turn is one turn however it runs.
+	grants := permission.NewGrants()
+	ctx = core.Carry(permission.WithGrants(ctx, grants), "permission.grants", grants)
 	ctx = withScope(ctx, &scope{m: s.m, session: s.id, thread: s.thread})
 	// For the MCP servers that act for a session's owner (Server.Session).
 	ctx = mcp.WithSession(ctx, s.id)
@@ -670,7 +755,8 @@ func (s *Session) runLocked(t turnStart) {
 	switch f := t.resumed; {
 	case f != nil:
 		j.frame = *f
-		j.frame.Messages = nil
+		j.frame.Messages, j.frame.Suspended = nil, false
+		j.frame.Events = slices.Clone(f.Events)
 		j.reopen(f.Step, t.in.Messages)
 	default:
 		j.frame = Inflight{Turn: turn, Base: sharedPrefix(s.msgs, t.in.Messages), Events: ids,
@@ -682,13 +768,53 @@ func (s *Session) runLocked(t turnStart) {
 	}
 	ctx = core.WithJournal(ctx, j)
 
+	// What steers the turn is taken at its next model call: the messages its
+	// batch brought, and — in a daemon that keeps no session between
+	// requests, where whoever was told is another process — what has come
+	// into the inbox since, a cancellation included. A message is the turn's
+	// once taken; one never taken goes back to the inbox when the slice ends.
+	j.offer(t.steered)
+	if len(t.steered) > 0 || s.m.cfg.Stateless {
+		t.in = t.in.SteerFrom(func(ctx context.Context) []string {
+			evs := j.offered()
+			if s.m.cfg.Stateless {
+				claimed, err := s.m.store.ClaimKinds(ctx, s.id, s.m.cfg.Name, []string{KindSteer, KindCancel}, time.Now())
+				if err != nil {
+					s.m.logger().Warn("daemon: taking what steers the turn failed", "session", s.id, "err", err)
+				}
+				evs = append(evs, claimed...)
+			}
+			if len(evs) == 0 {
+				return nil
+			}
+			j.take(evs)
+			var texts []string
+			for _, e := range evs {
+				if e.Kind == KindCancel {
+					cancel()
+					continue
+				}
+				if text, ok := messageText(asMessage(e)); ok {
+					texts = append(texts, text)
+					s.append(turn, SteerSent{Turn: turn, Prompt: text})
+				}
+			}
+			return texts
+		})
+	}
+
 	// Under the lock, and deliberately: Start and Buffer only spawn
 	// goroutines, and doing them here is what keeps Cancel and Steer from
 	// seeing a turn half begun.
 	buf := core.Buffer(s.agent.Start(ctx, t.in))
 	s.state, s.run, s.cancel = Running, buf, cancel
 	s.outcome, s.answer, s.errText, s.errKind = "", "", "", ""
-	s.emitLocked(turn, TurnStarted{Turn: turn, Prompt: t.prompt, Events: ids, Origins: t.prov.origins, Resumed: t.resumed != nil})
+	// A turn carried on from a slice that ended as it should goes on in the
+	// log as it would have; one carried on after a crash or a failure says so.
+	if !planned {
+		s.emitLocked(turn, TurnStarted{Turn: turn, Prompt: t.prompt, Events: ids, Origins: t.prov.origins, Resumed: t.resumed != nil})
+	}
+
 	// Saved as running, so a daemon that dies mid-turn is found out when the
 	// session is next loaded; the transcript is the one the turn started
 	// from, and the events that make it are in the inbox.
@@ -712,6 +838,9 @@ func (s *Session) runLocked(t turnStart) {
 			prov.folds = append(prov.folds, c.Folded)
 		}
 		s.append(turn, ev)
+		if s.keepDue() {
+			s.keep()
+		}
 	}
 	s.end(ctx, cancel, turn, buf, t.handled, t.replyTo, prov, j)
 }
@@ -826,13 +955,20 @@ func (s *Session) abandon(f *Inflight, rows []ToolCall) {
 		return
 	}
 	s.m.logger().Warn("daemon: a turn in flight was given up on, and is not carried on", "session", s.id, "turn", f.Turn, "step", f.Step)
+	s.closeCalls(f, rows, "the turn was given up on")
+}
+
+// closeCalls closes the calls a turn that will not be carried on left open:
+// what never started was not run, and what was running may or may not have
+// finished. Best effort.
+func (s *Session) closeCalls(f *Inflight, rows []ToolCall, why string) {
 	var moves []CallMove
 	for _, r := range rows {
 		switch r.State {
 		case tool.StateRunning:
-			moves = append(moves, CallMove{Index: r.Index, State: tool.StateInterrupted, Reason: "the turn was given up on while this call ran"})
+			moves = append(moves, CallMove{Index: r.Index, State: tool.StateInterrupted, Reason: why + " while this call ran"})
 		case tool.StatePending, tool.StateDeferred, tool.StateWaiting:
-			moves = append(moves, CallMove{Index: r.Index, State: tool.StateCancelled, Reason: "not run: the turn was given up on"})
+			moves = append(moves, CallMove{Index: r.Index, State: tool.StateCancelled, Reason: "not run: " + why})
 		}
 	}
 	if len(moves) > 0 {
@@ -878,9 +1014,33 @@ func sharedPrefix(session, turn []llm.Message) int {
 func (s *Session) end(ctx context.Context, cancel context.CancelFunc, turn int, buf *core.Buffered, events []Event, replyTo []int64, prov provenance, j *journal) {
 	defer cancel()
 	now := time.Now()
+	// What the turn took from the inbox as it went — messages steering it,
+	// a cancellation — is settled with it; a cancellation is done whatever
+	// became of the turn.
+	var cancels []Event
+	for _, e := range j.takenEvents() {
+		if e.Kind == KindCancel {
+			cancels = append(cancels, e)
+		} else {
+			events = append(events, e)
+		}
+	}
+	if len(cancels) > 0 {
+		defer s.m.settle(Settlement{Done: eventIDs(cancels)})
+	}
+	// Messages the turn was offered and never took are the next slice's, or
+	// the next turn's.
+	if untaken := j.offered(); len(untaken) > 0 {
+		defer s.m.settle(Settlement{Continue: eventIDs(untaken)})
+	}
+	s.keep()
 	// What the turn has cost, all its runs together, less what the session
 	// has counted already: a run of it that stopped to be tried again.
 	total := turnSpend(ctx)
+	if _, ok := buf.Outcome().(core.Suspended); ok {
+		s.suspend(ctx, turn, buf, events, prov, total, j.frame.Counted)
+		return
+	}
 	end := TurnEnded{Turn: turn, Events: eventIDs(events), Spend: total.minus(j.frame.Counted)}
 	var post []Message
 	reply := func(kind, text string) {
@@ -981,7 +1141,7 @@ func (s *Session) end(ctx context.Context, cancel context.CancelFunc, turn int, 
 		// the transcript it started from stays the session's — with what it
 		// has cost so far counted, and carried on.
 		f := *next.Inflight
-		f.Used, f.Counted = governor.FromContext(ctx).Progress().Used(), total
+		f.Used, f.Counted = governor.FromContext(ctx).Used(), total
 		next.Inflight = &f
 	}
 	next.Spend.add(end.Spend)
@@ -1005,13 +1165,12 @@ func (s *Session) end(ctx context.Context, cancel context.CancelFunc, turn int, 
 		set.Done = eventIDs(events)
 	}
 	s.settleOrForget(set)
+	if len(retry) > 0 {
+		s.m.wake(s.id, end.RetryAt)
+	}
 
 	s.mu.Lock()
-	s.msgs, s.origins, s.spend, s.state = next.Messages, next.Origins, next.Spend, next.State
-	s.outcome, s.answer, s.errText, s.errKind = next.Outcome, next.Answer, next.Error, next.ErrorKind
-	s.pauseID, s.deferred, s.verdicts, s.deferredAt, s.replyTo = next.PauseID, next.Deferred, next.Verdicts, next.DeferredAt, next.ReplyTo
-	s.decidedBy, s.deferredStep, s.results, s.inflight = next.DecidedBy, next.DeferredStep, next.Results, next.Inflight
-	s.run, s.cancel = nil, nil
+	s.adoptLocked(next)
 	// What was sent with Steer and never reached the model is handed back,
 	// so a client can send it as a message instead of losing it.
 	end.Undelivered = buf.Undelivered()
@@ -1022,6 +1181,7 @@ func (s *Session) end(ctx context.Context, cancel context.CancelFunc, turn int, 
 	changed := s.opts != next.Options
 	allow := len(end.Approvals) > 0 && s.opts.Permission == PermissionFull
 	s.mu.Unlock()
+	s.keep()
 	s.m.logger().Info("turn ended", "session", s.id, "turn", turn, "events", len(events),
 		"state", string(end.State), "cost_usd", end.Spend.CostUSD, "retry", len(retry) > 0)
 	if changed {
@@ -1032,6 +1192,118 @@ func (s *Session) end(ctx context.Context, cancel context.CancelFunc, turn int, 
 	if allow {
 		s.allowPending(context.Background())
 	}
+}
+
+// adoptLocked makes the record a turn left the session in memory.
+func (s *Session) adoptLocked(next SessionRecord) {
+	s.msgs, s.origins, s.spend, s.state = next.Messages, next.Origins, next.Spend, next.State
+	s.outcome, s.answer, s.errText, s.errKind = next.Outcome, next.Answer, next.Error, next.ErrorKind
+	s.pauseID, s.deferred, s.verdicts, s.deferredAt, s.replyTo = next.PauseID, next.Deferred, next.Verdicts, next.DeferredAt, next.ReplyTo
+	s.decidedBy, s.deferredStep, s.results, s.inflight = next.DecidedBy, next.DeferredStep, next.Results, next.Inflight
+	s.run, s.cancel = nil, nil
+}
+
+// suspend records a turn that stopped at the end of its slice: still
+// running, as it was written down, its events back in the inbox at once for
+// the next slice — the claim that took them not counted as a try — and what
+// the slice cost counted. What was steered into it and not taken yet goes to
+// the next slice through the inbox.
+func (s *Session) suspend(ctx context.Context, turn int, buf *core.Buffered, events []Event, prov provenance, total, counted Spend) {
+	now := time.Now()
+	spend := total.minus(counted)
+	s.mu.Lock()
+	next := s.recordLocked()
+	if next.Inflight != nil {
+		f := *next.Inflight
+		f.Used, f.Counted, f.Suspended = governor.FromContext(ctx).Used(), total, true
+		f.Folds = slices.Clone(prov.folds)
+		next.Inflight = &f
+	}
+	next.Spend.add(spend)
+	next.State, next.Updated = Running, now
+	next.Events++
+	s.mu.Unlock()
+
+	s.settleOrForget(Settlement{Session: next, Continue: eventIDs(events)})
+
+	s.mu.Lock()
+	s.spend, s.state, s.inflight, s.updated = next.Spend, Running, next.Inflight, now
+	s.run, s.cancel = nil, nil
+	s.emitLocked(turn, TurnSuspended{Turn: turn, Spend: spend})
+	s.mu.Unlock()
+	s.keep()
+	for _, text := range buf.Undelivered() {
+		payload, _ := json.Marshal(MessagePayload{Text: text})
+		if _, _, err := s.m.enqueue(context.WithoutCancel(ctx), Event{Session: s.id, Kind: KindSteer, Source: SourceAPI, Payload: payload}); err != nil {
+			s.m.logger().Warn("daemon: a steering message did not reach the next slice", "session", s.id, "err", err)
+		}
+	}
+	s.m.logger().Info("turn suspended", "session", s.id, "turn", turn, "events", len(events), "cost_usd", spend.CostUSD)
+}
+
+// cancelInFlightLocked ends a turn in flight that was cancelled while it was
+// stopped between slices, without running it again: as a turn cancelled
+// mid-step ends — failed, and not tried again, its transcript kept — with
+// the calls it left open closed. done are the events that cancelled it, and
+// any that came to steer it. The caller holds s.mu, which it lets go.
+func (s *Session) cancelInFlightLocked(f *Inflight, rows []ToolCall, mine, done []Event) {
+	now := time.Now()
+	msgs := f.Transcript(s.msgs)
+	prov := provenance{at: f.At, origins: slices.Clone(f.Origins), folds: slices.Clone(f.Folds)}
+	next := s.recordLocked()
+	next.Messages, next.Origins = msgs, prov.apply(s.origins, msgs)
+	next.State, next.Outcome, next.Answer = Failed, "", ""
+	next.Error, next.ErrorKind = "the turn was cancelled", "cancelled"
+	next.PauseID, next.Deferred, next.Verdicts, next.DeferredAt, next.ReplyTo = "", nil, nil, time.Time{}, nil
+	next.DecidedBy, next.DeferredStep, next.Results, next.Inflight = nil, 0, nil, nil
+	next.Updated = now
+	next.Events++
+	var post []Message
+	if len(f.ReplyTo) > 0 {
+		post = append(post, Message{Session: s.id, Thread: s.thread, Kind: MessageError, Text: next.Error,
+			InReplyTo: f.ReplyTo, Created: now})
+	}
+	s.mu.Unlock()
+
+	s.closeCalls(f, rows, "the turn was cancelled")
+	s.writing.Lock()
+	s.settleOrForget(Settlement{Session: next, Failed: eventIDs(mine), Done: eventIDs(done), Error: next.Error, Outbox: post})
+	s.writing.Unlock()
+
+	s.mu.Lock()
+	s.adoptLocked(next)
+	s.emitLocked(f.Turn, TurnEnded{Turn: f.Turn, State: Failed, Events: eventIDs(mine), Error: next.Error, ErrorKind: "cancelled"})
+	s.mu.Unlock()
+	s.keep()
+	s.m.logger().Info("turn cancelled between slices", "session", s.id, "turn", f.Turn)
+}
+
+// asMessage is a message that came to steer a turn and found none in
+// flight: a message, for the next.
+func asMessage(e Event) Event {
+	if e.Kind == KindSteer {
+		e.Kind = KindMessage
+	}
+	return e
+}
+
+func asMessages(events []Event) []Event {
+	out := make([]Event, len(events))
+	for i, e := range events {
+		out[i] = asMessage(e)
+	}
+	return out
+}
+
+// steerTexts is what messages steering a turn say.
+func steerTexts(events []Event) []string {
+	var out []string
+	for _, e := range events {
+		if text, ok := messageText(asMessage(e)); ok {
+			out = append(out, text)
+		}
+	}
+	return out
 }
 
 // settleOrForget settles, and drops the session from memory if the store
@@ -1159,6 +1431,39 @@ func (s *Session) Follow(ctx context.Context, from int) iter.Seq2[int, Frame] {
 
 		seq := max(from, 0)
 		for {
+			// What the log in memory no longer holds — or never did: what
+			// earlier processes said, and all of it for a session that runs
+			// elsewhere — is read from the store, where it was kept.
+			s.mu.Lock()
+			base, view := s.base, s.view
+			s.mu.Unlock()
+			if seq < base || view {
+				kept, over, ok := s.kept(ctx, seq, base, view)
+				if !ok {
+					return
+				}
+				for _, f := range kept {
+					if !yield(f.Seq, f) {
+						return
+					}
+					seq = f.Seq + 1
+				}
+				if over {
+					return
+				}
+				if len(kept) > 0 {
+					continue
+				}
+				if view {
+					select {
+					case <-time.After(followPoll):
+					case <-ctx.Done():
+						return
+					}
+					continue
+				}
+			}
+
 			s.mu.Lock()
 			// Clamped inside the loop, not once up front: eviction can pass a
 			// slow follower at any point, not just before its first read.
@@ -1195,6 +1500,35 @@ func (s *Session) Follow(ctx context.Context, from int) iter.Seq2[int, Frame] {
 	}
 }
 
+// followPoll is how often a session that runs elsewhere is looked at for
+// what its log has said since.
+const followPoll = 250 * time.Millisecond
+
+// kept reads the frames the store kept from seq on — below base, unless the
+// session runs elsewhere — and whether the conversation ended among them.
+// ok is false once there is nothing more to follow: the session is gone.
+func (s *Session) kept(ctx context.Context, seq, base int, view bool) (frames []Frame, over, ok bool) {
+	got, err := s.m.store.Frames(ctx, FrameFilter{Session: s.id, After: seq - 1, Limit: 500})
+	if errors.Is(err, ErrNoSuchSession) || ctx.Err() != nil {
+		return nil, false, false
+	}
+	if err != nil {
+		s.m.logger().Warn("daemon: reading the session's kept log failed", "session", s.id, "err", err)
+		return nil, false, true
+	}
+	for _, f := range got {
+		if !view && f.Seq >= base {
+			break
+		}
+		ev := decodeKept(f.Kind, f.Data)
+		frames = append(frames, Frame{Seq: f.Seq, Turn: f.Turn, Event: ev})
+		if end, ok := ev.(TurnEnded); ok && end.State == Done {
+			return frames, true, true
+		}
+	}
+	return frames, false, true
+}
+
 // append records one event under the session's global sequence.
 func (s *Session) append(turn int, ev core.Event) {
 	s.mu.Lock()
@@ -1207,7 +1541,9 @@ func (s *Session) emitLocked(turn int, ev core.Event) {
 	if s.closed {
 		return
 	}
-	s.frames = append(s.frames, Frame{Seq: s.base + len(s.frames), Turn: turn, Event: ev})
+	f := Frame{Seq: s.base + len(s.frames), Turn: turn, Event: ev}
+	s.frames = append(s.frames, f)
+	s.unkept = append(s.unkept, f)
 
 	// Overflow drops the OLDEST frames, never the newest. Dropping the newest
 	// would stall a live follower behind a permanent gap; dropping the oldest
@@ -1221,6 +1557,44 @@ func (s *Session) emitLocked(turn int, ev core.Event) {
 	}
 	s.updated = time.Now()
 	s.wakeLocked()
+}
+
+// keepEvery is how often a running turn writes the frames of its log to the
+// store, for a client that follows the session from elsewhere.
+const keepEvery = 250 * time.Millisecond
+
+// keepDue reports frames waiting longer than keepEvery to be written.
+func (s *Session) keepDue() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.unkept) > 0 && time.Since(s.keptAt) >= keepEvery
+}
+
+// keep writes the log's new frames to the store, best effort: a frame not
+// kept is missing only for a client that follows the session from
+// elsewhere, or after this process is gone.
+func (s *Session) keep() {
+	s.mu.Lock()
+	frames := s.unkept
+	s.unkept, s.keptAt = nil, time.Now()
+	s.mu.Unlock()
+	if len(frames) == 0 {
+		return
+	}
+	out := make([]StoredFrame, 0, len(frames))
+	at := time.Now()
+	for _, f := range frames {
+		data, err := marshalNoEscape(f.Event)
+		if err != nil {
+			continue
+		}
+		out = append(out, StoredFrame{Seq: f.Seq, Turn: f.Turn, Kind: f.Event.Kind(), Data: data, At: at})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), storeTimeout)
+	defer cancel()
+	if err := s.m.store.AppendFrames(ctx, s.id, s.m.cfg.Name, s.epoch, out); err != nil && !errors.Is(err, ErrNoSuchSession) && !errors.Is(err, ErrOwned) {
+		s.m.logger().Warn("daemon: keeping the session's log failed", "session", s.id, "frames", len(out), "err", err)
+	}
 }
 
 // wake releases every follower parked on the current generation.

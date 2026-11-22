@@ -105,13 +105,7 @@ func (s *Store) OpenStep(ctx context.Context, o daemon.StepOpen) (int, error) {
 			if err != nil {
 				return err
 			}
-			b.Queue(`
-				INSERT INTO tool_runs (session_id, parent, run, step, messages, iterations, updated)
-				VALUES ($1, $2, $3, $4, $5, $6, $7)
-				ON CONFLICT (session_id, parent, run) DO UPDATE
-				SET step = excluded.step, messages = excluded.messages,
-					iterations = excluded.iterations, updated = excluded.updated`,
-				o.Session, o.Parent, o.Run, step, msgs, o.Sub.Iterations, at)
+			b.Queue(upsertRun, o.Session, o.Parent, o.Run, step, msgs, o.Sub.Iterations, at, nullJSON(o.Sub.State))
 		}
 		return wrap(tx.SendBatch(ctx, b).Close())
 	})
@@ -217,13 +211,54 @@ func (s *Store) ToolCalls(ctx context.Context, f daemon.CallFilter) ([]daemon.To
 	return got, wrap(err)
 }
 
+// upsertRun writes where a sub-agent had got to.
+const upsertRun = `
+	INSERT INTO tool_runs (session_id, parent, run, step, messages, iterations, updated, state)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+	ON CONFLICT (session_id, parent, run) DO UPDATE
+	SET step = excluded.step, messages = excluded.messages, iterations = excluded.iterations,
+		updated = excluded.updated, state = excluded.state`
+
+func (s *Store) SaveProgress(ctx context.Context, p daemon.Progress) error {
+	at := orNow(p.At)
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if p.Inflight != nil {
+			inflight, err := daemon.EncodeInflight(p.Inflight)
+			if err != nil {
+				return err
+			}
+			tag, err := tx.Exec(ctx, `UPDATE sessions SET inflight = $4 WHERE id = $1 AND `+fenced(2, 3),
+				p.Session, p.Owner, p.Epoch, inflight)
+			if err != nil {
+				return wrap(err)
+			}
+			if tag.RowsAffected() == 0 {
+				return ownedOrGone(ctx, tx, p.Session)
+			}
+		} else if err := fence(ctx, tx, p.Session, p.Owner, p.Epoch); err != nil {
+			return err
+		}
+		if p.Sub != nil {
+			msgs, err := json.Marshal(p.Sub.Messages)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, upsertRun, p.Session, p.Parent, p.Run, p.Sub.Step, msgs, p.Sub.Iterations, at,
+				nullJSON(p.Sub.State)); err != nil {
+				return wrap(err)
+			}
+		}
+		return nil
+	})
+}
+
 func (s *Store) SubRun(ctx context.Context, session, parent string, n int) (daemon.SubRun, bool, error) {
 	sub := daemon.SubRun{Session: session, Parent: parent, Run: n}
-	var msgs []byte
+	var msgs, state []byte
 	err := s.pool.QueryRow(ctx, `
-		SELECT step, messages, iterations, updated FROM tool_runs
+		SELECT step, messages, iterations, updated, state FROM tool_runs
 		WHERE session_id = $1 AND parent = $2 AND run = $3`, session, parent, n).
-		Scan(&sub.Step, &msgs, &sub.Iterations, &sub.Updated)
+		Scan(&sub.Step, &msgs, &sub.Iterations, &sub.Updated, &state)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if _, err := leaseOf(ctx, s.pool, session); err != nil {
 			return daemon.SubRun{}, false, err
@@ -235,6 +270,9 @@ func (s *Store) SubRun(ctx context.Context, session, parent string, n int) (daem
 	}
 	if err := json.Unmarshal(msgs, &sub.Messages); err != nil {
 		return daemon.SubRun{}, false, fmt.Errorf("postgres: decoding the sub-agent of %s: %w", parent, err)
+	}
+	if len(state) > 0 {
+		sub.State = json.RawMessage(state)
 	}
 	sub.Updated = sub.Updated.UTC()
 	return sub, true, nil

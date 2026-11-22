@@ -252,6 +252,42 @@ func (c *crashStore) SubRun(ctx context.Context, session, parent string, n int) 
 	}
 	return c.Store.SubRun(ctx, session, parent, n)
 }
+func (c *crashStore) SaveProgress(ctx context.Context, p Progress) error {
+	if err := c.dead("SaveProgress"); err != nil {
+		return err
+	}
+	return c.Store.SaveProgress(ctx, p)
+}
+func (c *crashStore) ClaimKinds(ctx context.Context, session, owner string, kinds []string, now time.Time) ([]Event, error) {
+	if err := c.dead("ClaimKinds"); err != nil {
+		return nil, err
+	}
+	return c.Store.ClaimKinds(ctx, session, owner, kinds, now)
+}
+func (c *crashStore) AppendFrames(ctx context.Context, session, owner string, epoch int64, frames []StoredFrame) error {
+	if err := c.dead("AppendFrames"); err != nil {
+		return err
+	}
+	return c.Store.AppendFrames(ctx, session, owner, epoch, frames)
+}
+func (c *crashStore) Frames(ctx context.Context, f FrameFilter) ([]StoredFrame, error) {
+	if err := c.dead("Frames"); err != nil {
+		return nil, err
+	}
+	return c.Store.Frames(ctx, f)
+}
+func (c *crashStore) LastFrame(ctx context.Context, session string) (int, error) {
+	if err := c.dead("LastFrame"); err != nil {
+		return -1, err
+	}
+	return c.Store.LastFrame(ctx, session)
+}
+func (c *crashStore) PruneFrames(ctx context.Context, before time.Time) (int, error) {
+	if err := c.dead("PruneFrames"); err != nil {
+		return 0, err
+	}
+	return c.Store.PruneFrames(ctx, before)
+}
 func (c *crashStore) PruneCalls(ctx context.Context, before time.Time) (int, error) {
 	if err := c.dead("PruneCalls"); err != nil {
 		return 0, err

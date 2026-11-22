@@ -100,6 +100,12 @@ daemon:
   # store regardless, and comes back when something wants it.
   idle: 30m
 
+  # The longest a turn runs in one go: it stops between two steps, written
+  # down where it got to, and carries on at once — here, or on any wombatd
+  # sharing the store. A serverless host needs it (it is 4m there unless set);
+  # a process that stays up does not. 0 runs a turn in one go.
+  slice: 0s
+
 # ── where what the agent says goes ───────────────────────────────────────
 # Replies, questions, calls waiting for a decision, and what the agent sends
 # with its send_message tool all go to the outbox. A client long-polls
@@ -353,3 +359,27 @@ record:
 
   # With trace: render it as a self-contained HTML report on shutdown.
   trace_html: ""
+
+# ── on a serverless host ─────────────────────────────────────────────────
+# wombatd also runs as a serverless function — api/index.go, on Vercel — one
+# request at a time, with nothing kept between them: the configuration comes
+# from the WOMBATD_CONFIG_YAML environment variable (this file's contents,
+# ${VARS} expanded), the store must be postgres, and a turn runs a slice
+# (daemon.slice) per invocation. Ignored by a wombatd that stays up.
+serverless:
+  # How the next slice of a session gets run: wombatd POSTs
+  # {"session_id", "not_before"} here — a queue's publish endpoint that calls
+  # POST /api/advance with it. For Upstash QStash:
+  #   url: https://qstash.upstash.io/v2/publish/https://<your app>/api/advance
+  #   headers: {Authorization: "Bearer ${QSTASH_TOKEN}", Upstash-Forward-Authorization: "Bearer ${WOMBATD_TOKEN}"}
+  #   delay_header: Upstash-Not-Before
+  # Empty: only the cron's GET /api/tick?advance=true runs what is ready.
+  wake:
+    url: ""
+    headers: {}
+    delay_header: ""
+
+  # How long an event stream stays open before it ends, for the client to
+  # reconnect: less than the host lets a request run. 0 keeps it open, and is
+  # 4m on a serverless host.
+  stream_limit: 0s
