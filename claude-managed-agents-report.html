@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>手绘笔记 · Claude Managed Agents 是什么</title>
+<style>
+:root{
+  --ink:#2b2a28; --blue:#2f5d8c; --red:#c0453b; --green:#3f7d4e;
+  --yellow:#ffe98a; --paper:#fdfaf1;
+}
+*{box-sizing:border-box}
+body{
+  margin:0; padding:34px 18px 80px;
+  background:
+    repeating-linear-gradient(0deg, transparent 0 31px, #e7e0cd 31px 32px),
+    radial-gradient(circle at 12% 8%, #fff7dc 0%, var(--paper) 45%);
+  color:var(--ink);
+  font-family:"Xingkai SC","Kaiti SC","STKaiti","Comic Sans MS",cursive,sans-serif;
+  line-height:1.75;
+  font-size:17px;
+}
+.wrap{max-width:860px;margin:0 auto}
+/* 手绘纸片 */
+.card{
+  background:#fffdf6;
+  border:2.5px solid var(--ink);
+  border-radius:240px 18px 220px 16px/18px 200px 16px 230px;
+  padding:20px 26px;
+  margin:26px 0;
+  box-shadow:5px 6px 0 rgba(43,42,40,.16);
+  position:relative;
+}
+.card:nth-of-type(even){transform:rotate(-.35deg)}
+.card:nth-of-type(odd){transform:rotate(.3deg)}
+h1{
+  font-size:40px;line-height:1.25;margin:0 0 6px;
+  letter-spacing:1px;
+  text-shadow:1.5px 1.5px 0 #cfd8e3;
+}
+h2{font-size:25px;margin:0 0 12px;display:inline-block;position:relative}
+h2::after{
+  content:"";position:absolute;left:-4px;right:-6px;bottom:2px;height:10px;
+  background:var(--yellow);z-index:-1;transform:rotate(-.8deg);border-radius:6px;
+}
+h3{font-size:19px;margin:18px 0 6px;color:var(--blue)}
+.sub{color:#6d675c;font-size:16px;margin:0 0 4px}
+.scribble{display:block;margin:2px 0 22px;max-width:420px}
+.hl{background:linear-gradient(transparent 58%, #ffe98a 58%)}
+.red{color:var(--red)} .blue{color:var(--blue)} .green{color:var(--green)}
+b{font-weight:700}
+ul{padding-left:22px;margin:8px 0}
+li{margin:7px 0}
+li::marker{content:"✎  ";color:var(--red);font-size:15px}
+.quote{
+  border-left:4px dashed var(--blue);
+  padding:6px 0 6px 16px;margin:14px 0;color:#3a3a38;font-size:18px;
+}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:700px){.grid{grid-template-columns:1fr}h1{font-size:30px}}
+.box{
+  border:2px solid var(--ink); border-radius:14px 120px 16px 110px/110px 14px 120px 16px;
+  padding:12px 16px;background:#fffef9;
+}
+.box b{color:var(--red)}
+.sticky{
+  background:#fff6c4;border:none;
+  box-shadow:3px 4px 8px rgba(0,0,0,.14);
+  transform:rotate(1.6deg);
+  padding:16px 20px;margin:22px 0;font-size:16.5px;
+  border-radius:2px;
+}
+.sticky.blue{background:#dceaf7;transform:rotate(-1.4deg)}
+.tape{
+  position:absolute;top:-14px;left:50%;transform:translateX(-50%) rotate(-2deg);
+  width:120px;height:26px;background:rgba(255,236,150,.75);
+  border-left:1px dashed #d9c96b;border-right:1px dashed #d9c96b;
+}
+ol{padding-left:24px}
+ol li::marker{content:"◆ ";color:var(--green);font-size:14px}
+table{border-collapse:collapse;width:100%;font-size:15.5px;margin:10px 0}
+th,td{border:1.6px solid #4a4741;padding:7px 10px;text-align:left;vertical-align:top}
+th{background:#eef2f7}
+.flow{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:12px 0;font-size:15.5px}
+.step{
+  border:2px solid var(--ink);border-radius:12px 40px 14px 36px/36px 12px 40px 14px;
+  padding:7px 12px;background:#fffef9;
+}
+.arrow{color:var(--red);font-size:20px;transform:rotate(-4deg)}
+.pill{
+  display:inline-block;border:2px solid var(--ink);border-radius:30px 8px 28px 10px;
+  padding:1px 11px;font-size:14px;background:#fff7d9;margin:2px 4px 2px 0;
+}
+.warn{background:#fdeceb;border-color:var(--red)}
+.foot{color:#7a746a;font-size:14.5px;text-align:center;margin-top:34px}
+.foot a{color:var(--blue)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<p class="sub">手绘调研笔记 · 2026-11-16 · 来源：Anthropic 官方文档</p>
+<h1>Claude Managed Agents<br>到底是什么？</h1>
+<svg class="scribble" viewBox="0 0 420 22" height="22"><path d="M4 14 C60 4, 120 20, 180 10 S 300 4, 416 12" fill="none" stroke="#c0453b" stroke-width="3" stroke-linecap="round"/></svg>
+
+<div class="card">
+<h2>一句话结论</h2>
+<p class="quote">
+它是 Anthropic 官方托管的「<b>Agent 运行时</b>」：你只写 Agent 的配置（模型、提示词、工具、技能），
+剩下的 Agent 循环、工具执行、沙箱、会话状态、流式事件、计费与预算……<span class="hl">全部由 Anthropic 的服务器替你跑</span>。
+</p>
+<p>官方把它和 Messages API 摆在两个端点：<span class="blue">Messages API</span> 给你「直接提问」和完全的控制权；
+<span class="blue">Managed Agents</span> 给你「一个跑在托管基础设施上的、可配置的 agent harness（Agent 骨架）」，
+专治<b>长任务</b>和<b>异步干活</b>。</p>
+</div>
+
+<div class="card">
+<h2>三种做法，别再混淆</h2>
+<table>
+<tr><th>方式</th><th>Agent 循环 / 工具执行谁负责</th><th>适合</th></tr>
+<tr><td>Messages API</td><td>你自己写（自家后端）</td><td>要精细控制、自定义循环</td></tr>
+<tr><td>Claude Agent SDK</td><td>SDK 给你，但跑在你机器上</td><td>本地/自建，进程内集成</td></tr>
+<tr><td><b>Managed Agents</b></td><td><b>Anthropic 全托管</b>（含沙箱）</td><td>长时运行、状态持久、少运维</td></tr>
+</table>
+<p class="sub">→ 官方还提供了「从 Messages / Agent SDK 迁移」的文档，说明这是它主推的下一代形态。</p>
+</div>
+
+<div class="card">
+<h2>四个核心概念</h2>
+<div class="grid">
+  <div class="box"><b>Agent</b><br>模型 + 系统提示词 + 工具 + MCP 服务器 + Skills。建一次，拿到 ID 反复复用，可版本化、可归档。</div>
+  <div class="box"><b>Environment</b><br>「在哪跑」：Anthropic 云沙箱（每次会话一个全新 Linux 容器），或你自己机器上的自托管沙箱。</div>
+  <div class="box"><b>Session</b><br>一次运行实例。有状态：会话暂停可续跑，文件系统、对话历史、产出都留在服务端。</div>
+  <div class="box"><b>Events</b><br>你和 Agent 之间的事件流：用户消息、工具结果、状态更新，走 SSE 实时推回来，历史可完整取回。</div>
+</div>
+</div>
+
+<div class="card">
+<h2>跑一次，只要五步</h2>
+<div class="flow">
+  <span class="step">① 建 Agent</span><span class="arrow">➜</span>
+  <span class="step">② 建 Environment</span><span class="arrow">➜</span>
+  <span class="step">③ 开会话</span><span class="arrow">➜</span>
+  <span class="step">④ 发事件 / 收流</span><span class="arrow">➜</span>
+  <span class="step">⑤ 干预或中断</span>
+</div>
+<p>Agent 和 Environment 可以用 <span class="pill">ant apply</span> 从 YAML/Markdown 声明式定义，ID 记到 <span class="pill">claude-lock.json</span>；
+SDK 侧就是 <span class="pill">client.beta.agents.create()</span> <span class="pill">.environments.create()</span> <span class="pill">.sessions.create()</span>。
+所有端点走 beta 头 <span class="pill">managed-agents-2026-04-01</span>。</p>
+</div>
+
+<div class="card">
+<h2>它自带的能力（这部分才是重点）</h2>
+<h3>① 内置工具集</h3>
+<p>默认全开：<span class="pill">bash</span><span class="pill">read</span><span class="pill">write</span><span class="pill">edit</span><span class="pill">glob</span><span class="pill">grep</span><span class="pill">web_fetch</span><span class="pill">web_search</span>，外加 <span class="pill">MCP 服务器</span> 和自定义工具。
+小细节：单个工具输出超过 10 万字符，会自动落盘成文件，模型只看到截断预览 + 路径。</p>
+
+<h3>② 权限策略</h3>
+<ul>
+<li><b>always_allow</b>：直接执行（agent 工具集默认）</li>
+<li><b>always_ask</b>：暂停等你点同意（MCP 工具集默认）</li>
+<li><b>auto</b>：由服务端逐次判断——放行 / 拒绝 / 挂起问你</li>
+</ul>
+
+<h3>③ 让它自己「验收」：Outcome</h3>
+<p>你写一份 Markdown 评分表（rubric），Harness 会另起一个 <b>grader</b>（独立上下文，避免自我感觉良好），
+按条目打分并把意见回灌给 Agent，<span class="hl">循环迭代直到达标</span>。</p>
+
+<h3>④ 记忆与「做梦」</h3>
+<p><b>Memory store</b> 会挂载进沙箱当普通目录，Agent 用文件工具读写。跑久了必然脏，
+于是有了 <b>Dreams</b>（研究预览）：异步任务，读旧记忆库 + 最多 100 条历史会话，去重、纠错、提炼，
+输出一个<b>新的</b>记忆库，旧的绝不被改写——不满意就丢掉。</p>
+
+<h3>⑤ 其他加分项</h3>
+<ul>
+<li><b>Vaults</b>：集中保管 OAuth/API 凭证，支持轮换，会话里按需引用</li>
+<li><b>Budgets</b>：会话级预算上限，撞顶就暂停/可续，多 Agent 与定时任务也受控</li>
+<li><b>Scheduled deployments</b>：cron 定时跑，带时区语义与失败处理</li>
+<li><b>多 Agent 编排</b>：subagents 分工、threads 并行、advisor 关键时刻给建议、dynamic workflows 动态编排</li>
+<li><b>Webhooks / 事件增量 / 可观测性</b>：不守着流也能接结果，能查每个会话的 token 与花费</li>
+</ul>
+</div>
+
+<div class="card">
+<h2>云端沙箱 vs 自托管，怎么选</h2>
+<table>
+<tr><th></th><th>Cloud（默认）</th><th>Self-hosted sandbox</th></tr>
+<tr><td>工具/代码在哪跑</td><td>Anthropic 托管容器</td><td>你的 worker（你的机器）</td></tr>
+<tr><td>什么上云</td><td>全部</td><td>对话历史、工具结果、skills、memory；<b>文件与进程留在你这边</b></td></tr>
+<tr><td>你要运维</td><td>无</td><td>worker 主机、加固、网络限制、环境密钥</td></tr>
+</table>
+<p>还有更彻底的 <b>Self-hosted Managed Agents</b>：整套服务装进你自己的集群（Docker Compose 或 Helm chart <span class="pill">cma-sandboxes</span>），
+三把钥匙分工明确——<b>Server API key</b>（你的应用→你的服务器）、<b>Inference credential</b>（服务器→模型）、<b>Environment key</b>（worker→服务器）。
+代价是服务器安全、记忆库托管、异常检测都归你；好处是<b>唯一支持 ZDR</b> 的形态。</p>
+</div>
+
+<div class="sticky">
+<b>谁该用？</b> 需要跑几分钟到几小时的 Agent 任务、要持久文件系统与会话历史、要 cron 定时跑、
+不想自己写 agent loop 和沙箱、又或者有合规要求要把执行留在自己机房——这些都命中了。
+</div>
+
+<div class="sticky blue warn">
+<p style="margin:0 0 6px"><b>⚠ 踩坑前先记住</b></p>
+<ul style="margin:0">
+<li><b>Beta</b>：所有端点必须带 <span class="pill">managed-agents-2026-04-01</span>，行为可能被调整。</li>
+<li><b>不适用 ZDR</b>（托管版）：会话是有状态资源，转录会一直留着，直到你主动删会话；删文件要单独删。</li>
+<li><b>不支持 HIPAA BAA</b>。MCP tunnels、Dreams 是更受限的研究预览，需单独申请。</li>
+<li>能上：Claude API、Claude Platform on AWS、Google Cloud 上的 Anthropic managed 版本。</li>
+</ul>
+</div>
+
+<div class="card">
+<h2>我的三个判断</h2>
+<ol>
+<li><b>这是「Agent 的服务器端运行时」标准化。</b> 以前每家自己造循环+沙箱，现在收敛成 Agent / Environment / Session / Event 四个原语——很像容器把「进程+隔离」标准化。</li>
+<li><b>真正的护城河在「验收」和「记忆」。</b> Outcome+grader 把「做完了」变成可测的闭环；Dreams 解决长期记忆腐化——这两件事自己搭都很痛。</li>
+<li><b>自托管是给合规开的门，不是给省钱开的。</b> 它把 ZDR、数据驻留问题解决了，但把运维与安全责任全数退回给你。</li>
+</ol>
+</div>
+
+<p class="foot">
+参考：platform.claude.com/docs/en/managed-agents/ ——
+overview · quickstart · agent-setup · choosing-an-environment · tools ·
+permission-policies · memory · dreams · define-outcomes · budgets ·
+scheduled-deployments · multiagent-orchestration · self-hosted
+<br>（本页为手绘风格 HTML，双击用浏览器打开，⌘P 可导出 PDF）
+</p>
+
+</div>
+</body>
+</html>

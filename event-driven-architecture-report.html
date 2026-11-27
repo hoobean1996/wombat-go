@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>手绘笔记 · 什么是事件驱动（Event-Driven）架构</title>
+<style>
+:root{--ink:#2b2a28;--blue:#2f5d8c;--red:#c0453b;--green:#3f7d4e;--yellow:#ffe98a;--paper:#fdfaf1}
+*{box-sizing:border-box}
+body{margin:0;padding:34px 18px 80px;background:repeating-linear-gradient(0deg,transparent 0 31px,#e7e0cd 31px 32px),radial-gradient(circle at 12% 8%,#fff7dc 0%,var(--paper) 45%);color:var(--ink);font-family:"Xingkai SC","Kaiti SC","STKaiti","Comic Sans MS",cursive,sans-serif;line-height:1.75;font-size:17px}
+.wrap{max-width:880px;margin:0 auto}
+.card{background:#fffdf6;border:2.5px solid var(--ink);border-radius:240px 18px 220px 16px/18px 200px 16px 230px;padding:20px 26px;margin:26px 0;box-shadow:5px 6px 0 rgba(43,42,40,.16);position:relative}
+.card:nth-of-type(even){transform:rotate(-.3deg)}.card:nth-of-type(odd){transform:rotate(.25deg)}
+h1{font-size:38px;line-height:1.25;margin:0 0 6px;letter-spacing:1px;text-shadow:1.5px 1.5px 0 #cfd8e3}
+h2{font-size:24px;margin:0 0 12px;display:inline-block;position:relative}
+h2::after{content:"";position:absolute;left:-4px;right:-6px;bottom:2px;height:10px;background:var(--yellow);z-index:-1;transform:rotate(-.8deg);border-radius:6px}
+h3{font-size:18px;margin:16px 0 4px;color:var(--blue)}
+.sub{color:#6d675c;font-size:16px;margin:0 0 4px}
+.hl{background:linear-gradient(transparent 58%,#ffe98a 58%)}
+.red{color:var(--red)}.blue{color:var(--blue)}.green{color:var(--green)}
+ul{padding-left:22px;margin:8px 0}li{margin:7px 0}
+li::marker{content:"✎  ";color:var(--red);font-size:15px}
+.quote{border-left:4px dashed var(--blue);padding:6px 0 6px 16px;margin:14px 0;font-size:18px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:700px){.grid{grid-template-columns:1fr}h1{font-size:28px}}
+.box{border:2px solid var(--ink);border-radius:14px 120px 16px 110px/110px 14px 120px 16px;padding:12px 16px;background:#fffef9;font-size:16px}
+.box b{color:var(--red)}
+.sticky{background:#fff6c4;border:none;box-shadow:3px 4px 8px rgba(0,0,0,.14);transform:rotate(1.2deg);padding:16px 20px;margin:22px 0;font-size:16.5px;border-radius:2px}
+.sticky.blue{background:#dceaf7;transform:rotate(-1deg)}
+.sticky.warn{background:#fdeceb}
+table{border-collapse:collapse;width:100%;font-size:15.5px;margin:10px 0}
+th,td{border:1.6px solid #4a4741;padding:7px 10px;text-align:left;vertical-align:top}
+th{background:#eef2f7}
+.pill{display:inline-block;border:2px solid var(--ink);border-radius:30px 8px 28px 10px;padding:1px 11px;font-size:14px;background:#fff7d9;margin:2px 4px 2px 0}
+code{font-family:"SF Mono",Menlo,monospace;font-size:13.5px;background:#f1ece0;padding:1px 5px;border-radius:4px}
+.fig{margin:14px 0 6px;text-align:center}
+.cap{font-size:14px;color:#7a746a;text-align:center;margin:0 0 8px}
+.foot{color:#7a746a;font-size:14.5px;text-align:center;margin-top:34px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<p class="sub">手绘调研笔记 · 2026-11-16 · 来源：Wikipedia / Fowler / microservices.io / 本项目 DESIGN.md</p>
+<h1>Event-Driven 架构<br>到底是什么？</h1>
+<svg viewBox="0 0 420 22" height="22" style="max-width:420px"><path d="M4 14 C60 4,120 20,180 10 S 300 4,416 12" fill="none" stroke="#c0453b" stroke-width="3" stroke-linecap="round"/></svg>
+
+<div class="card">
+<h2>一句话结论</h2>
+<p class="quote">
+不再问「你帮我做件事」，而是<b>宣告「这里发生了什么」</b>，谁关心谁自己去接。发出的人
+<span class="hl">不知道、也不需要知道谁在听</span>——这就是全部的秘密，也是全部的代价。
+</p>
+<p>它不是一个框架，是<b>一套耦合方式的选择</b>：把「调用」换成「广播事实」，
+换来解耦、削峰、可重放，付出的是<b>看不见的控制流</b>与<b>最终一致</b>。</p>
+</div>
+
+<div class="card">
+<h2>先把三个词分开</h2>
+<table>
+<tr><th>消息</th><th>说的是</th><th>例子</th><th>耦合</th></tr>
+<tr><td><b>命令</b> Command</td><td>「请把这件事做了」</td><td>ReserveCredit</td><td>指名叫人干，强</td></tr>
+<tr><td><b>事件</b> Event</td><td>「这件事已经发生了」（过去式）</td><td>OrderCreated</td><td>广播给世界，弱</td></tr>
+<tr><td><b>查询</b> Query</td><td>「现在是什么状态？」</td><td>GetOrder</td><td>同步，强</td></tr>
+</table>
+<p class="sub">命名就是设计：事件永远用<b>过去式</b>，因为它记录的是既成事实，不可撤回、不可协商。</p>
+<h3>那"事件"到底是什么？</h3>
+<p>严格说，<b>事件是状态的一次显著变化</b>（车从"待售"变成"已售"）。发生的事本身不会旅行，
+在网上飞的是它的<b>通知消息</b>。日常把通知也叫事件——行，但要知道这层偷换，
+因为它解释了为什么事件总带着"消息中间件"的味道。</p>
+</div>
+
+<div class="card">
+<h2>三种形态，别混为一谈（Fowler）</h2>
+<div class="grid">
+<div class="box"><b>① 事件通知</b><br>事件很瘦，只说「订单 42 变了」，收的人自己回头来问详情。耦合最低、最好搭，但一旦<b>业务流跨了好几个事件</b>，它就变成一段"没写在任何代码里"的流程——难调试、难修改。</div>
+<div class="box"><b>② 事件携带状态</b><br>事件里塞满数据，收的人本地存一份副本，从此<b>不必再回来问</b>。换来低延迟、抗故障（源系统挂了也能干活），代价是数据到处复制、带宽与一致性压力，以及接收端要处理乱序与重复。</div>
+<div class="box"><b>③ 事件溯源</b><br>不存"当前状态"，只追加"变更日志"，状态由重放算出。能得到历史、能<b>回放到任意时刻</b>、能注入假设事件探索"另一种历史"（git 就是一本事件日志）。代价：版本演进、快照、重放成本、外部系统读不懂日志。</div>
+<div class="box"><b>④ CQRS（顺带）</b><br>读写模型分开。它本身<b>跟事件无关</b>，只是常和上面三个一起用。Fowler 原话大意：很多同事对它很警惕，因为常被误用——一个项目说"事件溯源是灾难"，其实混淆了 CQRS。</div>
+</div>
+<p class="sub">→ 这四种组合方式不同，<b>痛的地方完全不同</b>。搞不清自己用的是哪种，就没法判断问题出在哪（Fowler 把这叫"植物学家难题"）。</p>
+</div>
+
+<div class="card">
+<h2>两种拓扑：谁在管事</h2>
+<div class="fig">
+<svg viewBox="0 0 640 250" style="max-width:100%">
+<defs><marker id="a1" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto"><path d="M0 0 L9 4 L0 8" fill="none" stroke="#c0453b" stroke-width="1.8" stroke-linecap="round"/></marker></defs>
+<text x="8" y="18" font-size="14" fill="#2f5d8c">Broker 拓扑 · 谁爱听谁听</text>
+<rect x="14" y="42" width="88" height="34" rx="10" fill="#fffef9" stroke="#2b2a28" stroke-width="2"/><text x="34" y="65" font-size="13" fill="#2b2a28">订单</text>
+<path d="M106 54 C150 48,180 56,215 58" fill="none" stroke="#4a4741" stroke-width="2" stroke-linecap="round" marker-end="url(#a1)"/>
+<rect x="220" y="34" width="120" height="52" rx="12" fill="#eef2f7" stroke="#2b2a28" stroke-width="2"/><text x="240" y="57" font-size="13">消息通道</text><text x="243" y="74" font-size="11" fill="#6d675c">topic / log</text>
+<path d="M344 50 C380 44,400 36,430 34" fill="none" stroke="#4a4741" stroke-width="2" stroke-linecap="round" marker-end="url(#a1)"/>
+<path d="M344 66 C382 70,404 78,430 82" fill="none" stroke="#4a4741" stroke-width="2" stroke-linecap="round" marker-end="url(#a1)"/>
+<path d="M344 60 C384 90,404 116,430 120" fill="none" stroke="#4a4741" stroke-width="2" stroke-linecap="round" marker-end="url(#a1)"/>
+<rect x="434" y="20" width="88" height="28" rx="10" fill="#fffef9" stroke="#2b2a28" stroke-width="2"/><text x="450" y="39" font-size="12.5">库存</text>
+<rect x="434" y="68" width="88" height="28" rx="10" fill="#fffef9" stroke="#2b2a28" stroke-width="2"/><text x="450" y="87" font-size="12.5">积分</text>
+<rect x="434" y="106" width="88" height="28" rx="10" fill="#fffef9" stroke="#2b2a28" stroke-width="2"/><text x="450" y="125" font-size="12.5">通知</text>
+<text x="536" y="60" font-size="11.5" fill="#6d675c">发布者不知道</text><text x="536" y="76" font-size="11.5" fill="#6d675c">有几个人在听</text>
+<text x="8" y="176" font-size="14" fill="#2f5d8c">Mediator / 编排 · 有人在指挥</text>
+<rect x="14" y="196" width="80" height="34" rx="10" fill="#fffef9" stroke="#2b2a28" stroke-width="2"/><text x="34" y="219" font-size="13">订单</text>
+<path d="M96 212 C120 208,130 210,148 212" fill="none" stroke="#4a4741" stroke-width="2" marker-end="url(#a1)" stroke-linecap="round"/>
+<ellipse cx="212" cy="212" rx="60" ry="26" fill="#fff7d9" stroke="#2b2a28" stroke-width="2"/><text x="180" y="217" font-size="13">编排器</text>
+<path d="M272 208 C300 200,310 196,330 194" fill="none" stroke="#4a4741" stroke-width="2" marker-end="url(#a1)" stroke-linecap="round"/>
+<path d="M272 216 C300 216,310 216,330 216" fill="none" stroke="#4a4741" stroke-width="2" marker-end="url(#a1)" stroke-linecap="round"/>
+<path d="M272 224 C300 232,310 238,330 240" fill="none" stroke="#4a4741" stroke-width="2" marker-end="url(#a1)" stroke-linecap="round"/>
+<rect x="334" y="180" width="80" height="28" rx="10" fill="#fffef9" stroke="#2b2a28" stroke-width="2"/><text x="352" y="199" font-size="12.5">库存</text>
+<rect x="334" y="204" width="80" height="24" rx="10" fill="#fffef9" stroke="#2b2a28" stroke-width="2"/><text x="352" y="221" font-size="12.5">支付</text>
+<rect x="334" y="228" width="80" height="24" rx="10" fill="#fffef9" stroke="#2b2a28" stroke-width="2"/><text x="352" y="245" font-size="12.5">物流</text>
+<text x="430" y="212" font-size="11.5" fill="#6d675c">流程写在编排器里：</text><text x="430" y="228" font-size="11.5" fill="#6d675c">好控、好补偿、慢一点</text>
+</svg>
+</div>
+<p class="cap">图 1 · 无中心广播 vs 中心编排（也可混着用）</p>
+<p><b>Broker</b>：性能与扩展性好，但出了事"没人负责"，排查靠观测。<b>Mediator</b>：把跨服务流程收进一处，
+能重试、能补偿、能看进度，代价是多一跳、编排器自己别变成单点与瓶颈。</p>
+</div>
+
+<div class="card">
+<h2>拆开一条事件看</h2>
+<p><code>{ header, payload }</code> —— <b>header</b>：事件名、时间戳、类型、<span class="red">版本号</span>、事件 id、关联/追踪 id、来源。
+<b>payload</b>：变了什么。</p>
+<table>
+<tr><th>胖事件（带全量数据）</th><th>瘦事件（只带 id）</th></tr>
+<tr><td>快、不用回查、源系统压力小<br>但多份数据副本、带宽贵、<b>容易形成"印记耦合"</b></td><td>带宽省、耦合小、单一事实来源<br>但收的人要回查数据库，慢，源系统承压</td></tr>
+</table>
+<p class="sub">→ 这是<b>光谱不是二选一</b>。真正要定的问题只有一个：收的人拿到这条消息后，还需不需要再问一句？</p>
+<h3>领域事件 vs 集成事件</h3>
+<p><b>领域事件</b>：发生在一个限界上下文<b>内部</b>，payload 很瘦，因为听众多半就在同一个服务里，需求你清楚。
+<b>集成事件</b>：跨上下文发布，是给外人看的契约，payload 更肥、更啰嗦——因为<span class="hl">你不知道谁会听、拿它干什么</span>，
+宁可多说一点。</p>
+</div>
+
+<div class="card">
+<h2>真正的驱动力：一致性与 2PC 的不可能</h2>
+<p>微服务拆库之后（Database per Service），一个业务事务横跨两个库，ACID 没了；分布式事务 2PC 基本不是选项。
+于是：<b>每个服务改了自己的数据，就发一条事件；别人订阅、更新自己的数据</b>——用<b>最终一致</b>
+换掉跨库事务。经典例子：订单服务发 <code>OrderCreated</code>（订单处于 pending）→ 客户服务试着占用额度，
+回发 <code>CreditReserved</code> 或 <code>CreditLimitExceeded</code> → 订单服务据此把订单改成 approved 或 cancelled。</p>
+<p>麻烦在于：<b>可靠地同时做到「改库」和「发事件」</b>，这件事本身就难，因为库和 broker 之间没有共同事务。四条常见解法：</p>
+<ul>
+<li><b>本地事务表（Transactional Outbox）</b>：事件和业务数据写进同一个库、同一个事务，再由后台搬运出库。<span class="green">最常用</span></li>
+<li><b>事件溯源</b>：日志即事实，写日志就是发布</li>
+<li><b>数据库触发器 / 事务日志捕获（CDC / log tailing）</b>：从 binlog 里把变更捞出来发</li>
+<li><b>Saga</b>：一串本地事务 + 补偿动作，替掉长事务</li>
+</ul>
+</div>
+
+<div class="card">
+<h2>上线前必须过的五道关</h2>
+<ul>
+<li><b>至少一次投递 ⇒ 消费者必须幂等。</b>重复是常态不是意外；幂等键（dedup key）与去重表是标配。</li>
+<li><b>顺序不保证。</b>要么按 key 分区保序，要么让状态机容忍乱序（比较版本号/序号）。</li>
+<li><b>会丢吗？</b>发事件与改库不是一个事务 → 这就是 outbox 存在的理由。别在进程里"先发后写"。</li>
+<li><b>schema 演进。</b>事件一旦发出去就是契约，删字段就等于毁约。版本化 + 只加不改 + 语义化版本，
+消费者要能忽略不认识的字段。</li>
+<li><b>看不见的流程。</b>事件驱动的流程不在任何源码里，只能在运行中看见——trace/correlation id 贯穿、
+端到端可观测、再配一个"事件流视图"。这是 Fowler 点名的头号陷阱。</li>
+</ul>
+</div>
+
+<div class="sticky warn">
+<p style="margin:0 0 6px"><b>⚠ 反模式清单</b></p>
+<ul style="margin:0">
+<li><b>被动攻击式命令</b>：心里想让人干活，却把消息写成事件的样子——发的人其实在等结果。该用命令就用命令。</li>
+<li><b>拿事件当 RPC</b>：事件发出去、立刻同步等回应。两头的好处都没了，只剩复杂。</li>
+<li><b>事件驱动 = 分布式单体</b>：服务拆了，但靠事件串成一条强耦合链，谁也不能独立上线。</li>
+<li><b>Timeout 反模式</b>（Mark Richards）：超时设短了误杀，设长了错误反馈极慢；正解是熔断器 + 心跳/探活，而不是调参数。</li>
+<li><b>为了架构而架构</b>：CQRS、事件溯源在错误的土壤上一定失败。先问"这个域真的需要重放/审计/擦写分离吗"。</li>
+</ul>
+</div>
+
+<div class="card">
+<h2>选型草图</h2>
+<table>
+<tr><th>需求形状</th><th>可以选</th></tr>
+<tr><td>高吞吐、要回放、多消费者各自读全量</td><td>Kafka / Redpanda / Pulsar（日志型）</td></tr>
+<tr><td>复杂路由、优先级、延迟队列、事务性队列</td><td>RabbitMQ</td></tr>
+<tr><td>轻量、云原生、极简 pub/sub 或请求-回复</td><td>NATS / JetStream</td></tr>
+<tr><td>不想引入新基础设施、量不大</td><td>Postgres 表 + Outbox + <code>LISTEN/NOTIFY</code></td></tr>
+<tr><td>托管云、按条计费、扇出</td><td>SNS + SQS / EventBridge / Pub-Sub</td></tr>
+</table>
+<p class="sub">先定<b>投递语义</b>（至少一次？保序？回放？），再定产品。反过来的选型都会返工。</p>
+</div>
+
+<div class="card">
+<h2>照镜子：这个项目自己就是个小 EDA</h2>
+<p><code>wombat-go</code> 的 <code>pkg/daemon</code> 几乎踩遍了上面每一条，而且踩得挺标准：</p>
+<ul>
+<li><b>inbox 即通道</b>：消息、审批决定、定时器到期、任何 <code>POST /api/events</code> 都落成一行，
+请求返回即安全——这是"持久化通道"，不是内存队列。</li>
+<li><b>dedup key</b>：同一事件重复投递只收一次 ⇒ <span class="green">幂等消费者</span>。</li>
+<li><b>事件带头</b>：<code>kind</code> / <code>source</code> / <code>from</code>，与 Wikipedia 说的 header 一致；
+模型看到的是"谁说的"，而不是把 webhook 的 payload 当成用户指令。</li>
+<li><b>outbox 反向通道</b>：agent 说的话进 outbox，客户端 <code>?after=&amp;wait=</code> 长轮询并 ack，
+也支持 webhook 推送——<b>至少一次 + 客户端 ack</b>。</li>
+<li><b>序号是会话全局的</b>+ <code>Last-Event-ID</code>：把 SSE 断线重连变成了"从漏掉处续读"，
+这正是日志型通道给的能力。</li>
+<li><b>租约（lease）与 fencing</b>：一次只有一个 worker 跑某会话，死掉的进程停止续租，
+别人接管后把没跑完的补上——分布式下"谁负责"的问题在这里被收敛掉了。</li>
+</ul>
+<p class="sub">反过来看，这份设计最"事件"的一点是<b>没有任何东西能启动一轮对话，除了 inbox 里的一个事件</b>——
+连 agent 自己的定时器也是往 inbox 丢事件。这就是 EDA 的形状。</p>
+</div>
+
+<div class="card">
+<h2>我的三个判断</h2>
+<ol>
+<li><b>EDA 的收益在边界，成本在中间。</b> 跨团队、跨系统、峰值不均——收益巨大；只是把三个类解耦，纯亏。</li>
+<li><b>真正的门槛不是消息队列，是"一致性 + 幂等 + 可观测"。</b> 选 Kafka 只要一天，把 outbox、去重、追踪做对要半年。</li>
+<li><b>先有事件风暴，再有代码。</b> 能不能用过去式给一件事命名、说清它的边界，比选型重要得多。</li>
+</ol>
+</div>
+
+<p class="foot">
+参考：Wikipedia · Event-driven architecture；Martin Fowler · <i>What do you mean by "Event-Driven"?</i>（2017）；
+Chris Richardson · microservices.io（Event-driven architecture / Saga / Transactional Outbox / Event Sourcing）；
+Mark Richards · 软件架构模式（Broker 与 Mediator 拓扑）；本项目 <code>docs/DESIGN.md</code>。
+<br>（手绘风格 HTML，双击用浏览器打开，⌘P 可导出 PDF）
+</p>
+
+</div>
+</body>
+</html>

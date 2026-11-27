@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Claude Managed Agents · 架构与用法（手绘）</title>
+<script src="https://unpkg.com/roughjs@4.6.6/bundled/rough.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Caveat:wght@400;700&family=Patrick+Hand&display=swap" rel="stylesheet">
+<style>
+  :root{--paper:#fdf8ef;--ink:#1e1e1e;--blue:#4a6fa5;--red:#c0504d;--green:#4e7a3f;--purple:#7a5c9e;--orange:#d08030}
+  *{box-sizing:border-box}
+  body{margin:0;background:#f2ece1;font-family:'Patrick Hand','Comic Sans MS',ui-rounded,sans-serif;color:var(--ink)}
+  header{max-width:1500px;margin:0 auto;padding:26px 28px 6px}
+  h1{font-family:'Caveat',cursive;font-size:44px;margin:0 0 4px;letter-spacing:.5px}
+  .sub{font-size:17px;opacity:.72;margin:0}
+  .bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:16px 0 0}
+  button{font-family:inherit;font-size:15px;padding:7px 14px;background:#fff;border:2px solid var(--ink);border-radius:255px 15px 225px 20px/15px 225px 20px 255px;cursor:pointer;transition:.15s}
+  button:hover{background:#1e1e1e;color:#fdf8ef;transform:rotate(-.6deg)}
+  .tag{font-size:14px;padding:4px 10px;border:2px dashed var(--orange);border-radius:255px 15px 225px 20px/15px 225px 20px 255px;color:var(--orange)}
+  #wrap{max-width:1500px;margin:0 auto;padding:8px 28px 60px}
+  #paper{background:var(--paper);border-radius:12px;box-shadow:0 10px 30px rgba(0,0,0,.10),0 1px 0 #fff inset;overflow:auto}
+  svg{display:block;filter:url(#sketch)}
+  .note{max-width:1500px;margin:0 auto;padding:0 28px 60px;font-size:16px;line-height:1.65}
+  .note h2{font-family:'Caveat',cursive;font-size:30px;margin:26px 0 6px}
+  .note code{background:#eae3d4;padding:1px 5px;border-radius:4px;font-family:ui-monospace,Menlo,monospace;font-size:13.5px}
+  .note li{margin:5px 0}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}
+  .card{border:2px solid #2b2b2b;border-radius:255px 15px 225px 20px/15px 225px 20px 255px;padding:12px 16px;background:#fffaef}
+</style>
+</head>
+<body>
+<header>
+  <h1>Claude Managed Agents — 架构 &amp; 用法</h1>
+  <p class="sub">预置的 agent harness 跑在托管基础设施上：你只定义 Agent / Environment，然后开 Session 发 Event。</p>
+  <div class="bar">
+    <span class="tag">beta · managed-agents-2026-04-01</span>
+    <button onclick="dl()">⬇ 下载 .excalidraw</button>
+    <button onclick="document.getElementById('paper').requestFullscreen?.()">⛶ 全屏</button>
+  </div>
+</header>
+
+<div id="wrap"><div id="paper"><svg id="d" xmlns="http://www.w3.org/2000/svg" width="1480" height="1010" viewBox="0 0 1480 1010">
+  <defs>
+    <filter id="sketch"><feTurbulence type="fractalNoise" baseFrequency="0.02" numOctaves="2" seed="7" result="n"/>
+      <feDisplacementMap in="SourceGraphic" in2="n" scale="1.1" xChannelSelector="R" yChannelSelector="G"/></filter>
+    <marker id="ah" markerWidth="10" markerHeight="8" refX="8" refY="4" orient="auto">
+      <path d="M0,0 L9,4 L0,8" fill="none" stroke="#1e1e1e" stroke-width="1.8"/></marker>
+  </defs>
+</svg></div></div>
+
+<div class="note">
+  <h2>它到底是什么</h2>
+  <p>Anthropic 官方对 <b>Claude Managed Agents</b> 的定位是「预构建、可配置的 agent harness，运行在托管基础设施上」，面向<b>长时运行 / 异步任务</b>；而 Messages API 面向「自己写 agent loop、要细粒度控制」。它于 <code>beta</code>，所有端点需请求头 <code>anthropic-beta: managed-agents-2026-04-01</code>。</p>
+  <div class="grid">
+    <div class="card"><b>四个核心概念</b><ul>
+      <li><b>Agent</b>：模型 + system prompt + tools + MCP servers + Skills，建一次拿到 <code>agent.id</code></li>
+      <li><b>Environment</b>：在哪儿跑 —— 托管云沙箱，或自托管沙箱（你自己的 K8s）</li>
+      <li><b>Session</b>：环境里的一次运行实例，有持久文件系统与事件历史</li>
+      <li><b>Events</b>：你与 agent 之间的消息（user / agent / session 状态）</li></ul></div>
+    <div class="card"><b>能力清单</b><ul>
+      <li>内置工具：Bash、文件读写/glob/grep、web search &amp; fetch、MCP</li>
+      <li>harness 自带 prompt caching、上下文压缩（compaction）</li>
+      <li>SSE 流式事件；<code>event_deltas</code> 做 token 级预览</li>
+      <li>旁路能力：Skills、Vaults（凭据）、Memory stores、权限策略、会话预算、cron 定时部署、多智能体编排、Dreams（记忆整理）</li></ul></div>
+    <div class="card"><b>什么时候用 / 别用</b><ul>
+      <li>✅ 跑几分钟到几小时、多轮工具调用的任务；需要沙箱与状态</li>
+      <li>✅ 不想自己实现 loop、沙箱、工具执行层</li>
+      <li>⚠️ 不支持 ZDR / HIPAA（自托管版本例外，数据自己存）</li>
+      <li>⚠️ 仍是 beta，行为可能变；限流：写 300 rpm / 读 1200 rpm</li></ul></div>
+  </div>
+  <h2>最小用法（五步）</h2>
+  <ol>
+    <li><code>POST /v1/agents</code> → 拿 <code>agent.id</code>（tools 用 <code>agent_toolset_20260401</code> 批量开关）</li>
+    <li><code>POST /v1/environments</code> → <code>{"config":{"type":"cloud","networking":{"type":"limited","allow_package_managers":true}}}</code></li>
+    <li><code>POST /v1/sessions</code> → <code>{"agent":…,"environment_id":…,"title":…}</code></li>
+    <li>开 SSE <code>sessions.events.stream()</code>，再 <code>events.send()</code> 发 <code>user.message</code></li>
+    <li>消费事件：<code>agent.message</code> / <code>agent.tool_use</code> … 直到 <code>session.status_idle</code>；中途可发 <code>user.interrupt</code> 或补充消息来纠偏</li>
+  </ol>
+</div>
+
+<script>
+const C={ink:'#1e1e1e',blue:'#4a6fa5',red:'#c0504d',green:'#4e7a3f',purple:'#7a5c9e',orange:'#d08030',grey:'#8a8a8a'};
+const svg=document.getElementById('d'), rc=rough.svg(svg);
+const els=[];
+
+function box(x,y,w,h,label,o={}){
+  const c=o.c||C.ink, fill=o.fill||null, dash=o.dash||false;
+  svg.appendChild(rc.rectangle(x,y,w,h,{stroke:c,strokeWidth:o.sw||2,roughness:o.r??1.6,bowing:1.2,fill:fill||undefined,fillStyle:'hachure',fillWeight:1,strokeLineDash:dash?[8,7]:undefined}));
+  els.push({type:'rectangle',x,y,width:w,height:h,strokeColor:c,backgroundColor:fill||'transparent',strokeStyle:dash?'dashed':'solid',roundness:{type:3}});
+  if(label){
+    const lines=String(label).split('\n'), fs=o.fs||15, lh=fs*1.35;
+    const ty=y+h/2-(lines.length-1)*lh/2+fs*0.35;
+    lines.forEach((t,i)=>{
+      const tx=x+w/2;
+      const el=document.createElementNS('http://www.w3.org/2000/svg','text');
+      el.setAttribute('x',tx);el.setAttribute('y',ty+i*lh);
+      el.setAttribute('text-anchor','middle');el.setAttribute('font-family',"'Patrick Hand',sans-serif");
+      el.setAttribute('font-size',fs);el.setAttribute('fill',o.tc||C.ink);
+      if(o.bold)el.setAttribute('font-weight','700');
+      el.textContent=t;svg.appendChild(el);
+      els.push({type:'text',x:tx-t.length*fs*.27,y:ty+i*lh-fs,width:t.length*fs*.54,height:fs*1.25,text:t,fontSize:fs,strokeColor:o.tc||C.ink});
+    });
+  }
+}
+function txt(x,y,t,o={}){
+  const fs=o.fs||16,el=document.createElementNS('http://www.w3.org/2000/svg','text');
+  el.setAttribute('x',x);el.setAttribute('y',y);el.setAttribute('font-family',"'Patrick Hand',sans-serif");
+  el.setAttribute('font-size',fs);el.setAttribute('fill',o.c||C.ink);
+  if(o.bold)el.setAttribute('font-weight','700');if(o.anchor)el.setAttribute('text-anchor',o.anchor);
+  el.textContent=t;svg.appendChild(el);
+  els.push({type:'text',x,y:y-fs,width:t.length*fs*.55,height:fs*1.25,text:t,fontSize:fs,strokeColor:o.c||C.ink});
+}
+function title(x,y,t,o={}){
+  const fs=o.fs||34,el=document.createElementNS('http://www.w3.org/2000/svg','text');
+  el.setAttribute('x',x);el.setAttribute('y',y);el.setAttribute('font-family',"'Caveat',cursive");
+  el.setAttribute('font-size',fs);el.setAttribute('font-weight','700');el.setAttribute('fill',o.c||C.ink);
+  el.textContent=t;svg.appendChild(el);
+  els.push({type:'text',x,y:y-fs,width:t.length*fs*.5,height:fs,text:t,fontSize:fs,strokeColor:o.c||C.ink});
+}
+function arrow(x1,y1,x2,y2,o={}){
+  const pts=[[x1,y1],[x2,y2]];
+  svg.appendChild(rc.linearPath(pts,{stroke:o.c||C.ink,strokeWidth:o.sw||1.9,roughness:1.4}));
+  const a=Math.atan2(y2-y1,x2-x1),L=9;
+  svg.appendChild(rc.linearPath([[x2-L*Math.cos(a-.4),y2-L*Math.sin(a-.4)],[x2,y2],[x2-L*Math.cos(a+.4),y2-L*Math.sin(a+.4)]],{stroke:o.c||C.ink,strokeWidth:o.sw||1.9,roughness:1.2}));
+  if(o.label){const mx=(x1+x2)/2,my=(y1+y2)/2;txt(mx-8,my-8,o.label,{fs:13,c:o.c||C.grey,anchor:'middle'});}
+  els.push({type:'arrow',x:x1,y:y1,width:x2-x1,height:y2-y1,points:[[0,0],[x2-x1,y2-y1]],strokeColor:o.c||C.ink});
+}
+
+/* ---------- title ---------- */
+title(48,52,'Claude Managed Agents · 你有应用，它给你跑 agent');
+txt(48,84,'控制面 = /v1 REST + SSE    执行面 = 沙箱 Environment    状态 = Session（持久事件历史 + 文件系统）',{fs:15,c:C.grey});
+
+/* ---------- left: your app ---------- */
+box(46,150,206,66,'你的服务 / 客户端',{c:C.blue,bold:true});
+box(46,262,206,54,'SDK(Py/TS/Go…)\n· CLI `ant` · cURL',{c:C.blue,fs:14});
+box(46,354,206,54,'你的 UI / 后端逻辑',{c:C.blue,fs:14});
+arrow(149,216,149,262,{c:C.blue});
+arrow(149,316,149,354,{c:C.blue});
+txt(46,440,'← 你只写这一段',{fs:14,c:C.blue});
+
+/* ---------- control plane ---------- */
+box(300,128,326,420,'',{c:C.orange,dash:true});
+title(312,116,'控制面 Claude API',{fs:24,c:C.orange});
+box(320,168,286,56,'POST /v1/agents\n模型·system·tools·MCP·Skills',{c:C.orange,fs:13});
+box(320,248,286,56,'POST /v1/environments\ncloud 或 self_hosted 沙箱',{c:C.orange,fs:13});
+box(320,328,286,56,'POST /v1/sessions\nagent + environment_id',{c:C.orange,fs:13});
+box(320,408,286,62,'GET …/events/stream (SSE)\nPOST …/events',{c:C.orange,fs:13});
+txt(320,500,'beta 头: managed-agents-2026-04-01',{fs:13,c:C.orange});
+arrow(252,185,320,190,{c:C.blue,label:'create'});
+arrow(252,285,320,276,{c:C.blue});
+arrow(252,381,320,356,{c:C.blue});
+
+/* ---------- service ---------- */
+box(676,112,392,440,'',{c:C.purple,dash:true});
+title(688,100,'Managed Agents 服务 (harness)',{fs:24,c:C.purple});
+box(696,152,352,66,'Agent Loop / Harness\nprompt caching · compaction · 重试',{c:C.purple,fs:13});
+box(696,238,352,66,'Session Store（有状态）\n事件历史 · 沙箱文件系统 · 产出',{c:C.purple,fs:13});
+box(696,324,352,56,'编排 / 多智能体 · Threads',{c:C.purple,fs:13});
+box(696,400,352,56,'权限策略 · 会话预算 · 限流',{c:C.purple,fs:13});
+box(696,474,352,52,'Dreams：离线整理记忆',{c:C.purple,fs:13,dash:true});
+arrow(606,197,696,185,{c:C.orange});
+arrow(606,437,696,271,{c:C.orange,label:'events'});
+
+/* ---------- environment ---------- */
+box(1112,112,336,440,'',{c:C.green,dash:true});
+title(1124,100,'Environment 执行面',{fs:24,c:C.green});
+box(1132,152,296,70,'云沙箱（Anthropic 托管）\nnetworking: none/limited/unrestricted',{c:C.green,fs:12.5});
+box(1132,240,296,70,'自托管沙箱 / K8s worker\n你自己的基础设施（可 ZDR）',{c:C.green,fs:12.5});
+box(1132,328,296,66,'内置工具\nbash · 读写/glob/grep · web · MCP',{c:C.green,fs:12.5});
+box(1132,412,296,56,'Claude 模型\n(opus/sonnet/haiku 5.x)',{c:C.green,fs:13});
+arrow(1068,185,1132,187,{c:C.purple});
+arrow(1068,271,1132,275,{c:C.purple});
+
+/* ---------- flow legend ---------- */
+box(46,566,1402,120,'',{c:C.ink,dash:true,sw:1.4,r:2});
+title(62,556,'一次典型交互的事件流',{fs:24});
+[['① 建 Agent','agent.id'],['② 建 Env','environment.id'],['③ 开 Session','session.id'],['④ 开 SSE + 发 user.message','事件入队'],['⑤ agent.message / agent.tool_use','流式回传'],['⑥ session.status_idle','本轮结束']]
+ .forEach((s,i)=>{
+   const x=62+i*232, y=584, w=206, h=76;
+   box(x,y,w,h,s[0]+'\n'+s[1],{c:C.red,fs:13});
+   if(i<5)arrow(x+w+2,y+38,x+w+24,y+38,{c:C.red});
+ });
+txt(62,722,'中途可发 user.interrupt 打断、user.message 补充指令；user.tool_confirmation 审批工具调用；user.define_outcome 定义验收目标。',{fs:14,c:C.grey});
+
+/* ---------- side features ---------- */
+title(62,772,'旁路积木（按需拼装）',{fs:24});
+[['Skills','可复用的能力包'],['Vaults','凭据/密钥托管'],['Memory stores','跨会话记忆'],['Permission policies','工具级审批'],['Budgets','单会话花费上限'],['Scheduled deployments','cron 定时跑'],['MCP connector / tunnels','连外部工具'],['Event deltas','token 级预览']]
+ .forEach((s,i)=>{
+   const col=i%4, row=(i/4)|0, x=62+col*356, y=792+row*86;
+   box(x,y,326,66,s[0]+'\n'+s[1],{c:C.purple,fs:13,r:2});
+ });
+
+txt(62,986,'对比 Messages API：那边你自己写 loop / 沙箱 / 工具执行；这边 harness + 沙箱 + 状态都归服务，适合长跑与异步任务。',{fs:14.5,c:C.blue});
+</script>
+
+<script>
+function dl(){
+  const scene={type:'excalidraw',version:2,source:'https://excalidraw.com',
+    elements:els.map((e,i)=>({id:'e'+i,type:e.type,x:e.x,y:e.y,width:e.width,height:e.height,angle:0,
+      strokeColor:e.strokeColor||'#1e1e1e',backgroundColor:e.backgroundColor||'transparent',
+      fillStyle:'hachure',strokeWidth:e.strokeWidth||2,strokeStyle:e.strokeStyle||'solid',roughness:1.6,opacity:100,
+      seed:1000+i,version:1,versionNonce:1000+i,isDeleted:false,groupIds:[],boundElements:null,
+      roundness:e.type==='rectangle'?{type:3}:null,
+      ...(e.type==='text'?{text:e.text,fontSize:e.fontSize,fontFamily:1,textAlign:'left',verticalAlign:'top',lineHeight:1.25,baseline:Math.round(e.fontSize*.8),containerId:null,originalText:e.text}:{}),
+      ...(e.type==='arrow'?{points:e.points,startBinding:null,endBinding:null,lastCommittedPoint:null,startArrowhead:null,endArrowhead:'arrow',elbowed:false}:{})})),
+    appState:{viewBackgroundColor:'#fdf8ef',gridSize:null},files:{}};
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([JSON.stringify(scene,null,2)],{type:'application/json'}));
+  a.download='claude-managed-agents.excalidraw';a.click();
+}
+</script>
+</body>
+</html>
